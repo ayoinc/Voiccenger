@@ -48,7 +48,8 @@ final class StreamingResampler {
         let inputFrames = Double(input?.frameLength ?? 0)
         let capacity = AVAudioFrameCount((inputFrames * outputRate / inputRate).rounded(.up)) + 1024
         var output: [Float] = []
-        var supplied = false
+        // `nonisolated(unsafe)`: the input block runs synchronously inside `convert`, on this thread.
+        nonisolated(unsafe) var supplied = false
         while true {
             guard let buffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { return output }
             var conversionError: NSError?

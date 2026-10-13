@@ -87,10 +87,10 @@ public final class MicrophoneSource: AudioSource {
         }
         let observer = Task.detached { [weak self] in
             for await _ in NotificationCenter.default.notifications(
-                named: .AVAudioEngineConfigurationChange, object: engine)
+                named: .AVAudioEngineConfigurationChange, object: handle.engine)
             {
                 guard let self else { return }
-                self.restartAfterConfigurationChange(engine: engine)
+                self.restartAfterConfigurationChange(engine: handle.engine)
             }
         }
         state.withLock { $0.configurationTask = observer }

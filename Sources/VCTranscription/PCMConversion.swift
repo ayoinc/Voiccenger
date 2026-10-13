@@ -50,6 +50,8 @@ final class PCMStreamConverter {
         expectedFrames: Int,
         input: @escaping (UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer?
     ) throws -> [AVAudioPCMBuffer] {
+        // `nonisolated(unsafe)`: the input block runs synchronously inside `convert`, on this thread.
+        nonisolated(unsafe) let input = input
         let capacity = AVAudioFrameCount((Double(expectedFrames) * ratio).rounded(.up)) + 1024
         var outputs: [AVAudioPCMBuffer] = []
         while true {
