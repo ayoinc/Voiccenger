@@ -20,8 +20,15 @@ public final class MicrophoneSource: AudioSource {
     private let chunkDuration: TimeInterval
     private let state = Mutex(State())
 
+    /// `AVAudioEngine` isn't `Sendable`, but this source already hands one engine between the caller,
+    /// the configuration-change task and the tap. Every start/stop/restart is serialized through the
+    /// mutex-guarded `generation`/`session` counters, which is what makes sharing it sound.
+    private struct EngineHandle: @unchecked Sendable {
+        let engine: AVAudioEngine
+    }
+
     private struct State {
-        var engine: AVAudioEngine?
+        var engine: EngineHandle?
         var continuation: AsyncStream<AudioChunk>.Continuation?
         var assembler: ChunkAssembler?
         var configurationTask: Task<Void, Never>?
@@ -44,7 +51,7 @@ public final class MicrophoneSource: AudioSource {
     }
 
     deinit {
-        let engine = state.withLock { $0.engine }
+        let engine = state.withLock { $0.engine?.engine }
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
     }
@@ -54,9 +61,10 @@ public final class MicrophoneSource: AudioSource {
         let engine = AVAudioEngine()
         let (stream, continuation) = AsyncStream.makeStream(
             of: AudioChunk.self, bufferingPolicy: .bufferingNewest(Self.bufferCapacity(chunkDuration)))
+        let handle = EngineHandle(engine: engine)
         let session: UInt64 = try state.withLock { s in
             guard s.engine == nil else { throw AudioCaptureError.alreadyRunning }
-            s.engine = engine
+            s.engine = handle
             s.continuation = continuation
             s.session &+= 1
             s.timelineEnd = -.infinity
@@ -94,14 +102,15 @@ public final class MicrophoneSource: AudioSource {
     }
 
     private func stop(session: UInt64?) {
-        let taken = state.withLock { s -> (AVAudioEngine, AsyncStream<AudioChunk>.Continuation?, Task<Void, Never>?)? in
-            guard let engine = s.engine, session == nil || session == s.session else { return nil }
+        let taken = state.withLock { s -> (EngineHandle, AsyncStream<AudioChunk>.Continuation?, Task<Void, Never>?)? in
+            guard let handle = s.engine, session == nil || session == s.session else { return nil }
             s.engine = nil
             let observer = s.configurationTask
             s.configurationTask = nil
-            return (engine, s.continuation, observer)
+            return (handle, s.continuation, observer)
         }
-        guard let (engine, continuation, observer) = taken else { return }
+        guard let (handle, continuation, observer) = taken else { return }
+        let engine = handle.engine
         observer?.cancel()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
@@ -194,9 +203,10 @@ public final class MicrophoneSource: AudioSource {
 
     /// The engine stops itself on a configuration change; rebuild it on the new hardware format.
     private func restartAfterConfigurationChange(engine: AVAudioEngine) {
+        let engineID = ObjectIdentifier(engine)
         let (isCurrent, tail, continuation) = state.withLock {
             s -> (Bool, AudioChunk?, AsyncStream<AudioChunk>.Continuation?) in
-            guard s.engine === engine else { return (false, nil, nil) }
+            guard let current = s.engine, ObjectIdentifier(current.engine) == engineID else { return (false, nil, nil) }
             s.generation &+= 1
             let tail = s.assembler?.flush()
             if let end = s.assembler?.emittedEnd { s.timelineEnd = end }
