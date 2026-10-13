@@ -2,7 +2,8 @@ import Foundation
 
 /// Text form and shrinking of intermediate report notes, used by the map-reduce report on small context windows.
 enum ReportNotes {
-    /// Compact plain-text rendering fed to the merge step. Empty sections are omitted.
+    /// Compact plain-text rendering fed to the merge step; items keep their line citations as "(L3, L7)" so
+    /// merged notes still cite the transcript. Empty sections are omitted.
     static func render(_ notes: RawReport) -> String {
         var lines: [String] = []
         if let title = notes.title { lines.append("Title: \(title)") }
@@ -14,29 +15,37 @@ enum ReportNotes {
             if !topic.speakers.isEmpty { line += " (\(topic.speakers.joined(separator: ", ")))" }
             return line
         }, into: &lines)
-        section("Decisions", notes.decisions, into: &lines)
+        section("Decisions", notes.decisions.compactMap(cited), into: &lines)
         section("Action items", notes.actionItems.compactMap { item in
             guard let task = item.task else { return nil }
             var line = task
             if let owner = item.owner { line += " | owner: \(owner)" }
             if let due = item.due { line += " | due: \(due)" }
-            if let timestamp = item.timestamp { line += " | at \(timestamp)" }
-            return line
+            return line + citation(item.lines)
         }, into: &lines)
-        section("Notes to remember", notes.notesToRemember, into: &lines)
+        section("Notes to remember", notes.notesToRemember.compactMap(cited), into: &lines)
         section("Missed opportunities", notes.missedOpportunities, into: &lines)
-        section("Open questions", notes.openQuestions, into: &lines)
+        section("Open questions", notes.openQuestions.compactMap(cited), into: &lines)
         section("Corrections", notes.corrections.compactMap { note in
             guard let original = note.original, let corrected = note.corrected else { return nil }
             var line = "\(note.speaker ?? "Someone"): \"\(original)\" -> \"\(corrected)\""
-            if let reason = note.reason { line += " (\(reason))" }
-            return line
+            if let kind = note.kind { line += " [\(kind)]" }
+            return line + citation(note.lines)
         }, into: &lines)
         section("Participants", notes.participantSummaries.compactMap { participant in
             guard let name = participant.name, !participant.keyPoints.isEmpty else { return nil }
-            return "\(name): \(participant.keyPoints.joined(separator: "; "))"
+            return "\(name): " + participant.keyPoints.compactMap(cited).joined(separator: "; ")
         }, into: &lines)
         return lines.joined(separator: "\n")
+    }
+
+    private static func cited(_ item: RawItem) -> String? {
+        item.text.map { $0 + citation(item.lines) }
+    }
+
+    /// " (L3, L7)", or nothing for an item citing no lines.
+    private static func citation(_ lines: [Int]) -> String {
+        lines.isEmpty ? "" : " (" + lines.map { "L\($0)" }.joined(separator: ", ") + ")"
     }
 
     private static func section(_ title: String, _ items: [String], into lines: inout [String]) {

@@ -81,11 +81,10 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
 
     public func report(transcript: [ContextLine], participants: [String], meetingTitle: String?) async throws -> MeetingReport {
         try Self.requireAvailable()
+        let participants = TranscriptFormatter.speakingParticipants(participants, transcript: transcript)
         let notes: RawReport
         if transcript.isEmpty {
-            notes = RawReport(
-                title: nil, overview: "No speech was transcribed.", topics: [], decisions: [], actionItems: [],
-                notesToRemember: [], missedOpportunities: [], openQuestions: [], corrections: [], participantSummaries: [])
+            notes = RawReport(overview: "No speech was transcribed.")
         } else {
             let budget = await transcriptBudget()
             notes = try await reportNotes(
@@ -96,13 +95,15 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
             from: notes, transcript: transcript, participants: participants, meetingTitle: meetingTitle, generatedBy: engineName)
     }
 
-    /// One pass when the whole transcript fits `budget`, map-reduce otherwise. `mergeBudget` bounds the notes
-    /// sent to one merge request; it comes from the context window, not from the transcript budget.
+    /// One pass when the whole transcript fits `budget`, map-reduce otherwise. Lines are numbered over the whole
+    /// meeting so every request cites the same `L` numbers. `mergeBudget` bounds the notes sent to one merge
+    /// request; it comes from the context window, not from the transcript budget.
     func reportNotes(
         transcript: [ContextLine], participants: [String], meetingTitle: String?, budget initialBudget: Int, mergeBudget: Int
     ) async throws -> RawReport {
         var budget = initialBudget
-        let lines = TranscriptChunker.splitLongLines(transcript, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))
+        let numbered = NumberedLine.numbering(transcript)
+        let lines = TranscriptChunker.splitLongLines(numbered, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))
         if lines.reduce(0, { $0 + TranscriptChunker.defaultCost($1) }) <= budget {
             let prompt = IntelligencePrompts.reportPrompt(transcript: lines, participants: participants, meetingTitle: meetingTitle)
             do {
@@ -111,12 +112,12 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
                 budget = try Self.shrunk(budget)
             }
         }
-        let parts = try await partNotes(lines, participants: participants, meetingTitle: meetingTitle, budget: budget)
+        let parts = try await partNotes(numbered, participants: participants, meetingTitle: meetingTitle, budget: budget)
         return try await merged(parts, participants: participants, meetingTitle: meetingTitle, budget: max(mergeBudget, budget))
     }
 
     /// Map step: notes for consecutive chunks. A chunk that overflows is retried smaller; finished parts are kept.
-    func partNotes(_ transcript: [ContextLine], participants: [String], meetingTitle: String?, budget initialBudget: Int) async throws -> [RawReport] {
+    func partNotes(_ transcript: [NumberedLine], participants: [String], meetingTitle: String?, budget initialBudget: Int) async throws -> [RawReport] {
         var budget = initialBudget
         var remaining = TranscriptChunker.splitLongLines(transcript, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
         var parts: [RawReport] = []

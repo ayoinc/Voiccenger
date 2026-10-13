@@ -39,6 +39,7 @@ public enum ReportWriter {
     ) async throws -> MeetingReport {
         guard !m.segments.isEmpty else { throw ReportWriterError.emptyTranscript }
         return try await engine.report(
-            transcript: transcript(of: m), participants: m.participants.map(\.displayName), meetingTitle: title)
+            transcript: transcript(of: m), participants: ReportRenderer.speakingParticipants(m).map(\.displayName),
+            meetingTitle: title)
     }
 }

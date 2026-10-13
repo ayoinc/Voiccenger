@@ -106,8 +106,8 @@ NOTARY_KEYCHAIN_PROFILE=voiccenger-notary scripts/notarize.sh dist/Voiccenger-$V
 | Language/accent | Per-person calibration picks the best model; accent region seeds vocabulary; language switching (e.g. English ↔ French) on low confidence |
 | Speakers | FluidAudio diarization + WeSpeaker embeddings; enrolled people matched by cosine with multi-sample profiles, ambiguity margin and per-cluster voting |
 | Seat direction | GCC-PHAT steered response power over all mic pairs, per-speaker circular mean |
-| Intent, corrections, suggestions | Apple Foundation Models (default) or Claude, per utterance |
-| Report | Topics, decisions, action items (owner/due), notes, things that could have been said, open questions, corrections, per-person points; Markdown export |
+| Intent, corrections, suggestions | Apple Foundation Models (default) or Claude, per utterance. A correction is shown only as a self-correction, a contradiction of an earlier line or a likely mishearing, checked against the words spoken; filler or repetition clean-ups are never corrections |
+| Report | Topics, decisions, action items (owner/due), notes, things that could have been said, open questions, corrections, per-person points; Markdown export with the voice model used. Every item cites numbered transcript lines and is kept only when those lines support it (shared content words, a commitment/request/decision/question cue, the owner as the committer or the person asked); per-person points cite that person's own lines, skip small talk and name nothing those lines don't; promises are never reported as done; only people with transcript lines appear; meetings with little substance get a brief report |
 
 Data: `~/Library/Application Support/Voiccenger/`. Claude key stored in the Keychain.
 
@@ -125,6 +125,7 @@ Data: `~/Library/Application Support/Voiccenger/`. Claude key stored in the Keyc
 - Speaker labels lag ~10 s behind live text (diarization windows).
 - Seat direction needs a multi-channel array; the built-in Mac mic can't localize.
 - If system-audio permission is denied the tap yields silence, not an error.
+- Report grounding is lexical: an item that shares words with its cited lines and has the right cue can still misread them. Long overview sentences are only checked for promises reported as done ("agreed on a budget freeze" for a feature freeze survives there).
 - With CLT only, SwiftUI's `@State` macro is unavailable; views use a `ViewState = SwiftUI.State` alias.
 
 ## Artwork

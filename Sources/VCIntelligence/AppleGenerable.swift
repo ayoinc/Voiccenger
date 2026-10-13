@@ -80,27 +80,52 @@ struct GenActionItem: Generable, Equatable {
     var raw: RawActionItem { RawActionItem(task: task, owner: owner, due: due) }
 }
 
+/// Kind of correction for a live utterance; `none` is the usual answer.
+enum GenCorrectionKind: String, CaseIterable, Generable {
+    case none
+    case selfCorrection
+    case contradiction
+    case mishearing
+
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, description: "Usually none.", anyOf: allCases.map(\.rawValue))
+    }
+
+    init(_ content: GeneratedContent) throws {
+        guard let value = Self(rawValue: try content.value(String.self)) else { throw malformed("correction kind", content) }
+        self = value
+    }
+
+    var generatedContent: GeneratedContent { GeneratedContent(rawValue) }
+}
+
 struct GenInsight: Generable, Equatable {
     var intent: GenIntent
+    var correctionKind: GenCorrectionKind
     var correctedText: String?
-    var correctionReason: String?
+    var contradictsLine: Int?
     var suggestion: String?
     var actionItem: GenActionItem?
 
     static var generationSchema: GenerationSchema {
         GenerationSchema(type: Self.self, description: "Analysis of the new utterance.", properties: [
             .init(name: "intent", type: GenIntent.self),
-            .init(name: "correctedText", description: "What the speaker meant; only when the utterance is wrong.", type: String?.self),
-            .init(name: "correctionReason", description: "Why the utterance was corrected.", type: String?.self),
+            .init(name: "correctionKind", type: GenCorrectionKind.self),
+            .init(name: "correctedText", description: "Only when correctionKind is not none.", type: String?.self),
+            .init(name: "contradictsLine", description: "Context line number; only for a contradiction.", type: Int?.self),
             .init(name: "suggestion", description: "Propose:/Confirm:/Ask:/Clarify: line; only when genuinely useful.", type: String?.self),
-            .init(name: "actionItem", description: "Only when someone commits to or is asked to do a task.", type: GenActionItem?.self),
+            .init(name: "actionItem", description: "Only when someone commits to or is asked to do a task after the meeting.", type: GenActionItem?.self),
         ])
     }
 
-    init(intent: GenIntent, correctedText: String?, correctionReason: String?, suggestion: String?, actionItem: GenActionItem?) {
+    init(
+        intent: GenIntent, correctionKind: GenCorrectionKind, correctedText: String?, contradictsLine: Int?,
+        suggestion: String?, actionItem: GenActionItem?
+    ) {
         self.intent = intent
+        self.correctionKind = correctionKind
         self.correctedText = correctedText
-        self.correctionReason = correctionReason
+        self.contradictsLine = contradictsLine
         self.suggestion = suggestion
         self.actionItem = actionItem
     }
@@ -108,40 +133,74 @@ struct GenInsight: Generable, Equatable {
     init(_ content: GeneratedContent) throws {
         self.init(
             intent: try content.value(GenIntent.self, forProperty: "intent"),
+            correctionKind: (try? content.value(GenCorrectionKind.self, forProperty: "correctionKind")) ?? .none,
             correctedText: content.text("correctedText"),
-            correctionReason: content.text("correctionReason"),
+            contradictsLine: (try? content.value(Int?.self, forProperty: "contradictsLine")) ?? nil,
             suggestion: content.text("suggestion"),
             actionItem: try? content.value(GenActionItem?.self, forProperty: "actionItem"))
     }
 
     var generatedContent: GeneratedContent {
         GeneratedContent(properties: [
-            "intent": intent, "correctedText": correctedText, "correctionReason": correctionReason,
-            "suggestion": suggestion, "actionItem": actionItem,
+            "intent": intent, "correctionKind": correctionKind, "correctedText": correctedText,
+            "contradictsLine": contradictsLine, "suggestion": suggestion, "actionItem": actionItem,
         ])
     }
 
     var raw: RawInsight {
         RawInsight(
-            intent: intent.rawValue, correctedText: correctedText, correctionReason: correctionReason,
-            suggestion: suggestion, actionItem: actionItem?.raw)
+            intent: intent.rawValue, correctionKind: correctionKind.rawValue, correctedText: correctedText,
+            contradictsLine: contradictsLine, suggestion: suggestion, actionItem: actionItem?.raw)
     }
 }
 
 // MARK: - Report notes (one shape for a single pass, per-part notes and merged notes)
 
+/// Transcript line numbers an item cites, listed after the item.
+private func linesProperty(_ description: String = "Numbers of the transcript lines that support it (3 for L3).") -> GenerationSchema.Property {
+    .init(name: "lines", description: description, type: [Int].self, guides: [.maximumCount(4)])
+}
+
+/// A list entry with the transcript lines that support it.
+struct GenItem: Generable, Equatable {
+    var text: String
+    var lines: [Int]
+
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, properties: [
+            .init(name: "text", description: "In your own words, briefly.", type: String.self), linesProperty(),
+        ])
+    }
+
+    init(text: String, lines: [Int]) {
+        self.text = text
+        self.lines = lines
+    }
+
+    init(_ content: GeneratedContent) throws {
+        guard let text = content.text("text") else { throw malformed("item", content) }
+        self.init(text: text, lines: content.list("lines"))
+    }
+
+    var generatedContent: GeneratedContent {
+        GeneratedContent(properties: ["text": text, "lines": lines])
+    }
+
+    var raw: RawItem { RawItem(text: text, lines: lines) }
+}
+
 struct GenNoteActionItem: Generable, Equatable {
     var task: String
     var owner: String?
     var due: String?
-    var timestamp: String?
+    var lines: [Int]
 
     static var generationSchema: GenerationSchema {
         GenerationSchema(type: Self.self, properties: [
             .init(name: "task", description: "Short imperative task.", type: String.self),
-            .init(name: "owner", description: "Responsible person's name.", type: String?.self),
-            .init(name: "timestamp", description: "mm:ss of the line where it was agreed.", type: String?.self),
+            .init(name: "owner", description: "Name of the person who will do it.", type: String?.self),
             .init(name: "due", description: "Deadline words someone said, like \"Friday\"; null if none. Never a mm:ss timestamp.", type: String?.self),
+            linesProperty("Numbers of the lines where it was committed to or asked for."),
         ])
     }
 
@@ -150,12 +209,14 @@ struct GenNoteActionItem: Generable, Equatable {
         self.task = task
         owner = content.text("owner")
         due = content.text("due")
-        timestamp = content.text("timestamp")
+        lines = content.list("lines")
     }
 
     var generatedContent: GeneratedContent {
-        GeneratedContent(properties: ["task": task, "owner": owner, "due": due, "timestamp": timestamp])
+        GeneratedContent(properties: ["task": task, "owner": owner, "due": due, "lines": lines])
     }
+
+    var raw: RawActionItem { RawActionItem(task: task, owner: owner, due: due, lines: lines) }
 }
 
 struct GenTopic: Generable, Equatable {
@@ -183,44 +244,71 @@ struct GenTopic: Generable, Equatable {
     }
 }
 
+/// Kind of a report correction (no `none`: an entry exists only for an actual correction).
+enum GenReportCorrectionKind: String, CaseIterable, Generable {
+    case selfCorrection
+    case contradiction
+    case mishearing
+
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, description: "Kind of correction.", anyOf: allCases.map(\.rawValue))
+    }
+
+    init(_ content: GeneratedContent) throws {
+        guard let value = Self(rawValue: try content.value(String.self)) else { throw malformed("correction kind", content) }
+        self = value
+    }
+
+    var generatedContent: GeneratedContent { GeneratedContent(rawValue) }
+}
+
 struct GenCorrection: Generable, Equatable {
+    var kind: GenReportCorrectionKind
     var speaker: String
     var original: String
     var corrected: String
-    var reason: String
+    var lines: [Int]
 
     static var generationSchema: GenerationSchema {
         GenerationSchema(type: Self.self, properties: [
+            .init(name: "kind", type: GenReportCorrectionKind.self),
             .init(name: "speaker", type: String.self),
             .init(name: "original", description: "Original wording.", type: String.self),
-            .init(name: "corrected", description: "Corrected meaning.", type: String.self),
-            .init(name: "reason", type: String.self),
+            .init(name: "corrected", description: "Corrected wording.", type: String.self),
+            linesProperty("The corrected line; for a contradiction also the line it contradicts."),
         ])
     }
 
     init(_ content: GeneratedContent) throws {
-        guard let original = content.text("original"), let corrected = content.text("corrected") else {
-            throw malformed("correction", content)
-        }
+        guard let original = content.text("original"), let corrected = content.text("corrected"),
+            let kind = try? content.value(GenReportCorrectionKind.self, forProperty: "kind")
+        else { throw malformed("correction", content) }
+        lines = content.list("lines")
+        self.kind = kind
         speaker = content.text("speaker") ?? ""
         self.original = original
         self.corrected = corrected
-        reason = content.text("reason") ?? ""
     }
 
     var generatedContent: GeneratedContent {
-        GeneratedContent(properties: ["speaker": speaker, "original": original, "corrected": corrected, "reason": reason])
+        GeneratedContent(properties: ["kind": kind, "speaker": speaker, "original": original, "corrected": corrected, "lines": lines])
+    }
+
+    var raw: RawCorrection {
+        RawCorrection(speaker: speaker.isEmpty ? nil : speaker, kind: kind.rawValue, original: original, corrected: corrected, lines: lines)
     }
 }
 
 struct GenParticipant: Generable, Equatable {
     var name: String
-    var keyPoints: [String]
+    var keyPoints: [GenItem]
 
     static var generationSchema: GenerationSchema {
         GenerationSchema(type: Self.self, properties: [
             .init(name: "name", type: String.self),
-            .init(name: "keyPoints", type: [String].self, guides: [.maximumCount(4)]),
+            .init(
+                name: "keyPoints", description: "What this person said, citing their own lines; promises stay promises.",
+                type: [GenItem].self, guides: [.maximumCount(4)]),
         ])
     }
 
@@ -239,26 +327,26 @@ struct GenNotes: Generable, Equatable {
     var title: String
     var overview: String
     var topics: [GenTopic]
-    var decisions: [String]
+    var decisions: [GenItem]
     var actionItems: [GenNoteActionItem]
-    var notesToRemember: [String]
+    var notesToRemember: [GenItem]
     var missedOpportunities: [String]
-    var openQuestions: [String]
+    var openQuestions: [GenItem]
     var corrections: [GenCorrection]
     var participantSummaries: [GenParticipant]
 
-    /// Caps keep the answer well inside the on-device context window.
+    /// Caps keep the answer well inside the on-device context window; `ResultAssembler` caps again by length.
     static var generationSchema: GenerationSchema {
-        GenerationSchema(type: Self.self, description: "Meeting notes.", properties: [
+        GenerationSchema(type: Self.self, description: "Meeting notes. Empty lists are normal.", properties: [
             .init(name: "title", description: "Short title.", type: String.self),
-            .init(name: "overview", description: "Two to four sentences.", type: String.self),
-            .init(name: "topics", type: [GenTopic].self, guides: [.maximumCount(6)]),
-            .init(name: "decisions", type: [String].self, guides: [.maximumCount(8)]),
-            .init(name: "actionItems", type: [GenNoteActionItem].self, guides: [.maximumCount(10)]),
-            .init(name: "notesToRemember", description: "Facts, numbers, dates, caveats.", type: [String].self, guides: [.maximumCount(8)]),
-            .init(name: "missedOpportunities", description: "What could have been said, asked or followed up.", type: [String].self, guides: [.maximumCount(5)]),
-            .init(name: "openQuestions", type: [String].self, guides: [.maximumCount(5)]),
-            .init(name: "corrections", type: [GenCorrection].self, guides: [.maximumCount(5)]),
+            .init(name: "overview", description: "One to three sentences.", type: String.self),
+            .init(name: "topics", type: [GenTopic].self, guides: [.maximumCount(5)]),
+            .init(name: "decisions", description: "Explicitly agreed decisions only.", type: [GenItem].self, guides: [.maximumCount(6)]),
+            .init(name: "actionItems", description: "Tasks for after the meeting only.", type: [GenNoteActionItem].self, guides: [.maximumCount(8)]),
+            .init(name: "notesToRemember", description: "Facts, numbers, dates, constraints.", type: [GenItem].self, guides: [.maximumCount(6)]),
+            .init(name: "missedOpportunities", description: "Important follow-ups nobody raised.", type: [String].self, guides: [.maximumCount(3)]),
+            .init(name: "openQuestions", description: "Questions asked and left unanswered.", type: [GenItem].self, guides: [.maximumCount(4)]),
+            .init(name: "corrections", type: [GenCorrection].self, guides: [.maximumCount(3)]),
             .init(name: "participantSummaries", type: [GenParticipant].self, guides: [.maximumCount(8)]),
         ])
     }
@@ -289,14 +377,12 @@ struct GenNotes: Generable, Equatable {
             title: title.isEmpty ? nil : title,
             overview: overview.isEmpty ? nil : overview,
             topics: topics.map { RawTopic(title: $0.title, summary: $0.summary, speakers: $0.speakers) },
-            decisions: decisions,
-            actionItems: actionItems.map { RawActionItem(task: $0.task, owner: $0.owner, due: $0.due, timestamp: $0.timestamp) },
-            notesToRemember: notesToRemember,
+            decisions: decisions.map(\.raw),
+            actionItems: actionItems.map(\.raw),
+            notesToRemember: notesToRemember.map(\.raw),
             missedOpportunities: missedOpportunities,
-            openQuestions: openQuestions,
-            corrections: corrections.map {
-                RawCorrection(speaker: $0.speaker.isEmpty ? nil : $0.speaker, original: $0.original, corrected: $0.corrected, reason: $0.reason)
-            },
-            participantSummaries: participantSummaries.map { RawParticipant(name: $0.name, keyPoints: $0.keyPoints) })
+            openQuestions: openQuestions.map(\.raw),
+            corrections: corrections.map(\.raw),
+            participantSummaries: participantSummaries.map { RawParticipant(name: $0.name, keyPoints: $0.keyPoints.map(\.raw)) })
     }
 }

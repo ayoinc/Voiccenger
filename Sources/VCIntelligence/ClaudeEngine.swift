@@ -90,7 +90,9 @@ public final class ClaudeEngine: MeetingIntelligence {
     }
 
     public func report(transcript: [ContextLine], participants: [String], meetingTitle: String?) async throws -> MeetingReport {
-        let prompt = IntelligencePrompts.reportPrompt(transcript: transcript, participants: participants, meetingTitle: meetingTitle)
+        let participants = TranscriptFormatter.speakingParticipants(participants, transcript: transcript)
+        let prompt = IntelligencePrompts.reportPrompt(
+            transcript: NumberedLine.numbering(transcript), participants: participants, meetingTitle: meetingTitle)
         guard prompt.count <= Self.maxTranscriptCharacters else {
             throw IntelligenceError.transcriptTooLong(characters: prompt.count, limit: Self.maxTranscriptCharacters)
         }
@@ -259,50 +261,61 @@ public final class ClaudeEngine: MeetingIntelligence {
     static func insightSchema() -> [String: Any] {
         object([
             ("intent", ["type": "string", "enum": UtteranceIntent.allCases.map(\.rawValue), "description": "Intent of the new utterance."]),
-            ("correctedText", nullableString("What the speaker meant, only when the utterance has a slip, misstatement or recognition error; otherwise null.")),
-            ("correctionReason", nullableString("One short sentence explaining the correction; null when there is none.")),
+            ("correctionKind", ["type": "string", "enum": ["none"] + CorrectionKind.allCases.map(\.rawValue), "description": "Almost always none."]),
+            ("correctedText", nullableString("The corrected wording when correctionKind is not none; otherwise null.")),
+            ("contradictsLine", ["anyOf": [["type": "integer"], ["type": "null"]], "description": "For a contradiction, the number of the context line it contradicts; otherwise null."]),
             ("suggestion", nullableString("One short line starting with Propose:, Confirm:, Ask: or Clarify:, only when genuinely useful; otherwise null.")),
-            ("actionItem", ["anyOf": [actionItemSchema(withTimestamp: false), ["type": "null"]], "description": "A concrete task someone committed to or was asked to do; otherwise null."]),
+            ("actionItem", ["anyOf": [actionItemSchema(withLines: false), ["type": "null"]], "description": "A task for after the meeting someone committed to or was asked to do; otherwise null."]),
         ])
     }
 
     static func reportSchema() -> [String: Any] {
         object([
             ("title", string("Short meeting title.")),
-            ("overview", string("Two to four sentences.")),
+            ("overview", string("One to three sentences.")),
             ("topics", array(of: object([
                 ("title", string("Topic title.")),
                 ("summary", string("Short summary.")),
                 ("speakers", stringArray("Speakers involved.")),
             ]), "Main topics in order.")),
-            ("decisions", stringArray("Final decisions as agreed.")),
-            ("actionItems", array(of: actionItemSchema(withTimestamp: true), "Concrete tasks.")),
-            ("notesToRemember", stringArray("Facts, numbers, dates, constraints and caveats.")),
-            ("missedOpportunities", stringArray("What could have been said, asked or followed up.")),
-            ("openQuestions", stringArray("Questions raised but not resolved.")),
+            ("decisions", array(of: citedItem(), "Decisions explicitly agreed; often empty.")),
+            ("actionItems", array(of: actionItemSchema(withLines: true), "Tasks to be done after the meeting; often empty.")),
+            ("notesToRemember", array(of: citedItem(), "Facts, numbers, dates and constraints stated.")),
+            ("missedOpportunities", stringArray("A few important follow-ups, risks or questions nobody raised.")),
+            ("openQuestions", array(of: citedItem(), "Questions asked and left unanswered.")),
             ("corrections", array(of: object([
                 ("speaker", string("Who misspoke.")),
+                ("kind", ["type": "string", "enum": CorrectionKind.allCases.map(\.rawValue)]),
                 ("original", string("Original wording.")),
-                ("corrected", string("Corrected meaning.")),
-                ("reason", string("Why it was corrected.")),
-            ]), "Slips, self-corrections and misstatements.")),
+                ("corrected", string("Corrected wording.")),
+                ("lines", lineNumbers("The corrected line; for a contradiction also the line it contradicts.")),
+            ]), "Self-corrections, contradictions and misrecognised words.")),
             ("participantSummaries", array(of: object([
                 ("name", string("Participant name.")),
-                ("keyPoints", stringArray("Their key points.")),
+                ("keyPoints", array(of: citedItem(), "What they said, each citing their own lines; promises stay promises.")),
             ]), "Key points per participant who spoke.")),
         ])
     }
 
-    private static func actionItemSchema(withTimestamp: Bool) -> [String: Any] {
+    private static func actionItemSchema(withLines: Bool) -> [String: Any] {
         var properties: [(String, [String: Any])] = [
             ("task", string("Short imperative task.")),
-            ("owner", nullableString("Name of the responsible person, or null.")),
+            ("owner", nullableString("Name of the person who will do it, or null.")),
             ("due", nullableString("Deadline words someone said (e.g. \"Friday\"), or null. Never a transcript timestamp.")),
         ]
-        if withTimestamp {
-            properties.append(("timestamp", nullableString("mm:ss of the transcript line where it was agreed, or null.")))
+        if withLines {
+            properties.append(("lines", lineNumbers("Numbers of the lines where it was committed to or asked for.")))
         }
         return object(properties)
+    }
+
+    /// A report list entry and the transcript lines that support it.
+    private static func citedItem() -> [String: Any] {
+        object([("text", string("The item.")), ("lines", lineNumbers("Numbers of the transcript lines that support it (3 for L3)."))])
+    }
+
+    private static func lineNumbers(_ description: String) -> [String: Any] {
+        ["type": "array", "items": ["type": "integer"], "description": description]
     }
 
     private static func object(_ properties: [(String, [String: Any])]) -> [String: Any] {

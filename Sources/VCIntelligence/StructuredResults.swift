@@ -2,21 +2,60 @@ import Foundation
 import VCModels
 
 // Engine-neutral structured output. Claude's tool input decodes straight into these (leniently, so a
-// slightly off-schema answer still yields everything usable); Apple's @Generable output converts into them.
-// Both engines then go through the same clean-up into VCModels types.
+// slightly off-schema answer still yields everything usable); Apple's Generable output converts into them.
+// Both engines then go through the same clean-up and grounding checks into VCModels types.
+
+/// What kind of slip a correction fixes. Anything that fits none of these is not shown as a correction.
+enum CorrectionKind: String, CaseIterable, Equatable {
+    /// The speaker repaired their own words ("Tuesday, sorry, I mean Wednesday").
+    case selfCorrection
+    /// The line contradicts an earlier line.
+    case contradiction
+    /// Speech recognition got a word wrong ("last weak").
+    case mishearing
+
+    /// Case- and punctuation-insensitive; "none" and unknown kinds read as nil.
+    init?(lenient text: String?) {
+        let key = (text ?? "").lowercased().filter(\.isLetter)
+        guard let kind = Self.allCases.first(where: { $0.rawValue.lowercased() == key }) else { return nil }
+        self = kind
+    }
+}
+
+/// A report list entry with the transcript lines (1-based `L` numbers) that support it.
+struct RawItem: Decodable, Equatable {
+    var text: String?
+    var lines: [Int]
+
+    init(text: String?, lines: [Int] = []) {
+        self.text = text
+        self.lines = lines
+    }
+
+    /// `{"text": …, "lines": […]}`, or a bare string citing nothing.
+    init(from decoder: any Decoder) throws {
+        if let single = try? decoder.singleValueContainer(), let text = try? single.decode(String.self) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.init(text: trimmed.isEmpty ? nil : trimmed)
+            return
+        }
+        let c = try decoder.container(keyedBy: AnyKey.self)
+        self.init(text: c.lenientString("text"), lines: c.lenientLines("lines"))
+    }
+}
 
 struct RawActionItem: Decodable, Equatable {
     var task: String?
     var owner: String?
     var due: String?
-    /// `mm:ss` of the line where the task came up (reports only).
-    var timestamp: String?
+    /// Transcript lines where the task was committed to or asked for (reports only).
+    var lines: [Int]
 
-    init(task: String?, owner: String?, due: String?, timestamp: String? = nil) {
+    init(task: String?, owner: String?, due: String?, lines: [Int] = []) {
         self.task = task
         self.owner = owner
         self.due = due
-        self.timestamp = timestamp
+        self.lines = lines
     }
 
     init(from decoder: any Decoder) throws {
@@ -24,21 +63,27 @@ struct RawActionItem: Decodable, Equatable {
         task = c.lenientString("task")
         owner = c.lenientString("owner")
         due = c.lenientString("due")
-        timestamp = c.lenientString("timestamp")
+        lines = c.lenientLines("lines")
     }
 }
 
 struct RawInsight: Decodable, Equatable {
     var intent: String?
+    var correctionKind: String?
     var correctedText: String?
-    var correctionReason: String?
+    /// Number of the context line a contradiction contradicts.
+    var contradictsLine: Int?
     var suggestion: String?
     var actionItem: RawActionItem?
 
-    init(intent: String?, correctedText: String?, correctionReason: String?, suggestion: String?, actionItem: RawActionItem?) {
+    init(
+        intent: String?, correctionKind: String? = nil, correctedText: String?, contradictsLine: Int? = nil,
+        suggestion: String?, actionItem: RawActionItem?
+    ) {
         self.intent = intent
+        self.correctionKind = correctionKind
         self.correctedText = correctedText
-        self.correctionReason = correctionReason
+        self.contradictsLine = contradictsLine
         self.suggestion = suggestion
         self.actionItem = actionItem
     }
@@ -46,8 +91,9 @@ struct RawInsight: Decodable, Equatable {
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
         intent = c.lenientString("intent")
+        correctionKind = c.lenientString("correctionKind")
         correctedText = c.lenientString("correctedText")
-        correctionReason = c.lenientString("correctionReason")
+        contradictsLine = c.lenientLines("contradictsLine").first
         suggestion = c.lenientString("suggestion")
         actionItem = (try? c.decodeIfPresent(RawActionItem.self, forKey: AnyKey("actionItem"))) ?? nil
     }
@@ -74,31 +120,36 @@ struct RawTopic: Decodable, Equatable {
 
 struct RawCorrection: Decodable, Equatable {
     var speaker: String?
+    var kind: String?
     var original: String?
     var corrected: String?
-    var reason: String?
+    /// The corrected line, plus for a contradiction the line it contradicts.
+    var lines: [Int]
 
-    init(speaker: String?, original: String?, corrected: String?, reason: String?) {
+    init(speaker: String?, kind: String?, original: String?, corrected: String?, lines: [Int]) {
         self.speaker = speaker
+        self.kind = kind
         self.original = original
         self.corrected = corrected
-        self.reason = reason
+        self.lines = lines
     }
 
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
         speaker = c.lenientString("speaker")
+        kind = c.lenientString("kind")
         original = c.lenientString("original")
         corrected = c.lenientString("corrected")
-        reason = c.lenientString("reason")
+        lines = c.lenientLines("lines")
     }
 }
 
 struct RawParticipant: Decodable, Equatable {
     var name: String?
-    var keyPoints: [String]
+    /// Each point cites the participant's own lines.
+    var keyPoints: [RawItem]
 
-    init(name: String?, keyPoints: [String]) {
+    init(name: String?, keyPoints: [RawItem]) {
         self.name = name
         self.keyPoints = keyPoints
     }
@@ -106,7 +157,7 @@ struct RawParticipant: Decodable, Equatable {
     init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
         name = c.lenientString("name")
-        keyPoints = c.lenientStrings("keyPoints")
+        keyPoints = c.lossyArray("keyPoints")
     }
 }
 
@@ -114,18 +165,18 @@ struct RawReport: Decodable, Equatable {
     var title: String?
     var overview: String?
     var topics: [RawTopic]
-    var decisions: [String]
+    var decisions: [RawItem]
     var actionItems: [RawActionItem]
-    var notesToRemember: [String]
+    var notesToRemember: [RawItem]
     var missedOpportunities: [String]
-    var openQuestions: [String]
+    var openQuestions: [RawItem]
     var corrections: [RawCorrection]
     var participantSummaries: [RawParticipant]
 
     init(
-        title: String?, overview: String?, topics: [RawTopic], decisions: [String], actionItems: [RawActionItem],
-        notesToRemember: [String], missedOpportunities: [String], openQuestions: [String],
-        corrections: [RawCorrection], participantSummaries: [RawParticipant]
+        title: String? = nil, overview: String? = nil, topics: [RawTopic] = [], decisions: [RawItem] = [],
+        actionItems: [RawActionItem] = [], notesToRemember: [RawItem] = [], missedOpportunities: [String] = [],
+        openQuestions: [RawItem] = [], corrections: [RawCorrection] = [], participantSummaries: [RawParticipant] = []
     ) {
         self.title = title
         self.overview = overview
@@ -144,11 +195,11 @@ struct RawReport: Decodable, Equatable {
         title = c.lenientString("title")
         overview = c.lenientString("overview")
         topics = c.lossyArray("topics")
-        decisions = c.lenientStrings("decisions")
+        decisions = c.lossyArray("decisions")
         actionItems = c.lossyArray("actionItems")
-        notesToRemember = c.lenientStrings("notesToRemember")
+        notesToRemember = c.lossyArray("notesToRemember")
         missedOpportunities = c.lenientStrings("missedOpportunities")
-        openQuestions = c.lenientStrings("openQuestions")
+        openQuestions = c.lossyArray("openQuestions")
         corrections = c.lossyArray("corrections")
         participantSummaries = c.lossyArray("participantSummaries")
     }
@@ -161,46 +212,56 @@ enum ResultAssembler {
     /// made) small models invent tasks, contradicting the intent they chose themselves.
     private static let taskIntents: Set<UtteranceIntent> = [.commitment, .request, .proposal]
 
-    /// `context` is the recent context the model saw; a due date must have been spoken there or in the utterance.
+    /// `context` is the numbered recent context the model saw (`L1` is `context[0]`); a due date must have been
+    /// spoken there or in the utterance, and a contradiction must cite one of its lines.
     static func insight(from raw: RawInsight, utterance: ContextLine, context: [ContextLine] = []) -> UtteranceInsight {
         let intent = Self.intent(from: raw.intent)
-        let corrected = raw.correctedText.flatMap { text -> String? in
-            let unquoted = text.trimmingCharacters(in: CharacterSet(charactersIn: "\"“”'‘’").union(.whitespaces))
-            guard !unquoted.isEmpty, isGenuineCorrection(unquoted, of: utterance.text) else { return nil }
-            return unquoted
+        let correction = raw.correctedText.flatMap { text -> (text: String, reason: String)? in
+            let corrected = unquoted(text)
+            guard !corrected.isEmpty, let kind = CorrectionKind(lenient: raw.correctionKind) else { return nil }
+            let contradicted = raw.contradictsLine.flatMap { context.indices.contains($0 - 1) ? context[$0 - 1] : nil }
+            return correctionReason(kind, original: utterance.text, corrected: corrected, line: utterance, contradicted: contradicted)
+                .map { (corrected, $0) }
         }
         let spoken = comparable(([utterance] + context).map(\.text).joined(separator: " "))
+        let cues = Grounding.taskCues(utterance.text)
         let action = raw.actionItem.flatMap { item -> ActionItem? in
             let body = item.task.map { labelled($0).body } ?? ""
-            guard taskIntents.contains(intent), !comparable(body).isEmpty else { return nil }
+            guard taskIntents.contains(intent), !cues.isEmpty, !comparable(body).isEmpty else { return nil }
             var owner = resolveOwner(item.owner, speaker: utterance.speaker)
-            if intent == .request, owner == nil || owner?.caseInsensitiveCompare(utterance.speaker) == .orderedSame {
-                owner = addressee(of: utterance, among: context.map(\.speaker)) ?? owner
+            // Whoever asks is not the one who does it; the person named in the request is.
+            let ownerIsSpeaker = owner?.caseInsensitiveCompare(utterance.speaker) == .orderedSame
+            if cues.contains(.request), !cues.contains(.commitment), owner == nil || ownerIsSpeaker {
+                owner = addressee(of: utterance, among: context.map(\.speaker))
             }
-            return ActionItem(
-                task: body, owner: owner, due: item.due.flatMap { groundedDue($0, spoken: spoken) },
-                sourceSegmentID: utterance.segmentID)
+            let due = item.due.flatMap { groundedDue($0, spoken: spoken) } ?? Grounding.deadline(in: utterance.text)
+            return ActionItem(task: body, owner: owner, due: due, sourceSegmentID: utterance.segmentID)
         }
         return UtteranceInsight(
             intent: intent,
-            correctedText: corrected,
-            correctionReason: corrected == nil ? nil : raw.correctionReason,
-            suggestion: raw.suggestion.flatMap(meaningfulSuggestion),
+            correctedText: correction?.text,
+            correctionReason: correction?.reason,
+            suggestion: raw.suggestion.flatMap(meaningfulSuggestion).flatMap { echoes($0, utterance.text) ? nil : $0 },
             actionItem: action)
     }
 
-    /// The one other participant named in a request ("Samantha, can you…"); nil when none or several are.
+    /// The other participant named in a request ("Samantha, can you…"): the only one named, or else the only
+    /// one named before the request itself ("Leo, can you estimate it once Priya's designs are ready?"); nil
+    /// when that is still ambiguous or nobody is named.
     static func addressee(of utterance: ContextLine, among speakers: [String]) -> String? {
         let said = words(utterance.text)
-        var named: [String] = []
+        var named: [(speaker: String, at: Int)] = []
         for speaker in speakers where speaker.caseInsensitiveCompare(utterance.speaker) != .orderedSame {
             let name = words(speaker)
-            guard !name.isEmpty, name.count <= said.count, !named.contains(speaker),
-                (0...(said.count - name.count)).contains(where: { Array(said[$0..<($0 + name.count)]) == name })
+            guard !name.isEmpty, !named.contains(where: { $0.speaker == speaker }),
+                let end = Grounding.ends(of: name, in: said).first
             else { continue }
-            named.append(speaker)
+            named.append((speaker, end - name.count))
         }
-        return named.count == 1 ? named[0] : nil
+        if named.count == 1 { return named[0].speaker }
+        let request = Grounding.requestCues.flatMap { cue in Grounding.ends(of: cue, in: said).map { $0 - cue.count } }.min()
+        let beforeRequest = named.filter { name in request.map { name.at < $0 } ?? false }
+        return beforeRequest.count == 1 ? beforeRequest[0].speaker : nil
     }
 
     /// Words that signal a speaker repairing what they just said ("Tuesday, sorry, I mean Wednesday").
@@ -225,6 +286,79 @@ enum ResultAssembler {
         }
     }
 
+    /// The user-facing reason for correcting `original` (a stretch of `line`, or all of it) to `corrected`, or nil
+    /// when the correction is not one of the three kinds. The reason comes from the kind, never from the model.
+    /// Edits that only drop fillers, hesitations or repeated words are never corrections.
+    static func correctionReason(
+        _ kind: CorrectionKind, original: String, corrected: String, line: ContextLine, contradicted: ContextLine?
+    ) -> String? {
+        guard isGenuineCorrection(corrected, of: line.text), Grounding.fluent(corrected) != Grounding.fluent(original),
+            Grounding.fluent(corrected) != Grounding.fluent(line.text)
+        else { return nil }
+        switch kind {
+        case .selfCorrection:
+            guard isRepair(corrected, in: line.text) else { return nil }
+            let speaker = line.speaker.trimmingCharacters(in: .whitespacesAndNewlines)
+            return speaker.isEmpty ? "Corrected themselves" : "\(speaker) corrected themselves"
+        case .contradiction:
+            guard let contradicted, contradicted != line, contradicts(corrected, said: line.text, cited: contradicted.text)
+            else { return nil }
+            let speaker = contradicted.speaker.trimmingCharacters(in: .whitespacesAndNewlines)
+            let when = TranscriptFormatter.timestamp(contradicted.time)
+            return speaker.isEmpty ? "Contradicts \(when)" : "Contradicts \(when) (\(speaker))"
+        case .mishearing:
+            return isLikelyMishearing(corrected, of: original) ? "Probably misheard" : nil
+        }
+    }
+
+    /// The speaker repaired themselves and `corrected` comes from the repair: the line has a repair cue with
+    /// replaced words before it ("Tuesday the fourteenth, sorry, I mean…") and `corrected` takes its new words
+    /// from after the cue, adding nothing the speaker did not say.
+    static func isRepair(_ corrected: String, in line: String) -> Bool {
+        let fixed = Grounding.contentStems(corrected)
+        let said = words(line)
+        let saidStems = Grounding.contentStems(line)
+        guard !fixed.isEmpty, fixed.allSatisfy({ word in saidStems.contains { Grounding.related(word, $0) } }) else { return false }
+        for cue in repairCues {
+            for end in Grounding.ends(of: cue, in: said) {
+                let start = end - cue.count
+                let replaced = Grounding.contentStems(said[max(0, start - 6)..<start].joined(separator: " "))
+                let repair = Grounding.contentStems(said[end...].joined(separator: " "))
+                let fromRepair = fixed.contains { word in
+                    repair.contains { Grounding.related(word, $0) } && !replaced.contains { Grounding.related(word, $0) }
+                }
+                let dropsSomething = replaced.contains { word in !fixed.contains { Grounding.related(word, $0) } }
+                if fromRepair, dropsSomething { return true }
+            }
+        }
+        return false
+    }
+
+    /// `corrected` restates `cited`: its words that the speaker did not say all come from the cited line, and the
+    /// speaker and the cited line talk about the same thing.
+    static func contradicts(_ corrected: String, said: String, cited: String) -> Bool {
+        let saidStems = Grounding.contentStems(said)
+        let citedStems = Grounding.contentStems(cited)
+        let added = Grounding.contentStems(corrected).filter { word in !saidStems.contains { Grounding.related(word, $0) } }
+        return !added.isEmpty
+            && added.allSatisfy { word in citedStems.contains { Grounding.related(word, $0) } }
+            && saidStems.contains { word in citedStems.contains { Grounding.related(word, $0) } }
+    }
+
+    /// A likely recognition error: one stretch of at most three words swapped for a similar-length stretch that
+    /// sounds alike ("last weak" → "last week"), the rest unchanged.
+    static func isLikelyMishearing(_ corrected: String, of original: String) -> Bool {
+        let said = Grounding.fluent(original)
+        let fixed = Grounding.fluent(corrected)
+        let prefix = zip(said, fixed).prefix { $0 == $1 }.count
+        let suffix = zip(said.dropFirst(prefix).reversed(), fixed.dropFirst(prefix).reversed()).prefix { $0 == $1 }.count
+        let heard = said[prefix..<(said.count - suffix)]
+        let meant = fixed[prefix..<(fixed.count - suffix)]
+        guard !heard.isEmpty, !meant.isEmpty, heard.count <= 3, meant.count <= 3, abs(heard.count - meant.count) <= 1
+        else { return false }
+        return Grounding.soundsAlike(heard.joined(), meant.joined())
+    }
+
     private static let labels: Set<String> = ["propose", "confirm", "ask", "clarify", "suggest", "suggestion", "task"]
 
     /// Splits leading labels off `text`. Small models stack them ("Propose: Confirm: …"); the last one is kept.
@@ -247,9 +381,14 @@ enum ResultAssembler {
         return label.map { "\($0): \(body)" } ?? body
     }
 
+    /// A suggestion that only repeats the utterance ("Clarify: Can you introduce yourself?").
+    static func echoes(_ suggestion: String, _ utterance: String) -> Bool {
+        Grounding.fluent(labelled(suggestion).body) == Grounding.fluent(utterance)
+    }
+
     /// Lowercased alphanumeric words.
     static func words(_ text: String) -> [String] {
-        text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        Grounding.words(text)
     }
 
     /// A due date is kept only when it was actually said: clock labels ("00:34", "[01:05]") are transcript
@@ -261,100 +400,6 @@ enum ResultAssembler {
             trimmed.range(of: #"^\[?\d{1,2}:\d{2}(:\d{2})?\]?$"#, options: .regularExpression) == nil
         else { return nil }
         return trimmed
-    }
-
-    static func report(
-        from raw: RawReport, transcript: [ContextLine], participants: [String], meetingTitle: String?,
-        generatedBy: String, generatedAt: Date = Date()
-    ) -> MeetingReport {
-        let givenTitle = meetingTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = (givenTitle?.isEmpty == false ? givenTitle : nil) ?? raw.title ?? "Meeting"
-
-        var linesByTimestamp: [String: [ContextLine]] = [:]
-        for line in transcript { linesByTimestamp[TranscriptFormatter.timestamp(line.time), default: []].append(line) }
-        let spoken = comparable(transcript.map(\.text).joined(separator: " "))
-        // A copy of a task may carry the deadline another copy omitted.
-        var dueByTask: [String: String] = [:]
-        for item in raw.actionItems {
-            guard let task = item.task, dueByTask[comparable(task)] == nil, let due = item.due.flatMap({ groundedDue($0, spoken: spoken) })
-            else { continue }
-            dueByTask[comparable(task)] = due
-        }
-
-        // The same task may come back several times (small models repeat themselves); keep it once, owned by
-        // whoever most of the copies name (earliest wins ties).
-        var ownerVotes: [String: [String: Int]] = [:]
-        var firstOwnerIndex: [String: [String: Int]] = [:]
-        for (index, item) in raw.actionItems.enumerated() {
-            guard let task = item.task, let owner = cleanedOwner(item.owner) else { continue }
-            ownerVotes[comparable(task), default: [:]][owner, default: 0] += 1
-            if firstOwnerIndex[comparable(task)]?[owner] == nil { firstOwnerIndex[comparable(task), default: [:]][owner] = index }
-        }
-        var seenTasks = Set<String>()
-        let actionItems = raw.actionItems.compactMap { item -> ActionItem? in
-            guard let task = item.task, seenTasks.insert(comparable(task)).inserted else { return nil }
-            let votes = ownerVotes[comparable(task)] ?? [:]
-            let firsts = firstOwnerIndex[comparable(task)] ?? [:]
-            let favourite = votes.max { a, b in a.value != b.value ? a.value < b.value : firsts[a.key, default: 0] > firsts[b.key, default: 0] }?.key
-            let claimedOwner = favourite ?? item.owner
-            let candidates = item.timestamp.map { linesByTimestamp[normalizedTimestamp($0)] ?? [] } ?? []
-            let ownerLine = candidates.first { $0.speaker.caseInsensitiveCompare(claimedOwner ?? "") == .orderedSame }
-            let source = ownerLine ?? candidates.first
-            let owner = source.map { resolveOwner(claimedOwner, speaker: $0.speaker) } ?? cleanedOwner(claimedOwner)
-            return ActionItem(task: task, owner: owner, due: dueByTask[comparable(task)], sourceSegmentID: source?.segmentID)
-        }
-
-        let topics = raw.topics.compactMap { topic -> TopicSummary? in
-            guard let title = topic.title else { return nil }
-            return TopicSummary(title: title, summary: topic.summary ?? "", speakers: deduplicated(topic.speakers))
-        }
-
-        let corrections = raw.corrections.compactMap { note -> CorrectionNote? in
-            guard let original = note.original, let corrected = note.corrected,
-                comparable(original) != comparable(corrected)
-            else { return nil }
-            return CorrectionNote(speaker: note.speaker ?? "Unknown", original: original, corrected: corrected, reason: note.reason ?? "")
-        }
-
-        return MeetingReport(
-            title: title,
-            overview: raw.overview ?? "",
-            topics: topics,
-            decisions: deduplicated(raw.decisions),
-            actionItems: actionItems,
-            notesToRemember: deduplicated(raw.notesToRemember),
-            missedOpportunities: deduplicated(raw.missedOpportunities),
-            openQuestions: deduplicated(raw.openQuestions),
-            corrections: corrections,
-            participantSummaries: participantSummaries(raw.participantSummaries, participants: participants, transcript: transcript),
-            generatedBy: generatedBy,
-            generatedAt: generatedAt)
-    }
-
-    /// Known participants first, in their given order; each name once with its points merged.
-    static func participantSummaries(_ raw: [RawParticipant], participants: [String], transcript: [ContextLine]) -> [ParticipantSummary] {
-        var order: [String] = []
-        var points: [String: [String]] = [:]
-        var displayName: [String: String] = [:]
-        for name in TranscriptFormatter.participantNames(participants: participants, transcript: transcript) {
-            let key = name.lowercased()
-            order.append(key)
-            displayName[key] = name
-        }
-        for entry in raw {
-            guard let name = entry.name else { continue }
-            let key = name.lowercased()
-            if displayName[key] == nil {
-                order.append(key)
-                displayName[key] = name
-            }
-            points[key, default: []].append(contentsOf: entry.keyPoints)
-        }
-        return order.compactMap { key in
-            let keyPoints = deduplicated(points[key] ?? [])
-            guard !keyPoints.isEmpty, let name = displayName[key] else { return nil }
-            return ParticipantSummary(name: name, keyPoints: keyPoints)
-        }
     }
 
     static func intent(from text: String?) -> UtteranceIntent {
@@ -379,21 +424,13 @@ enum ResultAssembler {
         return vague.contains(owner.lowercased()) ? nil : owner
     }
 
-    /// Accepts "1:05", "01:05", "[01:05]" or "1:05:00" style labels and returns the transcript's `mm:ss` form.
-    static func normalizedTimestamp(_ text: String) -> String {
-        let parts = text.filter { $0.isNumber || $0 == ":" }.split(separator: ":").compactMap { Int($0) }
-        let seconds: Int
-        switch parts.count {
-        case 2: seconds = parts[0] * 60 + parts[1]
-        case 3: seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
-        default: return text
-        }
-        return TranscriptFormatter.timestamp(TimeInterval(seconds))
-    }
-
     static func deduplicated(_ items: [String]) -> [String] {
         var seen = Set<String>()
         return items.filter { !comparable($0).isEmpty && seen.insert(comparable($0)).inserted }
+    }
+
+    static func unquoted(_ text: String) -> String {
+        text.trimmingCharacters(in: CharacterSet(charactersIn: "\"“”'‘’").union(.whitespaces))
     }
 
     /// Case-, punctuation- and spacing-insensitive form used to compare free text.
@@ -412,6 +449,22 @@ struct AnyKey: CodingKey {
     init?(intValue: Int) {
         stringValue = String(intValue)
         self.intValue = intValue
+    }
+}
+
+/// A cited line as a number (3) or a label ("L3", "lines 3 and 4"); null or anything else cites nothing.
+private struct LineLabel: Decodable {
+    var numbers: [Int]
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let number = try? c.decode(Double.self), number.isFinite, number >= 1, number < 1_000_000 {
+            numbers = [Int(number)]
+        } else if let text = try? c.decode(String.self) {
+            numbers = text.split { !$0.isNumber }.compactMap { Int($0) }
+        } else {
+            numbers = []
+        }
     }
 }
 
@@ -444,6 +497,20 @@ extension KeyedDecodingContainer where Key == AnyKey {
         }
         if let single = lenientString(key.stringValue) { return [single] }
         return []
+    }
+
+    /// Cited line numbers: numbers or "L3"-style labels, as an array or a single value ("L3, L5"); every digit run
+    /// counts once.
+    func lenientLines(_ key: String) -> [Int] {
+        let labels: [LineLabel]
+        if let many = try? decodeIfPresent([LineLabel].self, forKey: AnyKey(key)) {
+            labels = many
+        } else if let one = try? decodeIfPresent(LineLabel.self, forKey: AnyKey(key)) {
+            labels = [one]
+        } else {
+            labels = []
+        }
+        return labels.flatMap(\.numbers)
     }
 
     /// Decodes each element independently, skipping the ones that fail.

@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 import VCModels
 
@@ -153,6 +154,35 @@ struct ReportRendererTests {
         #expect(md.contains("| Remote \\| 1 | Remote | en-US | — | 12 s |"))
     }
 
+    @Test("Participants without transcript lines are left out, and the main voice model is named")
+    func speakingParticipantsAndVoiceModel() {
+        var m = sampleMeeting()
+        // A one-second diarization blip that never produced a line.
+        m.participants.append(Participant(id: "mic:9", displayName: "Speaker 2", channel: .microphone, speakingTime: 1))
+        let plain = ReportRenderer.markdown(m)
+        #expect(!plain.contains("Speaker 2"))
+        #expect(plain.contains("- **Participants:** Rishi, Speaker 1, Remote | 1\n"))
+        #expect(!plain.contains("Transcribed by"), "unknown voice model")
+        #expect(ReportRenderer.speakingParticipants(m).map(\.displayName) == ["Rishi", "Speaker 1", "Remote | 1"])
+
+        m.segments[0].engine = .apple
+        m.segments[1].engine = .cohere
+        m.segments[2].engine = .cohere
+        #expect(ReportRenderer.markdown(m).contains("- **Transcribed by:** Cohere Transcribe\n"))
+        m.segments[2].engine = nil
+        // A tie goes to the engine listed first.
+        #expect(ReportRenderer.transcriptionEngine(m) == .apple)
+    }
+
+    @Test("The report is asked about speakers only")
+    func reportParticipantsAreSpeakers() async throws {
+        var m = sampleMeeting()
+        m.participants.append(Participant(id: "mic:9", displayName: "Speaker 2", channel: .microphone, speakingTime: 1))
+        let engine = RecordingEngine()
+        _ = try await ReportWriter.report(for: m, engine: engine, title: nil)
+        #expect(engine.participants.withLock { $0 } == ["Rishi", "Speaker 1", "Remote | 1"])
+    }
+
     @Test("A meeting without a report still renders participants and transcript")
     func noReport() {
         var m = sampleMeeting()
@@ -172,5 +202,22 @@ struct ReportRendererTests {
         #expect(ReportRenderer.timestamp(3_599) == "59:59")
         #expect(ReportRenderer.timestamp(3_600) == "1:00:00")
         #expect(ReportRenderer.timestamp(-3) == "00:00")
+    }
+}
+
+/// Records the participants a report was requested for.
+private final class RecordingEngine: MeetingIntelligence {
+    let participants = Mutex<[String]>([])
+    var engineName: String { "Recorder" }
+
+    func analyze(utterance: ContextLine, recentContext: [ContextLine]) async throws -> UtteranceInsight {
+        UtteranceInsight(intent: .statement)
+    }
+
+    func report(transcript: [ContextLine], participants: [String], meetingTitle: String?) async throws -> MeetingReport {
+        self.participants.withLock { $0 = participants }
+        return MeetingReport(
+            title: "", overview: "", topics: [], decisions: [], actionItems: [], notesToRemember: [], missedOpportunities: [],
+            openQuestions: [], corrections: [], participantSummaries: [], generatedBy: engineName)
     }
 }

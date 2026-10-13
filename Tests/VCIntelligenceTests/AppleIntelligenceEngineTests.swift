@@ -63,10 +63,28 @@ struct AppleIntelligenceEngineTests {
         let transcript = try Fixture.transcript()
         let budget = AppleIntelligenceEngine.minimumTranscriptBudget
         // The fixture costs more than the forced budget, so it must be split into parts and merged.
-        #expect(TranscriptChunker.chunk(transcript, tokenBudget: budget).count >= 2)
+        #expect(TranscriptChunker.chunk(NumberedLine.numbering(transcript), tokenBudget: budget).count >= 2)
         let report = try await AppleIntelligenceEngine(transcriptTokenBudget: budget)
             .report(transcript: transcript, participants: try Fixture.speakers, meetingTitle: "Quarterly planning")
         try Self.expectFixtureReport(report, transcript: transcript)
+    }
+
+    /// The user's one-minute meeting: a blip participant, greetings, a request answered in the room.
+    @Test func regressionMeetingGetsABriefReportWithoutInventions() async throws {
+        let report = try await engine.report(transcript: Regression.transcript, participants: ["Ayo", "Speaker 1"], meetingTitle: nil)
+        #expect(report.decisions.isEmpty)
+        #expect(report.actionItems.isEmpty)
+        #expect(report.notesToRemember.isEmpty && report.missedOpportunities.isEmpty)
+        #expect(report.participantSummaries.isEmpty)
+        #expect(report.topics.count <= 1)
+    }
+
+    @Test(arguments: 0..<8)
+    func regressionLinesNeedNoCorrectionOrTask(index: Int) async throws {
+        let t = Regression.transcript
+        let insight = try await engine.analyze(utterance: t[index], recentContext: Array(t[..<index]))
+        #expect(insight.correctedText == nil, "corrected to \(insight.correctedText ?? "")")
+        #expect(insight.actionItem == nil)
     }
 
     @Test func emptyTranscriptReportsNothingWithoutInventing() async throws {

@@ -16,11 +16,11 @@ public enum TranscriptChunker {
     /// Every line lands in exactly one chunk, in order. A chunk exceeds `tokenBudget` only when it
     /// holds a single line that is by itself larger than the budget.
     public static func chunk(
-        _ lines: [ContextLine], tokenBudget: Int, cost: (ContextLine) -> Int = defaultCost
-    ) -> [[ContextLine]] {
+        _ lines: [NumberedLine], tokenBudget: Int, cost: (NumberedLine) -> Int = defaultCost
+    ) -> [[NumberedLine]] {
         precondition(tokenBudget > 0, "tokenBudget must be positive")
-        var chunks: [[ContextLine]] = []
-        var current: [ContextLine] = []
+        var chunks: [[NumberedLine]] = []
+        var current: [NumberedLine] = []
         var used = 0
         for line in lines {
             let lineCost = cost(line)
@@ -37,15 +37,20 @@ public enum TranscriptChunker {
     }
 
     /// Estimated cost of a line as it appears in a prompt, including its newline.
-    public static func defaultCost(_ line: ContextLine) -> Int {
+    public static func defaultCost(_ line: NumberedLine) -> Int {
         TokenEstimator.estimate(TranscriptFormatter.format(line)) + 1
     }
 
+    /// Estimated cost of a context line as it appears in a live-analysis prompt (numbered), including its newline.
+    public static func defaultCost(_ line: ContextLine) -> Int {
+        TokenEstimator.estimate(TranscriptFormatter.format(line)) + 3
+    }
+
     /// Splits any line costing more than `maxTokens` into consecutive word-boundary pieces that keep the
-    /// line's segment, speaker and time, so no single line can overflow a chunk. Words are never cut.
-    public static func splitLongLines(_ lines: [ContextLine], maxTokens: Int, cost: (ContextLine) -> Int = defaultCost) -> [ContextLine] {
+    /// line's number, segment, speaker and time, so no single line can overflow a chunk. Words are never cut.
+    public static func splitLongLines(_ lines: [NumberedLine], maxTokens: Int, cost: (NumberedLine) -> Int = defaultCost) -> [NumberedLine] {
         precondition(maxTokens > 0, "maxTokens must be positive")
-        var result: [ContextLine] = []
+        var result: [NumberedLine] = []
         result.reserveCapacity(lines.count)
         for line in lines {
             guard cost(line) > maxTokens else {
@@ -53,18 +58,18 @@ public enum TranscriptChunker {
                 continue
             }
             var piece = line
-            piece.text = ""
-            for word in line.text.split(whereSeparator: \.isWhitespace) {
+            piece.line.text = ""
+            for word in line.line.text.split(whereSeparator: \.isWhitespace) {
                 var candidate = piece
-                candidate.text = piece.text.isEmpty ? String(word) : piece.text + " " + word
-                if !piece.text.isEmpty, cost(candidate) > maxTokens {
+                candidate.line.text = piece.line.text.isEmpty ? String(word) : piece.line.text + " " + word
+                if !piece.line.text.isEmpty, cost(candidate) > maxTokens {
                     result.append(piece)
-                    piece.text = String(word)
+                    piece.line.text = String(word)
                 } else {
                     piece = candidate
                 }
             }
-            if !piece.text.isEmpty { result.append(piece) }
+            if !piece.line.text.isEmpty { result.append(piece) }
         }
         return result
     }

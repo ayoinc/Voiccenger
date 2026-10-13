@@ -6,7 +6,7 @@ import VCModels
 @Suite struct TranscriptChunkerTests {
     @Test(arguments: [40, 120, 400, 5_000])
     func chunksCoverTranscriptInOrderWithinBudget(budget: Int) throws {
-        let transcript = try Fixture.transcript()
+        let transcript = NumberedLine.numbering(try Fixture.transcript())
         let chunks = TranscriptChunker.chunk(transcript, tokenBudget: budget)
 
         #expect(chunks.flatMap { $0 } == transcript)
@@ -24,35 +24,35 @@ import VCModels
     }
 
     @Test func wholeTranscriptFitsOneChunkWhenBudgetAllows() throws {
-        let transcript = try Fixture.transcript()
+        let transcript = NumberedLine.numbering(try Fixture.transcript())
         let total = transcript.reduce(0) { $0 + TranscriptChunker.defaultCost($1) }
         #expect(TranscriptChunker.chunk(transcript, tokenBudget: total).count == 1)
         #expect(TranscriptChunker.chunk(transcript, tokenBudget: total - 1).count == 2)
         #expect(TranscriptChunker.chunk([], tokenBudget: 10).isEmpty)
     }
 
-    @Test func splitLongLinesKeepsEveryWordAndMetadata() {
+    @Test func splitLongLinesKeepsEveryWordNumberAndMetadata() {
         let id = UUID()
         let words = (1...400).map { "word\($0)" }
         let long = ContextLine(segmentID: id, speaker: "Karen", time: 754, text: words.joined(separator: "  \n"))
         let short = ContextLine(segmentID: UUID(), speaker: "Rishi", time: 760, text: "Agreed.")
         let maxTokens = 60
 
-        let pieces = TranscriptChunker.splitLongLines([long, short], maxTokens: maxTokens)
+        let pieces = TranscriptChunker.splitLongLines(NumberedLine.numbering([long, short]), maxTokens: maxTokens)
 
         #expect(pieces.count > 2)
-        #expect(pieces.last == short)
+        #expect(pieces.last == NumberedLine(number: 2, line: short))
         let longPieces = pieces.dropLast()
         #expect(longPieces.allSatisfy { TranscriptChunker.defaultCost($0) <= maxTokens })
-        #expect(longPieces.allSatisfy { $0.segmentID == id && $0.speaker == "Karen" && $0.time == 754 })
-        #expect(longPieces.flatMap { $0.text.split(separator: " ").map(String.init) } == words)
+        #expect(longPieces.allSatisfy { $0.number == 1 && $0.line.segmentID == id && $0.line.speaker == "Karen" && $0.line.time == 754 })
+        #expect(longPieces.flatMap { $0.line.text.split(separator: " ").map(String.init) } == words)
     }
 
     @Test func splitLongLinesKeepsOversizedSingleWordWhole() {
         let word = String(repeating: "x", count: 900)
         let line = ContextLine(segmentID: UUID(), speaker: "A", time: 0, text: "a \(word) b")
-        let pieces = TranscriptChunker.splitLongLines([line], maxTokens: 50)
-        #expect(pieces.map(\.text) == ["a", word, "b"])
+        let pieces = TranscriptChunker.splitLongLines(NumberedLine.numbering([line]), maxTokens: 50)
+        #expect(pieces.map(\.line.text) == ["a", word, "b"])
     }
 
     @Test func tailKeepsMostRecentLinesWithinBudget() throws {

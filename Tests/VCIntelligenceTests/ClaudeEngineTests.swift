@@ -96,8 +96,9 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
 
     static var insightInput: [String: Any] {
         [
-            "intent": "correction", "correctedText": "So let's target the launch for Wednesday the fifteenth.",
-            "correctionReason": "The speaker corrected the date.", "suggestion": NSNull(), "actionItem": NSNull(),
+            "intent": "correction", "correctionKind": "selfCorrection",
+            "correctedText": "So let's target the launch for Wednesday the fifteenth.", "contradictsLine": NSNull(),
+            "suggestion": NSNull(), "actionItem": NSNull(),
         ]
     }
 
@@ -115,6 +116,7 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
 
         #expect(insight.intent == .correction)
         #expect(insight.correctedText == "So let's target the launch for Wednesday the fifteenth.")
+        #expect(insight.correctionReason == "Daniel corrected themselves")
         #expect(insight.suggestion == nil && insight.actionItem == nil)
 
         let script = try #require(StubProtocol.script(key: key))
@@ -130,7 +132,12 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
         #expect(tools.first?["strict"] as? Bool == true)
         let schema = try #require(tools.first?["input_schema"] as? [String: Any])
         #expect(schema["additionalProperties"] as? Bool == false)
-        #expect(Set(schema["required"] as? [String] ?? []) == ["intent", "correctedText", "correctionReason", "suggestion", "actionItem"])
+        #expect(
+            Set(schema["required"] as? [String] ?? [])
+                == ["intent", "correctionKind", "correctedText", "contradictsLine", "suggestion", "actionItem"])
+        let properties = try #require(schema["properties"] as? [String: Any])
+        let kind = try #require(properties["correctionKind"] as? [String: Any])
+        #expect(kind["enum"] as? [String] == ["none", "selfCorrection", "contradiction", "mishearing"])
         let messages = try #require(body["messages"] as? [[String: Any]])
         #expect((messages.first?["content"] as? String)?.contains("Tuesday the fourteenth") == true)
     }
@@ -237,16 +244,24 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
             "title": "Quarterly planning review",
             "overview": "The team set the mobile app launch for Wednesday the fifteenth.",
             "topics": [["title": "Launch date", "summary": "Agreed on Wednesday the fifteenth.", "speakers": ["Daniel", "Samantha"]]],
-            "decisions": ["Launch on Wednesday the fifteenth.", "Freeze features by the end of the month."],
-            "actionItems": [
-                ["task": "Send the updated budget to everyone", "owner": "Rishi", "due": "Friday", "timestamp": "00:30"],
-                ["task": "Share the press kit with Karen's team", "owner": "Samantha", "due": "Monday", "timestamp": "00:39"],
+            "decisions": [
+                ["text": "Launch on Wednesday the fifteenth.", "lines": [5, 10]],
+                ["text": "Freeze features by the end of the month.", "lines": ["L6", "L7"]],
+                ["text": "Thank everyone for coming.", "lines": [10]],
             ],
-            "notesToRemember": ["Marketing needs at least three weeks of notice."],
+            "actionItems": [
+                ["task": "Send the updated budget to everyone", "owner": "Rishi", "due": "Friday", "lines": [7]],
+                ["task": "Share the press kit with Karen's team", "owner": "Samantha", "due": "Monday", "lines": [8, 9]],
+                ["task": "Start the planning review", "owner": "Daniel", "due": NSNull(), "lines": [1]],
+            ],
+            "notesToRemember": [["text": "Marketing needs at least three weeks of notice.", "lines": [4]]],
             "missedOpportunities": ["Nobody confirmed the launch leaves marketing three weeks of notice."],
             "openQuestions": [],
-            "corrections": [["speaker": "Daniel", "original": "Tuesday the fourteenth", "corrected": "Wednesday the fifteenth", "reason": "Self-correction"]],
-            "participantSummaries": [["name": "Karen", "keyPoints": ["Needs three weeks of notice."]]],
+            "corrections": [[
+                "speaker": "Daniel", "kind": "selfCorrection", "original": "Tuesday the fourteenth",
+                "corrected": "Wednesday the fifteenth", "lines": [5],
+            ]],
+            "participantSummaries": [["name": "Karen", "keyPoints": [["text": "Needs three weeks of notice.", "lines": [4]]]]],
         ]
         let engine = engine(key, replies: [Self.toolReply("record_meeting_report", input: input)])
 
@@ -255,11 +270,25 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
         #expect(StubProtocol.script(key: key)?.requests.count == 1)
         #expect(report.title == "Quarterly planning review")
         #expect(report.generatedBy == "Claude (\(ClaudeEngine.defaultModel))")
+        #expect(report.decisions == ["Launch on Wednesday the fifteenth.", "Freeze features by the end of the month."])
         #expect(report.actionItems.map(\.owner) == ["Rishi", "Samantha"])
         #expect(report.actionItems.map(\.sourceSegmentID) == [Fixture.segmentID(6), Fixture.segmentID(8)])
+        #expect(report.notesToRemember == ["Marketing needs at least three weeks of notice."])
+        #expect(report.participantSummaries == [ParticipantSummary(name: "Karen", keyPoints: ["Needs three weeks of notice."])])
         #expect(report.corrections.map(\.corrected) == ["Wednesday the fifteenth"])
-        let prompt = try #require((StubProtocol.script(key: key)?.bodies.first?["messages"] as? [[String: Any]])?.first?["content"] as? String)
-        #expect(transcript.allSatisfy { prompt.contains($0.text) })
+        #expect(report.corrections.map(\.reason) == ["Daniel corrected themselves"])
+        let body = try #require(StubProtocol.script(key: key)?.bodies.first)
+        let prompt = try #require((body["messages"] as? [[String: Any]])?.first?["content"] as? String)
+        for (index, line) in transcript.enumerated() {
+            #expect(prompt.contains("L\(index + 1) [\(TranscriptFormatter.timestamp(line.time))] \(line.speaker): \(line.text)"))
+        }
+        // The tool schema asks for cited lines on every list item.
+        let schema = try #require((body["tools"] as? [[String: Any]])?.first?["input_schema"] as? [String: Any])
+        let properties = try #require(schema["properties"] as? [String: Any])
+        for key in ["decisions", "actionItems", "notesToRemember", "openQuestions", "corrections"] {
+            let items = try #require((properties[key] as? [String: Any])?["items"] as? [String: Any])
+            #expect((items["required"] as? [String])?.contains("lines") == true, "\(key) lacks lines")
+        }
     }
 
     @Test func oversizedTranscriptIsRejectedBeforeAnyRequest() async throws {

@@ -1,5 +1,6 @@
 import Foundation
 import VCModels
+import VCTranscription
 
 /// Renders a meeting (report + attributed transcript) as Markdown.
 public enum ReportRenderer {
@@ -74,10 +75,14 @@ public enum ReportRenderer {
         }
         let kind = m.kind == .online ? "Online" + (m.appName.map { " (\($0))" } ?? "") : "In person"
         lines.append("- **Type:** \(kind)")
-        if !m.participants.isEmpty {
-            lines.append("- **Participants:** \(m.participants.map(\.displayName).joined(separator: ", "))")
+        let speaking = speakingParticipants(m)
+        if !speaking.isEmpty {
+            lines.append("- **Participants:** \(speaking.map(\.displayName).joined(separator: ", "))")
         }
         if !m.localeIDs.isEmpty { lines.append("- **Languages:** \(m.localeIDs.joined(separator: ", "))") }
+        if let engine = transcriptionEngine(m) {
+            lines.append("- **Transcribed by:** \(SpeechModelLibrary.info(engine).displayName)")
+        }
         if let r = m.report { lines.append("- **Report by:** \(r.generatedBy)") }
         return lines
     }
@@ -98,13 +103,31 @@ public enum ReportRenderer {
         return line
     }
 
+    /// Participants with at least one transcript line. Diarization blips (a second of audio clustered as a new
+    /// voice, never transcribed) stay in the meeting data but are not people in the report.
+    public static func speakingParticipants(_ m: Meeting) -> [Participant] {
+        let speakers = Set(m.segments.map(\.speakerKey))
+        return m.participants.filter { speakers.contains($0.id) }
+    }
+
+    /// The voice model that transcribed most segments; nil when no segment records one.
+    public static func transcriptionEngine(_ m: Meeting) -> SpeechEngineKind? {
+        var counts: [SpeechEngineKind: Int] = [:]
+        for engine in m.segments.compactMap(\.engine) { counts[engine, default: 0] += 1 }
+        // Ties go to the engine listed first, so the result does not depend on dictionary order.
+        return SpeechEngineKind.allCases.reduce(nil) { best, kind in
+            counts[kind, default: 0] > best.map { counts[$0, default: 0] } ?? 0 ? kind : best
+        }
+    }
+
     private static func participantTable(_ m: Meeting) -> [String] {
-        guard !m.participants.isEmpty else { return [] }
+        let participants = speakingParticipants(m)
+        guard !participants.isEmpty else { return [] }
         var lines = [
             "| Name | Source | Language | Seat | Speaking time |",
             "| --- | --- | --- | --- | --- |",
         ]
-        for p in m.participants {
+        for p in participants {
             let source = p.channel == .microphone ? "In room" : "Remote"
             let enrolled = p.isEnrolled ? " (enrolled)" : ""
             let seat = p.seatAzimuthDegrees.map { String(format: "%.0f°", $0) } ?? "—"

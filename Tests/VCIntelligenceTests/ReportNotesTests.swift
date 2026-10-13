@@ -5,19 +5,20 @@ import Testing
 @Suite struct ReportNotesTests {
     static func bulkyNotes(items: Int) -> RawReport {
         let list = (1...items).map { "Item \($0): a fact about the launch plan worth keeping in mind." }
+        let cited = list.enumerated().map { RawItem(text: $1, lines: [$0 + 1]) }
         return RawReport(
             title: "Launch",
             overview: "The team set the launch date. Marketing wants notice. Engineering is on track.",
             topics: (1...items).map { RawTopic(title: "Topic \($0)", summary: "Summary \($0).", speakers: ["Daniel"]) },
-            decisions: list,
-            actionItems: (1...items).map { RawActionItem(task: "Task \($0)", owner: "Rishi", due: "Friday", timestamp: "00:30") },
-            notesToRemember: list,
+            decisions: cited,
+            actionItems: (1...items).map { RawActionItem(task: "Task \($0)", owner: "Rishi", due: "Friday", lines: [7]) },
+            notesToRemember: cited,
             missedOpportunities: list,
-            openQuestions: list,
+            openQuestions: cited,
             corrections: (1...items).map {
-                RawCorrection(speaker: "Daniel", original: "Tuesday \($0)", corrected: "Wednesday \($0)", reason: "Slip")
+                RawCorrection(speaker: "Daniel", kind: "selfCorrection", original: "Tuesday \($0)", corrected: "Wednesday \($0)", lines: [5])
             },
-            participantSummaries: [RawParticipant(name: "Karen", keyPoints: list)])
+            participantSummaries: [RawParticipant(name: "Karen", keyPoints: cited)])
     }
 
     @Test func renderListsEverySectionAndSkipsEmptyOnes() {
@@ -25,9 +26,10 @@ import Testing
         notes.openQuestions = []
         let text = ReportNotes.render(notes)
         #expect(text.contains("Overview: The team set the launch date."))
-        #expect(text.contains("- Task 1 | owner: Rishi | due: Friday | at 00:30"))
-        #expect(text.contains("- Daniel: \"Tuesday 1\" -> \"Wednesday 1\" (Slip)"))
-        #expect(text.contains("- Karen: Item 1"))
+        #expect(text.contains("- Item 1: a fact about the launch plan worth keeping in mind. (L1)"))
+        #expect(text.contains("- Task 1 | owner: Rishi | due: Friday (L7)"))
+        #expect(text.contains("- Daniel: \"Tuesday 1\" -> \"Wednesday 1\" [selfCorrection] (L5)"))
+        #expect(text.contains("- Karen: Item 1: a fact about the launch plan worth keeping in mind. (L1)"))
         #expect(!text.contains("Open questions"))
     }
 
