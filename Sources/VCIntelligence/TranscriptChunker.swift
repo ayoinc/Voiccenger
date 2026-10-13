@@ -1,0 +1,84 @@
+import Foundation
+import VCModels
+
+/// Conservative token estimate used to size requests before they are sent.
+///
+/// Measured on the on-device model: meeting transcript lines run at ~3.6 UTF-8 bytes per token,
+/// so 3 bytes per token over-estimates by ~20%, which keeps chunks safely inside the window.
+public enum TokenEstimator {
+    public static func estimate(_ text: String) -> Int {
+        (text.utf8.count + 2) / 3
+    }
+}
+
+/// Splits a transcript into consecutive chunks that fit a token budget without ever splitting a line.
+public enum TranscriptChunker {
+    /// Every line lands in exactly one chunk, in order. A chunk exceeds `tokenBudget` only when it
+    /// holds a single line that is by itself larger than the budget.
+    public static func chunk(
+        _ lines: [ContextLine], tokenBudget: Int, cost: (ContextLine) -> Int = defaultCost
+    ) -> [[ContextLine]] {
+        precondition(tokenBudget > 0, "tokenBudget must be positive")
+        var chunks: [[ContextLine]] = []
+        var current: [ContextLine] = []
+        var used = 0
+        for line in lines {
+            let lineCost = cost(line)
+            if !current.isEmpty, used + lineCost > tokenBudget {
+                chunks.append(current)
+                current = []
+                used = 0
+            }
+            current.append(line)
+            used += lineCost
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    /// Estimated cost of a line as it appears in a prompt, including its newline.
+    public static func defaultCost(_ line: ContextLine) -> Int {
+        TokenEstimator.estimate(TranscriptFormatter.format(line)) + 1
+    }
+
+    /// Splits any line costing more than `maxTokens` into consecutive word-boundary pieces that keep the
+    /// line's segment, speaker and time, so no single line can overflow a chunk. Words are never cut.
+    public static func splitLongLines(_ lines: [ContextLine], maxTokens: Int, cost: (ContextLine) -> Int = defaultCost) -> [ContextLine] {
+        precondition(maxTokens > 0, "maxTokens must be positive")
+        var result: [ContextLine] = []
+        result.reserveCapacity(lines.count)
+        for line in lines {
+            guard cost(line) > maxTokens else {
+                result.append(line)
+                continue
+            }
+            var piece = line
+            piece.text = ""
+            for word in line.text.split(whereSeparator: \.isWhitespace) {
+                var candidate = piece
+                candidate.text = piece.text.isEmpty ? String(word) : piece.text + " " + word
+                if !piece.text.isEmpty, cost(candidate) > maxTokens {
+                    result.append(piece)
+                    piece.text = String(word)
+                } else {
+                    piece = candidate
+                }
+            }
+            if !piece.text.isEmpty { result.append(piece) }
+        }
+        return result
+    }
+
+    /// The most recent lines whose total cost fits `tokenBudget`, in original order.
+    static func tail(_ lines: [ContextLine], tokenBudget: Int, cost: (ContextLine) -> Int = defaultCost) -> [ContextLine] {
+        var used = 0
+        var start = lines.endIndex
+        while start > lines.startIndex {
+            let lineCost = cost(lines[start - 1])
+            if used + lineCost > tokenBudget { break }
+            used += lineCost
+            start -= 1
+        }
+        return Array(lines[start...])
+    }
+}

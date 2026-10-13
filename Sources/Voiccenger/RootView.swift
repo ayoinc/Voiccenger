@@ -1,0 +1,134 @@
+import SwiftUI
+import VCPipeline
+
+struct RootView: View {
+    @Environment(MeetingCoordinator.self) private var coordinator
+    @Environment(NavigationModel.self) private var navigation
+
+    var body: some View {
+        @Bindable var navigation = navigation
+        NavigationSplitView {
+            List(selection: $navigation.sidebar) {
+                Section {
+                    ForEach(SidebarItem.allCases) { item in
+                        Label(item.title, systemImage: item.symbol)
+                            .badge(badge(for: item))
+                            .tag(item)
+                    }
+                }
+                if !coordinator.recentMeetings.isEmpty {
+                    Section("Recent") {
+                        ForEach(coordinator.recentMeetings) { meeting in
+                            Button {
+                                navigation.showMeeting(meeting.id)
+                            } label: {
+                                Label(meeting.title, systemImage: meeting.kind == .online ? "video" : "person.3")
+                                    .lineLimit(1)
+                            }
+                            .buttonStyle(.plain)
+                            .help(meeting.startedAt.formatted(date: .abbreviated, time: .shortened))
+                        }
+                    }
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 280)
+        } detail: {
+            switch navigation.sidebar ?? .live {
+            case .live: LiveView()
+            case .meetings: MeetingsView()
+            case .people: PeopleView()
+            case .spatial: SpatialView()
+            }
+        }
+        .alert(
+            "Something went wrong",
+            isPresented: Binding(get: { coordinator.lastError != nil }, set: { if !$0 { coordinator.lastError = nil } }),
+            presenting: coordinator.lastError
+        ) { _ in
+            Button("OK", role: .cancel) { coordinator.lastError = nil }
+        } message: { message in
+            Text(message)
+        }
+    }
+
+    private func badge(for item: SidebarItem) -> Text? {
+        switch item {
+        case .live where coordinator.isRecording: Text("REC")
+        case .meetings where !coordinator.meetings.isEmpty: Text("\(coordinator.meetings.count)")
+        case .people where !coordinator.profiles.isEmpty: Text("\(coordinator.profiles.count)")
+        default: nil
+        }
+    }
+}
+
+struct MenuBarLabel: View {
+    let status: MeetingCoordinator.Status
+
+    var body: some View {
+        Image(systemName: StatusSymbol.name(for: status))
+            .accessibilityLabel("Voiccenger: \(StatusSymbol.label(for: status))")
+    }
+}
+
+struct MenuBarContent: View {
+    @Environment(MeetingCoordinator.self) private var coordinator
+    @Environment(NavigationModel.self) private var navigation
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Text(statusLine)
+        Divider()
+        if coordinator.session?.isActive == true {
+            Button("Stop Recording") { Task { await coordinator.stopRecording() } }
+                .keyboardShortcut("r")
+                .disabled(coordinator.status == .finishing)
+        } else {
+            if let detected = coordinator.detectedMeeting {
+                Button("Record \(detected.app.displayName) Meeting") {
+                    Task { await coordinator.startRecording(kind: .online, detected: detected) }
+                }
+                .keyboardShortcut("r")
+            }
+            Button("Start In-Person Meeting") { Task { await coordinator.startRecording(kind: .inPerson) } }
+        }
+        Divider()
+        Button("Open Voiccenger") { showWindow(.live) }
+            .keyboardShortcut("o")
+        if !coordinator.recentMeetings.isEmpty {
+            Menu("Recent Meetings") {
+                ForEach(coordinator.recentMeetings) { meeting in
+                    Button("\(meeting.title) — \(meeting.startedAt.formatted(date: .abbreviated, time: .shortened))") {
+                        showWindow(.meetings)
+                        navigation.showMeeting(meeting.id)
+                    }
+                }
+            }
+        }
+        Divider()
+        SettingsLink { Text("Settings…") }
+            .keyboardShortcut(",")
+        Button("Quit Voiccenger") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
+    }
+
+    private var statusLine: String {
+        switch coordinator.status {
+        case .idle: return "Not recording"
+        case .detected:
+            if let app = coordinator.detectedMeeting?.app.displayName { return "\(app) meeting detected" }
+            return "Conversation detected"
+        case .recording:
+            if let start = coordinator.session?.startedAt {
+                return "Recording since \(start.formatted(date: .omitted, time: .shortened))"
+            }
+            return "Starting…"
+        case .finishing: return "Writing report…"
+        }
+    }
+
+    private func showWindow(_ item: SidebarItem) {
+        navigation.sidebar = item
+        openWindow(id: WindowID.main)
+        NSApp.activate()
+    }
+}
