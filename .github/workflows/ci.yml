@@ -23,6 +23,9 @@ jobs:
 
       - name: Toolchain
         run: |
+          # Newest installed Xcode, so builds pick up the latest SDK (e.g. macOS 27 FoundationModels errors).
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)"
+          sudo xcode-select -s "$XCODE"
           sw_vers
           xcodebuild -version
           swift --version

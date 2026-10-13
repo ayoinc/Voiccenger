@@ -48,7 +48,7 @@ final class PCMStreamConverter {
 
     private func drain(
         expectedFrames: Int,
-        input: (UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer?
+        input: @escaping (UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer?
     ) throws -> [AVAudioPCMBuffer] {
         let capacity = AVAudioFrameCount((Double(expectedFrames) * ratio).rounded(.up)) + 1024
         var outputs: [AVAudioPCMBuffer] = []

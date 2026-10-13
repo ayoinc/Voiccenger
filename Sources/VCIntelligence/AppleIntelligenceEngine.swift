@@ -50,7 +50,12 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
     }
 
     private static var generationOptions: GenerationOptions {
+        // The macOS 27 SDK (Swift 6.4) renamed `sampling:` to `samplingMode:`.
+        #if compiler(>=6.4)
         GenerationOptions(samplingMode: .greedy)
+        #else
+        GenerationOptions(sampling: .greedy)
+        #endif
     }
 
     // MARK: Live analysis
@@ -235,7 +240,10 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
 
     static func isContextOverflow(_ error: any Error) -> Bool {
         if let error = error as? LanguageModelSession.GenerationError, case .exceededContextWindowSize = error { return true }
+        #if compiler(>=6.4)
+        // macOS 27 reports errors as `LanguageModelError`; the type only exists in its SDK.
         if #available(macOS 27.0, *), let error = error as? LanguageModelError, case .contextSizeExceeded = error { return true }
+        #endif
         return false
     }
 
@@ -254,6 +262,7 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
                 return error
             }
         }
+        #if compiler(>=6.4)
         if #available(macOS 27.0, *), let error = error as? LanguageModelError {
             switch error {
             case .guardrailViolation, .refusal:
@@ -264,6 +273,7 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
                 return error
             }
         }
+        #endif
         return error
     }
 }
