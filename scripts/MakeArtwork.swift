@@ -3,7 +3,7 @@
 //
 // Output:
 //   Resources/AppIcon.icns   app icon (all macOS sizes, via iconutil)
-//   docs/icon.png            1024 px icon for the README
+//   docs/icon.png            512 px icon for the README
 //   docs/banner.png          README banner
 //   Resources/dmg-background.tiff   installer window background (1x + 2x), 660 × 400 pt
 //
@@ -266,9 +266,9 @@ guard p.terminationStatus == 0 else { fatalError("iconutil failed") }
 try? FileManager.default.removeItem(at: iconset)
 print("wrote \(icns.path)")
 
-try savePNG(renderIcon(size: 1024), docs.appendingPathComponent("icon.png"))
+try savePNG(renderIcon(size: 512), docs.appendingPathComponent("icon.png"))
 print("wrote docs/icon.png")
-try savePNG(renderBanner(width: 2400, height: 720), docs.appendingPathComponent("banner.png"))
+try savePNG(renderBanner(width: 1600, height: 480), docs.appendingPathComponent("banner.png"))
 print("wrote docs/banner.png")
 
 /// Installer window background. Finder draws the app icon at (165, 190) and the Applications

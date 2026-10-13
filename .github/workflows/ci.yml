@@ -30,7 +30,7 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .build
           key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
@@ -40,14 +40,16 @@ jobs:
         run: swift build
 
       - name: Test
-        run: scripts/test.sh
+        run: |
+          swift scripts/MakeFixtures.swift
+          scripts/test.sh
 
       - name: Package (ad hoc)
         run: |
           scripts/bundle.sh
           scripts/make-dmg.sh dist/Voiccenger.app "dist/Voiccenger-${GITHUB_SHA::7}.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Voiccenger-${{ github.sha }}
           path: dist/*.dmg

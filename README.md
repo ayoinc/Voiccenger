@@ -52,7 +52,8 @@ Without the certificate/notary secrets the workflow still releases, ad-hoc signe
 
 Local equivalent of the pipeline:
 ```sh
-export SIGN_IDENTITY="Developer ID Application: Ayodele Ajayi (T8242XY72S)" VERSION=1.2.0
+# Pick the Developer ID identity by SHA-1 (`security find-identity -v -p codesigning`); names can be ambiguous.
+export SIGN_IDENTITY=CE6B8B4871E09778C148588B5718F827ABAD63A0 VERSION=1.2.0
 scripts/bundle.sh && scripts/make-dmg.sh dist/Voiccenger.app dist/Voiccenger-$VERSION.dmg
 NOTARY_KEYCHAIN_PROFILE=voiccenger-notary scripts/notarize.sh dist/Voiccenger-$VERSION.dmg
 ```

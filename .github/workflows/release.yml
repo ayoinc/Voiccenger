@@ -77,14 +77,16 @@ jobs:
           echo "build=$BUILD_NUMBER" >>"$GITHUB_OUTPUT"
           echo "Releasing $VERSION (build $BUILD_NUMBER)" >>"$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .build
           key: spm-release-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
           restore-keys: spm-${{ runner.os }}-
 
       - name: Test
-        run: scripts/test.sh
+        run: |
+          swift scripts/MakeFixtures.swift
+          scripts/test.sh
 
       - name: Import Developer ID certificate
         if: env.HAS_SIGNING == 'true'
