@@ -217,7 +217,8 @@ private struct ModelRow: View {
     }
 }
 
-/// Word error rates measured on 89 Speech Accent Archive speakers (54 African) reading the same paragraph.
+/// Word error rates on 89 Speech Accent Archive speakers (54 African) reading the same paragraph. Whisper and
+/// Cohere were measured through Voiccenger's own transcription path (what users get); Apple and Parakeet raw.
 private struct BenchmarkTable: View {
     private struct Row: Identifiable {
         let group: String
@@ -227,11 +228,11 @@ private struct BenchmarkTable: View {
 
     private static let engines = ["Apple", "Parakeet v3", "Whisper", "Cohere"]
     private static let rows = [
-        Row(group: "All speakers", rates: [0.102, 0.091, 0.051, 0.045]),
-        Row(group: "African", rates: [0.101, 0.080, 0.041, 0.039]),
-        Row(group: "West African", rates: [0.095, 0.065, 0.037, 0.030]),
-        Row(group: "East & Southern African", rates: [0.111, 0.105, 0.046, 0.054]),
-        Row(group: "Native English", rates: [0.013, 0.011, 0.007, 0.005]),
+        Row(group: "All speakers", rates: [0.102, 0.091, 0.057, 0.051]),
+        Row(group: "African", rates: [0.101, 0.080, 0.051, 0.043]),
+        Row(group: "West African", rates: [0.095, 0.065, 0.049, 0.034]),
+        Row(group: "East & Southern African", rates: [0.111, 0.105, 0.055, 0.057]),
+        Row(group: "Native English", rates: [0.013, 0.011, 0.005, 0.009]),
     ]
 
     var body: some View {
@@ -265,7 +266,7 @@ private struct BenchmarkTable: View {
                     }
                 }
             }
-            Text("Apple's British, American and South African English produce identical text: one acoustic model, with the locale only changing formatting. Parakeet v3 sometimes drifts into Dutch or Greek on accented English, so it isn't offered. Cohere is the default; Whisper understands 99 languages, including Swahili, Yoruba, Hausa and Amharic.")
+            Text("Apple's British, American and South African English produce identical text: one acoustic model, with the locale only changing formatting. Parakeet v3 sometimes drifts into Dutch or Greek on accented English, so it isn't offered. Cohere is the default; Whisper understands 100 languages, including Swahili, Yoruba, Hausa and Amharic.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -83,12 +83,12 @@ public actor SpeechModelLibrary {
             SpeechModelInfo(
                 kind: .cohere, displayName: "Cohere Transcribe",
                 summary: "Most accurate on accented English, including African accents. 14 languages; warms up for a few seconds per launch.",
-                downloadBytes: 2_220_000_000, languageCodes: CohereTranscriber.languageCodes, africanWordErrorRate: 0.039)
+                downloadBytes: 2_220_000_000, languageCodes: CohereTranscriber.languageCodes, africanWordErrorRate: 0.043)
         case .whisper:
             SpeechModelInfo(
                 kind: .whisper, displayName: "Whisper Large v3 Turbo",
                 summary: "Close second on accents, with word timings and name hints. 100 languages including Swahili, Yoruba, Hausa and Amharic.",
-                downloadBytes: 1_660_000_000, languageCodes: WhisperTranscriber.languageCodes, africanWordErrorRate: 0.041)
+                downloadBytes: 1_660_000_000, languageCodes: WhisperTranscriber.languageCodes, africanWordErrorRate: 0.051)
         case .apple:
             SpeechModelInfo(
                 kind: .apple, displayName: "Apple Speech",

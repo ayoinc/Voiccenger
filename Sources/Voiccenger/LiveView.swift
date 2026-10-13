@@ -202,15 +202,16 @@ private struct SessionHeader: View {
                 EngineStatusChip(
                     engine: session.config.speechEngine,
                     reported: session.speechEngineStatuses[session.config.speechEngine])
-                ForEach(session.currentLocales.sorted(by: { $0.key.rawValue < $1.key.rawValue }), id: \.key) { channel, locale in
-                    Label(Format.localeName(locale), systemImage: channel == .microphone ? "mic" : "speaker.wave.2")
+                ForEach(languages, id: \.locale) { language in
+                    Label(Format.localeName(language.locale), systemImage: symbol(for: language.channels))
                         .font(.callout)
                         .lineLimit(1)
                         .foregroundStyle(.secondary)
-                        .help("\(channel == .microphone ? "Room" : "Meeting audio") is transcribed as \(Format.localeName(locale))")
+                        .help("\(sources(language.channels)) transcribed as \(Format.localeName(language.locale))")
                 }
                 if let engine = session.intelligenceEngineName {
-                    Label(engine, systemImage: "sparkles")
+                    // "Apple Intelligence (on-device)" → "Apple Intelligence"; the full name is in the tooltip.
+                    Label(engine.components(separatedBy: " (").first ?? engine, systemImage: "sparkles")
                         .font(.callout)
                         .lineLimit(1)
                         .foregroundStyle(.secondary)
@@ -227,6 +228,29 @@ private struct SessionHeader: View {
         .padding(.horizontal)
         .padding(.vertical, 10)
         .background(.bar)
+    }
+
+    /// One entry per language being transcribed, with the channels using it (room and meeting audio usually match).
+    private var languages: [(locale: String, channels: [AudioChannel])] {
+        var result: [(locale: String, channels: [AudioChannel])] = []
+        for (channel, locale) in session.currentLocales.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+            if let i = result.firstIndex(where: { $0.locale == locale }) {
+                result[i].channels.append(channel)
+            } else {
+                result.append((locale, [channel]))
+            }
+        }
+        return result
+    }
+
+    private func symbol(for channels: [AudioChannel]) -> String {
+        guard channels.count == 1 else { return "character.bubble" }
+        return channels[0] == .microphone ? "mic" : "speaker.wave.2"
+    }
+
+    private func sources(_ channels: [AudioChannel]) -> String {
+        let names = channels.map { $0 == .microphone ? "Room audio" : "Meeting audio" }
+        return names.count == 1 ? "\(names[0]) is" : "\(Format.list(names)) are"
     }
 }
 
