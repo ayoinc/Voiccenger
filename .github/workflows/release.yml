@@ -1,0 +1,172 @@
+name: Release
+
+# Start from Actions › Release › Run workflow (or `gh workflow run release.yml -f bump=minor`).
+# Pushing a v* tag also releases that exact version.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump from the latest release
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version instead of a bump (e.g. 1.0.0)
+        type: string
+        required: false
+      prerelease:
+        description: Pre-release (not offered to installed apps as an update)
+        type: boolean
+        default: false
+  push:
+    tags: ['v[0-9]*']
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.NOTARY_API_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "$EXPLICIT" ]]; then
+            VERSION="${EXPLICIT#v}"
+          else
+            LATEST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+            IFS=. read -r MAJOR MINOR PATCH <<<"${LATEST#v}"
+            MAJOR="${MAJOR:-0}" MINOR="${MINOR:-0}" PATCH="${PATCH:-0}"
+            case "$BUMP" in
+              major) VERSION="$((MAJOR + 1)).0.0" ;;
+              minor) VERSION="$MAJOR.$((MINOR + 1)).0" ;;
+              *)     VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+            esac
+          fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::Invalid version '$VERSION'"; exit 1; }
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]] && git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::v$VERSION already exists"; exit 1
+          fi
+          BUILD_NUMBER="$(git rev-list --count HEAD)"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "build=$BUILD_NUMBER" >>"$GITHUB_OUTPUT"
+          echo "Releasing $VERSION (build $BUILD_NUMBER)" >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-release-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Test
+        run: scripts/test.sh
+
+      - name: Import Developer ID certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "$P12" | base64 --decode >"$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Build app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build }}
+          SIGN_IDENTITY: ${{ env.HAS_SIGNING == 'true' && secrets.MACOS_SIGNING_IDENTITY || '-' }}
+        run: scripts/bundle.sh
+
+      - name: Build DMG
+        timeout-minutes: 10
+        env:
+          SIGN_IDENTITY: ${{ env.HAS_SIGNING == 'true' && secrets.MACOS_SIGNING_IDENTITY || '-' }}
+        run: scripts/make-dmg.sh dist/Voiccenger.app "dist/Voiccenger-${{ steps.version.outputs.version }}.dmg"
+
+      - name: Notarize
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          export NOTARY_API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$P8" | base64 --decode >"$NOTARY_API_KEY_PATH"
+          trap 'rm -f "$NOTARY_API_KEY_PATH"' EXIT
+          scripts/notarize.sh "dist/Voiccenger-${{ steps.version.outputs.version }}.dmg"
+
+      - name: Sign update and write appcast
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SPARKLE_ED_PRIVATE_KEY" ]] || { echo "::error::SPARKLE_ED_PRIVATE_KEY secret missing"; exit 1; }
+          export SPARKLE_KEY_FILE="$RUNNER_TEMP/sparkle.key"
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" >"$SPARKLE_KEY_FILE"
+          trap 'rm -f "$SPARKLE_KEY_FILE"' EXIT
+          DMG="dist/Voiccenger-$VERSION.dmg"
+          REPO_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          scripts/appcast.sh "$DMG" "$VERSION" "$BUILD_NUMBER" \
+            "$REPO_URL/releases/download/v$VERSION/Voiccenger-$VERSION.dmg" \
+            "$REPO_URL/releases/tag/v$VERSION" dist/appcast.xml
+          (cd dist && shasum -a 256 "Voiccenger-$VERSION.dmg" >"Voiccenger-$VERSION.dmg.sha256")
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          FLAGS=(--title "Voiccenger $VERSION" --generate-notes --verify-tag)
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            git tag "v$VERSION" "$GITHUB_SHA"
+            git push origin "v$VERSION"
+          fi
+          [[ "$PRERELEASE" == "true" ]] && FLAGS+=(--prerelease) || FLAGS+=(--latest)
+          if [[ "$HAS_SIGNING" == "true" && "$HAS_NOTARY" == "true" ]]; then
+            NOTE="Signed with Developer ID and notarized by Apple."
+          else
+            NOTE="Ad-hoc signed: on first launch, right-click the app and choose Open."
+          fi
+          gh release create "v$VERSION" "${FLAGS[@]}" \
+            --notes "**Install:** open the DMG and drag Voiccenger to Applications. $NOTE Installed copies update themselves via **Voiccenger › Check for Updates…**." \
+            "dist/Voiccenger-$VERSION.dmg" "dist/Voiccenger-$VERSION.dmg.sha256" dist/appcast.xml
+          echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$VERSION" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Remove signing keychain
+        if: always() && env.HAS_SIGNING == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true

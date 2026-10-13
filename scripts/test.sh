@@ -10,4 +10,8 @@ if [[ ! -d "$PLUGINS" ]]; then
     PLUGINS="/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing"
 fi
 
-exec swift test -Xswiftc -plugin-path -Xswiftc "$PLUGINS" "$@"
+# Xcode toolchains find the Testing plugin on their own; only the Command Line Tools need the hint.
+if [[ -d "$PLUGINS" ]]; then
+    exec swift test -Xswiftc -plugin-path -Xswiftc "$PLUGINS" "$@"
+fi
+exec swift test "$@"

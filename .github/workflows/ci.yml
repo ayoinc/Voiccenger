@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: scripts/test.sh
+
+      - name: Package (ad hoc)
+        run: |
+          scripts/bundle.sh
+          scripts/make-dmg.sh dist/Voiccenger.app "dist/Voiccenger-${GITHUB_SHA::7}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Voiccenger-${{ github.sha }}
+          path: dist/*.dmg
+          retention-days: 14

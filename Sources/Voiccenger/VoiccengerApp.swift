@@ -11,6 +11,7 @@ struct VoiccengerApp: App {
     @ViewState private var coordinator: MeetingCoordinator
     @ViewState private var enrollment: EnrollmentService
     @ViewState private var navigation = NavigationModel()
+    @ViewState private var updater = AppUpdater()
 
     init() {
         let coordinator = MeetingCoordinator()
@@ -29,12 +30,16 @@ struct VoiccengerApp: App {
                 .frame(minWidth: 820, minHeight: 520)
         }
         .defaultSize(width: 1100, height: 720)
-        .commands { MeetingCommands(coordinator: coordinator, navigation: navigation) }
+        .commands {
+            MeetingCommands(coordinator: coordinator, navigation: navigation)
+            CommandGroup(after: .appInfo) { CheckForUpdatesButton(updater: updater) }
+        }
 
         MenuBarExtra {
             MenuBarContent()
                 .environment(coordinator)
                 .environment(navigation)
+                .environment(updater)
                 .task { await coordinator.launch() }
         } label: {
             MenuBarLabel(status: coordinator.status)
@@ -45,6 +50,7 @@ struct VoiccengerApp: App {
             SettingsView()
                 .environment(coordinator)
                 .environment(coordinator.settings)
+                .environment(updater)
         }
     }
 }

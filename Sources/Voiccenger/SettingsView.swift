@@ -21,6 +21,7 @@ struct SettingsView: View {
 
 private struct GeneralSettings: View {
     @Environment(AppSettings.self) private var settings
+    @Environment(AppUpdater.self) private var updater
 
     var body: some View {
         @Bindable var settings = settings
@@ -48,6 +49,7 @@ private struct GeneralSettings: View {
                 Text("Saves each meeting's audio next to its transcript.")
                     .settingsFootnote()
             }
+            UpdateSettingsSection(updater: updater)
         }
         .formStyle(.grouped)
     }
@@ -320,7 +322,7 @@ private struct AudioSettings: View {
     }
 }
 
-private extension Text {
+extension Text {
     func settingsFootnote() -> some View {
         font(.callout).foregroundStyle(.secondary)
     }

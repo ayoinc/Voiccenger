@@ -5,6 +5,7 @@
 //   Resources/AppIcon.icns   app icon (all macOS sizes, via iconutil)
 //   docs/icon.png            1024 px icon for the README
 //   docs/banner.png          README banner
+//   Resources/dmg-background.tiff   installer window background (1x + 2x), 660 × 400 pt
 //
 // Motif: a meeting table seen from above. Radial waveform bars form the ring of seats;
 // each seat dot is a speaker colour, the active speaker's bars are tall and a direction
@@ -269,3 +270,66 @@ try savePNG(renderIcon(size: 1024), docs.appendingPathComponent("icon.png"))
 print("wrote docs/icon.png")
 try savePNG(renderBanner(width: 2400, height: 720), docs.appendingPathComponent("banner.png"))
 print("wrote docs/banner.png")
+
+/// Installer window background. Finder draws the app icon at (165, 190) and the Applications
+/// link at (495, 190) (points, top-left origin); scripts/make-dmg.sh uses the same positions.
+func renderDMGBackground(scale: Int) -> CGImage {
+    let w = 660 * scale, h = 400 * scale
+    let s = CGFloat(scale)
+    let ctx = context(w, h)
+    let g = CGGradient(colorsSpace: nil, colors: [rgb(0xF5F2FF), rgb(0xE7F8F5)] as CFArray, locations: [0, 1])!
+    ctx.drawLinearGradient(g, start: CGPoint(x: 0, y: CGFloat(h)), end: CGPoint(x: CGFloat(w), y: 0), options: [])
+
+    ctx.saveGState()
+    ctx.setAlpha(0.07)
+    drawMark(ctx, center: CGPoint(x: CGFloat(w) / 2, y: CGFloat(h) * 0.52), radius: CGFloat(h) * 0.55)
+    ctx.restoreGState()
+
+    // Arrow from the app slot to the Applications slot.
+    let y = CGFloat(400 - 190) * s
+    ctx.setStrokeColor(rgb(0x4B2FB0, 0.75))
+    ctx.setLineWidth(5 * s)
+    ctx.setLineCap(.round)
+    ctx.setLineJoin(.round)
+    ctx.move(to: CGPoint(x: 262 * s, y: y))
+    ctx.addLine(to: CGPoint(x: 398 * s, y: y))
+    ctx.strokePath()
+    ctx.move(to: CGPoint(x: 380 * s, y: y + 16 * s))
+    ctx.addLine(to: CGPoint(x: 400 * s, y: y))
+    ctx.addLine(to: CGPoint(x: 380 * s, y: y - 16 * s))
+    ctx.strokePath()
+
+    let gctx = NSGraphicsContext(cgContext: ctx, flipped: false)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = gctx
+    let para = NSMutableParagraphStyle()
+    para.alignment = .center
+    NSAttributedString(
+        string: "Drag Voiccenger to Applications to install",
+        attributes: [
+            .font: NSFont.systemFont(ofSize: 15 * s, weight: .medium),
+            .foregroundColor: NSColor(cgColor: rgb(0x24175E, 0.8))!,
+            .paragraphStyle: para,
+        ]
+    ).draw(in: CGRect(x: 0, y: 52 * s, width: CGFloat(w), height: 24 * s))
+    NSGraphicsContext.restoreGraphicsState()
+    return ctx.makeImage()!
+}
+
+let bgDir = FileManager.default.temporaryDirectory.appendingPathComponent("vc-dmg-bg")
+try? FileManager.default.removeItem(at: bgDir)
+try FileManager.default.createDirectory(at: bgDir, withIntermediateDirectories: true)
+try savePNG(renderDMGBackground(scale: 1), bgDir.appendingPathComponent("background.png"))
+try savePNG(renderDMGBackground(scale: 2), bgDir.appendingPathComponent("background@2x.png"))
+let tiff = Process()
+tiff.executableURL = URL(fileURLWithPath: "/usr/bin/tiffutil")
+tiff.arguments = [
+    "-cathidpicheck", bgDir.appendingPathComponent("background.png").path,
+    bgDir.appendingPathComponent("background@2x.png").path,
+    "-out", resources.appendingPathComponent("dmg-background.tiff").path,
+]
+try tiff.run()
+tiff.waitUntilExit()
+guard tiff.terminationStatus == 0 else { fatalError("tiffutil failed") }
+try? FileManager.default.removeItem(at: bgDir)
+print("wrote Resources/dmg-background.tiff")

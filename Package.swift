@@ -10,6 +10,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git", .upToNextMinor(from: "0.17.7")),
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.10.0"),
     ],
     targets: [
         // Shared value types and protocols. No framework dependencies beyond Foundation.
@@ -32,7 +33,10 @@ let package = Package(
             name: "VCPipeline",
             dependencies: ["VCModels", "VCAudio", "VCTranscription", "VCSpeakers", "VCSpatial", "VCIntelligence"]
         ),
-        .executableTarget(name: "Voiccenger", dependencies: ["VCPipeline"]),
+        .executableTarget(
+            name: "Voiccenger",
+            dependencies: ["VCPipeline", .product(name: "Sparkle", package: "Sparkle")]
+        ),
         .executableTarget(name: "voiccenger-cli", dependencies: ["VCPipeline"]),
 
         .testTarget(name: "VCModelsTests", dependencies: ["VCModels"]),

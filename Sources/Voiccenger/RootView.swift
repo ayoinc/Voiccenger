@@ -73,6 +73,7 @@ struct MenuBarLabel: View {
 struct MenuBarContent: View {
     @Environment(MeetingCoordinator.self) private var coordinator
     @Environment(NavigationModel.self) private var navigation
+    @Environment(AppUpdater.self) private var updater
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -107,6 +108,9 @@ struct MenuBarContent: View {
         Divider()
         SettingsLink { Text("Settings…") }
             .keyboardShortcut(",")
+        if updater.isAvailable {
+            CheckForUpdatesButton(updater: updater)
+        }
         Button("Quit Voiccenger") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
     }
