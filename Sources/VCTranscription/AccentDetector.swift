@@ -56,17 +56,3 @@ public struct AccentDetector: Sendable {
         }
     }
 }
-
-/// Convenience offline transcription of a file (CLI/tests).
-public enum FileTranscriber {
-    /// Transcribes the whole file (any format AVAudioFile reads) and returns the final results in order;
-    /// ranges are seconds from the start of the file. Installs the locale's assets first if needed.
-    public static func transcribe(url: URL, localeID: String, channel: AudioChannel = .microphone) async throws
-        -> [TranscriptUpdate]
-    {
-        guard SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
-        try await SpeechAssets.ensureInstalled(localeIDs: [localeID])
-        let locale = try await SpeechAssets.resolveInstalledLocale(localeID)
-        return try await OfflineRecognizer.transcribe(url: url, locale: locale, channel: channel)
-    }
-}

@@ -4,6 +4,7 @@ import UserNotifications
 import VCAudio
 import VCModels
 import VCSpeakers
+import VCTranscription
 
 /// App-level owner of meeting detection, the active `MeetingSession`, saved meetings and voice profiles.
 ///
@@ -11,7 +12,8 @@ import VCSpeakers
 /// they are recorded automatically or announced with a notification offering to start. In-person meetings
 /// are detected from sustained conversation on the microphone (only when the user enabled it) and are always
 /// announced rather than recorded. A session started for a detected online meeting stops when the app
-/// releases the microphone.
+/// releases the microphone. Until the user acknowledges telling participants they're being recorded, every
+/// start waits for confirmation (`pendingRecording`) and nothing is recorded automatically.
 @MainActor @Observable
 public final class MeetingCoordinator {
     public enum Status: Sendable, Hashable {
@@ -20,6 +22,13 @@ public final class MeetingCoordinator {
         case detected
         case recording
         case finishing
+    }
+
+    /// A recording waiting for the user to confirm they'll tell the participants.
+    public struct RecordingRequest: Sendable, Hashable, Identifiable {
+        public let id = UUID()
+        public let kind: MeetingKind?
+        public let detected: DetectedMeeting?
     }
 
     public let settings: AppSettings
@@ -37,6 +46,9 @@ public final class MeetingCoordinator {
     public private(set) var profiles: [SpeakerProfile] = []
     /// The most recent user-facing failure (start/stop/storage).
     public var lastError: String?
+    /// Set when a recording was requested before `AppSettings.recordingConsentAcknowledged`; the app asks the
+    /// user to confirm (`confirmPendingRecording`) or cancel (`cancelPendingRecording`).
+    public private(set) var pendingRecording: RecordingRequest?
 
     public var status: Status {
         if let session {
@@ -58,6 +70,7 @@ public final class MeetingCoordinator {
     @ObservationIgnored private var monitorTask: Task<Void, Never>?
     @ObservationIgnored private var notifier: MeetingNotifier?
     @ObservationIgnored private var launched = false
+    @ObservationIgnored private var prewarmTask: Task<Void, Never>?
 
     public init(settings: AppSettings = AppSettings(), paths: AppPaths = .default) {
         self.settings = settings
@@ -78,13 +91,38 @@ public final class MeetingCoordinator {
         await reloadProfiles()
         applySettings()
         observeSettings()
+        prepareSpeechEngine()
+        observeSpeechEngine()
     }
 
     // MARK: - Recording
 
     /// Starts recording. Without arguments: the detected online meeting if any, else an in-person meeting.
+    /// Until the user has acknowledged telling participants, this only sets `pendingRecording`.
     public func startRecording(kind: MeetingKind? = nil, detected: DetectedMeeting? = nil) async {
         guard session?.isActive != true else { return }
+        guard settings.recordingConsentAcknowledged else {
+            pendingRecording = RecordingRequest(kind: kind, detected: detected)
+            return
+        }
+        await beginRecording(kind: kind, detected: detected)
+    }
+
+    /// Starts the pending recording after the user confirmed they'll tell participants. `remember` stops
+    /// future recordings from asking (and allows automatic recording of detected meetings).
+    public func confirmPendingRecording(remember: Bool) async {
+        guard let request = pendingRecording else { return }
+        pendingRecording = nil
+        if remember { settings.recordingConsentAcknowledged = true }
+        guard session?.isActive != true else { return }
+        await beginRecording(kind: request.kind, detected: request.detected)
+    }
+
+    public func cancelPendingRecording() {
+        pendingRecording = nil
+    }
+
+    private func beginRecording(kind: MeetingKind?, detected: DetectedMeeting?) async {
         let meeting = detected ?? (kind == .inPerson ? nil : detectedMeeting)
         let resolvedKind = kind ?? (meeting != nil ? .online : .inPerson)
         stopMonitor()
@@ -92,8 +130,7 @@ public final class MeetingCoordinator {
         conversationDetectedAt = nil
         lastError = nil
         await reloadProfiles()
-        var config = settings.sessionConfig(kind: resolvedKind, detected: meeting, meetingsDirectory: paths.meetings)
-        config.contextualStrings += profiles.map(\.name)
+        let config = settings.sessionConfig(kind: resolvedKind, detected: meeting, meetingsDirectory: paths.meetings)
         let session = MeetingSession(config: config, profiles: profiles)
         self.session = session
         do {
@@ -267,6 +304,47 @@ public final class MeetingCoordinator {
         }
     }
 
+    // MARK: - Voice model
+
+    /// Loads and warms the selected voice model in the background (downloading it first when missing and
+    /// automatic downloads are on), so meetings get its text from the first line. Apple needs no preparation.
+    private func prepareSpeechEngine() {
+        prewarmTask?.cancel()
+        let engine = settings.speechEngine
+        guard engine != .apple else { return }
+        let download = settings.downloadModelsAutomatically
+        let library = SpeechModelLibrary.shared
+        prewarmTask = Task { [weak self] in
+            do {
+                let status = await library.status(engine)
+                if !SessionVoices.availableEngines([engine: status]).contains(engine) {
+                    guard download else { return }
+                    try await library.download(engine)
+                }
+                try Task.checkCancellation()
+                try await library.prewarm(engine)
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.lastError =
+                    "\(SpeechModelLibrary.info(engine).displayName) couldn't be prepared: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func observeSpeechEngine() {
+        withObservationTracking {
+            _ = settings.speechEngine
+            _ = settings.downloadModelsAutomatically
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.prepareSpeechEngine()
+                self.observeSpeechEngine()
+            }
+        }
+    }
+
     private func startDetector() {
         guard detector == nil else { return }
         let detector = MeetingDetector()
@@ -324,7 +402,7 @@ public final class MeetingCoordinator {
         case .meetingStarted(let meeting):
             detectedMeeting = meeting
             guard session?.isActive != true else { return }
-            if settings.autoRecordOnline {
+            if settings.autoRecordOnline, settings.recordingConsentAcknowledged {
                 await startRecording(kind: .online, detected: meeting)
             } else {
                 notifier?.postMeetingDetected(appName: meeting.app.displayName)
@@ -333,6 +411,12 @@ public final class MeetingCoordinator {
         case .meetingEnded(let meeting):
             guard detectedMeeting?.app.bundleID == meeting.app.bundleID else { return }
             detectedMeeting = nil
+            if let request = pendingRecording,
+                request.detected?.app.bundleID == meeting.app.bundleID || (request.detected == nil && request.kind == .online)
+            {
+                // The meeting the user was asked about is over.
+                pendingRecording = nil
+            }
             notifier?.removeAll()
             if let session, session.state == .recording,
                 session.config.detectedMeeting?.app.bundleID == meeting.app.bundleID

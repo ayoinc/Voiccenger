@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Mac App Store build. Must match Resources/embedded profile "Voiccenger Mac App Store". -->
+	<key>com.apple.application-identifier</key>
+	<string>T8242XY72S.com.voiccenger.app</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>T8242XY72S</string>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- Microphone, and audio from meeting apps via Core Audio process taps (sandbox-compatible). -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- Speech model downloads (Hugging Face) and the optional Claude API. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- Exporting meeting reports to a location the user picks. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+</dict>
+</plist>

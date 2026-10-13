@@ -99,25 +99,41 @@ let usage = """
       devices                          List audio input devices and apps using the microphone.
       detect [--watch]                 Show conferencing apps using the microphone; --watch streams
                                        debounced meeting start/end events until interrupted.
-      enroll <name> <wav> [--store dir]
-                                       Enroll a voice from a recording (≥ 5 s of speech) and detect its accent.
+      enroll <name> <wav> [options]    Enroll a voice from a recording (≥ 5 s of speech).
+          --store dir                  Profile store (default: the app's library)
+          --accent id / --lives id     Accent and home regions, e.g. ng, gb (see `calibrate --regions`)
+          --language code              Language they speak in meetings (default: en)
+          --engine cohere|whisper|apple Voice model for their lines (overrides calibration)
+          --standard | --text file     The recording reads the standard passage / this text: also calibrate
+                                       the voice models on it and save the best as their engine
       profiles [--store dir]           List enrolled voices.
-      transcribe <file> [--locale en-GB]
-                                       Transcribe an audio file with timestamps.
-      accent <file> [--candidates en-GB,en-US,...]
-                                       Rank locales/accents by recognition confidence on a recording.
+      models                           List voice models: status, size, languages, measured accuracy.
+      models download <engine>         Download a voice model (cohere, whisper).
+      models delete <engine>           Delete a downloaded voice model.
+      transcribe <file> [--engine cohere|whisper|apple] [--language en]
+                                       Transcribe an audio file with timestamps (default engine: cohere).
+      calibrate <wav> [options]        Score every downloaded voice model on a reading of a known text.
+          --standard                   The recording reads the Speech Accent Archive passage
+          --text file                  The recording reads this text
+          --name N [--region id]       Without --standard/--text: the recording reads the enrollment
+                                       passage (standard + a sentence with N and a place in the region)
+          --engines cohere,whisper     Engines to score (default: Apple plus every downloaded model)
+          --language code              Language of the reading (default: en)
+          --regions                    List accent/residence region ids and exit
       process <file> [options]         Run a recording through the full meeting pipeline
                                        (transcription, speaker identification, analysis, report).
           --profiles dir               Enrolled voices (default: the app's library)
-          --engine apple|claude        Intelligence engine (default: apple; falls back to the other)
-          --locale id                  Recognizer locale (default: system locale)
+          --engine cohere|whisper|apple Voice model (default: cohere; downloaded if missing)
+          --intelligence apple|claude  Intelligence engine (default: apple; falls back to the other)
+          --locale id                  Apple preview locale and meeting language (default: system locale)
+          --spelling british|american  Spelling for speakers without their own preference
           --title text                 Meeting title (default: proposed by the report, else the file name)
           --out report.md              Write the Markdown report here (default: print it)
           --json meeting.json          Also write the meeting as JSON
           --meetings dir               Store the meeting here (default: a temporary directory)
           --truth truth.json           Score per-turn speaker accuracy against ground truth
           --no-analysis                Skip live per-line analysis (the report is still written)
-          --no-auto-language           Keep the recognizer on --locale
+          --no-auto-language           Keep the Apple preview on --locale
       system-audio [--seconds 5] [--pids 123,456] [--out capture.wav]
                                        Capture system audio through a Core Audio process tap (all apps, or
                                        only --pids), report its level, optionally record it.
@@ -177,22 +193,38 @@ func enroll(_ a: inout Arguments) async throws {
     let name = try a.positional(0, "<name>")
     let url = try fileURL(try a.positional(1, "<wav>"))
     let store = SpeakerProfileStore(directory: directoryURL(a.option("store"), default: AppPaths.default.profiles))
+    let accent = try a.option("accent").map(region)
+    let lives = try a.option("lives").map(region)
+    let language = a.option("language")
+    let manualEngine = try a.option("engine").map(engine)
+    let expected = try readingText(&a, name: nil, region: nil, required: false)
     try a.checkUnused()
     eprint("Preparing speaker models…")
     try await SpeakerModels.prepare()
     let samples = try AudioResampler.load16kMono(url: url)
     let existing = await store.all().first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
-    let outcome = try await EnrollmentService.enroll(name: name, samples16k: samples, store: store, replacing: existing)
-    let p = outcome.profile
-    print("\(existing == nil ? "Enrolled" : "Re-enrolled") \(p.name) (\(p.id.uuidString)) with \(p.embeddings.count) voice sample(s).")
-    if outcome.accentScores.isEmpty {
-        print("Accent: not detected (speech assets unavailable)")
-    } else {
-        print("Accent: \(p.preferredLocaleID ?? outcome.accentScores[0].localeID)")
-        for s in outcome.accentScores {
-            print("  \(pad(s.localeID, 8)) confidence \(String(format: "%.3f", s.meanConfidence))  words \(s.wordCount)")
-        }
+    var voice = existing?.voice ?? VoiceSettings()
+    if let accent { voice.accentRegionID = accent.id }
+    if let lives { voice.residenceRegionID = lives.id }
+    if let language { voice.languageCode = language }
+    var replacing = existing
+    replacing?.voice = voice
+    var transcribers: [any AccurateTranscriber] = []
+    if expected != nil {
+        eprint("Loading voice models for calibration…")
+        transcribers = await EnrollmentService.calibrationTranscribers()
     }
+    let outcome = try await EnrollmentService.enroll(
+        name: name, samples16k: samples, store: store, replacing: replacing, voice: voice, calibrationText: expected,
+        transcribers: transcribers)
+    var p = outcome.profile
+    if let manualEngine, p.voice.preferredEngine != manualEngine {
+        p.voice.preferredEngine = manualEngine
+        try await store.upsert(p)
+    }
+    print("\(existing == nil ? "Enrolled" : "Re-enrolled") \(p.name) (\(p.id.uuidString)) with \(p.embeddings.count) voice sample(s).")
+    if expected != nil { printCalibration(outcome.calibration, suggestions: outcome.suggestedReplacements) }
+    print("Engine: \(p.voice.preferredEngine.map { SpeechModelLibrary.info($0).displayName } ?? "meeting default")")
 }
 
 func profiles(_ a: inout Arguments) async throws {
@@ -201,48 +233,229 @@ func profiles(_ a: inout Arguments) async throws {
     let all = await store.all().sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     if all.isEmpty { print("No enrolled voices.") }
     for p in all {
-        print("\(pad(p.name, 20)) accent \(pad(p.preferredLocaleID ?? "—", 7)) samples \(p.embeddings.count)  \(p.id.uuidString)")
+        let v = p.voice
+        let engine = v.preferredEngine?.rawValue ?? "default"
+        let wer = v.calibration?.best.map { " (WER \(percent($0.wordErrorRate)))" } ?? ""
+        print(
+            "\(pad(p.name, 20)) accent \(pad(v.accentRegionID ?? "—", 3)) lives \(pad(v.residenceRegionID ?? "—", 3)) language \(pad(v.languageCode, 3)) engine \(pad(engine + wer, 22)) samples \(p.embeddings.count)  \(p.id.uuidString)"
+        )
+    }
+}
+
+func models(_ a: inout Arguments) async throws {
+    let library = SpeechModelLibrary.shared
+    switch a.positional.first {
+    case nil:
+        try a.checkUnused()
+        for info in SpeechModelLibrary.allInfo {
+            let status = describe(await library.status(info.kind))
+            let size = info.downloadBytes > 0 ? ByteCountFormatter.string(fromByteCount: info.downloadBytes, countStyle: .file) : "built in"
+            let wer = info.africanWordErrorRate.map { "African-accent WER \(percent($0))" } ?? ""
+            print(
+                "\(pad(info.kind.rawValue, 8)) \(pad(info.displayName, 24)) \(pad(status, 16)) \(pad(size, 9)) \(pad("\(info.languageCodes.count) languages", 13)) \(wer)"
+            )
+            print("         \(info.summary)")
+        }
+    case "download":
+        let kind = try engine(try a.positional(1, "<engine>"))
+        try a.checkUnused()
+        guard kind != .apple else {
+            print("Apple Speech is built in; its language assets download on first use.")
+            return
+        }
+        try await download(kind)
+        let status = describe(await library.status(kind))
+        print("\(SpeechModelLibrary.info(kind).displayName): \(status)")
+    case "delete":
+        let kind = try engine(try a.positional(1, "<engine>"))
+        try a.checkUnused()
+        guard kind != .apple else { throw UsageError("Apple Speech is built in and can't be deleted") }
+        try await library.delete(kind)
+        print("Deleted \(SpeechModelLibrary.info(kind).displayName).")
+    case let action?:
+        throw UsageError("unknown models action “\(action)” (use download or delete)")
     }
 }
 
 func transcribe(_ a: inout Arguments) async throws {
     let url = try fileURL(try a.positional(0, "<file>"))
-    let locale = a.option("locale") ?? AppSettings.systemLocaleID
+    let kind = try a.option("engine").map(engine) ?? .cohere
+    let language = a.option("language") ?? SessionVoices.languageCode(ofLocale: AppSettings.systemLocaleID)
     try a.checkUnused()
-    try await SpeechAssets.ensureInstalled(localeIDs: [locale])
-    let updates = try await FileTranscriber.transcribe(url: url, localeID: locale)
+    let started = ContinuousClock.now
+    let updates: [TranscriptUpdate]
+    if kind == .apple {
+        // Apple's recognizer needs a locale: the system's region when it speaks this language.
+        let system = AppSettings.systemLocaleID
+        let locale = SessionVoices.languageCode(ofLocale: system) == language ? system : language
+        try await SpeechAssets.ensureInstalled(localeIDs: [locale])
+        updates = try await FileTranscriber.transcribe(url: url, localeID: locale)
+    } else {
+        try await ensureDownloaded(kind)
+        eprint("Loading \(SpeechModelLibrary.info(kind).displayName)…")
+        try await SpeechModelLibrary.shared.prewarm(kind)
+        eprint("Loaded in \(seconds(since: started)).")
+        updates = try await FileTranscriber.transcribe(
+            url: url, engine: kind, languageCode: language, prompt: [], customization: nil)
+    }
     for u in updates {
         let conf = u.confidence.map { String(format: " (%.2f)", $0) } ?? ""
         print("[\(ReportRenderer.timestamp(u.range.start))–\(ReportRenderer.timestamp(u.range.end))]\(conf) \(u.text)")
     }
+    eprint("\(updates.count) line(s) by \(engineSummary(updates.map(\.engine))) in \(seconds(since: started)).")
 }
 
-func accent(_ a: inout Arguments) async throws {
-    let url = try fileURL(try a.positional(0, "<file>"))
-    let candidateList = a.option("candidates")
+func calibrate(_ a: inout Arguments) async throws {
+    if a.flag("regions") {
+        try a.checkUnused()
+        for r in AccentRegions.all {
+            print("\(pad(r.id, 4)) \(pad(r.name, 26)) \(pad(r.continent, 14)) \(r.englishName)  (\(r.vocabulary.count) names/places)")
+        }
+        return
+    }
+    let url = try fileURL(try a.positional(0, "<wav>"))
+    let name = a.option("name")
+    let area = try a.option("region").map(region)
+    let language = a.option("language") ?? "en"
+    let engineList = try a.option("engines").map { list in
+        try list.split(separator: ",").map { try engine($0.trimmingCharacters(in: .whitespaces)) }
+    }
+    guard let expected = try readingText(&a, name: name, region: area, required: true) else { return }
     try a.checkUnused()
-    let candidates: [String]
-    if let candidateList {
-        candidates = candidateList.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    } else {
-        candidates = await EnrollmentService.defaultAccentCandidates()
-    }
-    guard !candidates.isEmpty else { throw UsageError("no candidate locales (pass --candidates)") }
-    try await SpeechAssets.ensureInstalled(localeIDs: candidates)
+
     let samples = try AudioResampler.load16kMono(url: url)
-    let ranked = try await AccentDetector().rank(samples: samples, sampleRate: 16_000, candidateLocaleIDs: candidates)
-    for (i, s) in ranked.enumerated() {
-        print("\(i + 1). \(pad(s.localeID, 8)) confidence \(String(format: "%.3f", s.meanConfidence))  words \(s.wordCount)")
-        if i == 0 { print("   “\(s.transcript)”") }
+    eprint("Loading voice models…")
+    let loadStarted = ContinuousClock.now
+    let transcribers: [any AccurateTranscriber]
+    if let engineList {
+        var loaded: [any AccurateTranscriber] = []
+        for kind in engineList {
+            try await ensureDownloaded(kind)
+            loaded.append(try await SpeechModelLibrary.shared.transcriber(kind))
+        }
+        transcribers = loaded
+    } else {
+        transcribers = await EnrollmentService.calibrationTranscribers(languageCode: language)
     }
+    eprint("Loaded \(transcribers.map(\.kind.rawValue).joined(separator: ", ")) in \(seconds(since: loadStarted)); transcribing…")
+    let profile = SpeakerProfile(name: name ?? "", embeddings: [], voice: VoiceSettings(accentRegionID: area?.id))
+    let started = ContinuousClock.now
+    let result = await EnrollmentService.calibrate(
+        samples16k: samples, expected: expected, transcribers: transcribers, languageCode: language,
+        vocabulary: EnrollmentService.calibrationVocabulary(for: profile))
+    eprint("Scored in \(seconds(since: started)).")
+    printCalibration(result.calibration, suggestions: result.suggestedReplacements)
+}
+
+/// The text a recording reads: `--text file`, `--standard`, else (with a name) the enrollment passage.
+func readingText(_ a: inout Arguments, name: String?, region: AccentRegion?, required: Bool) throws -> String? {
+    let standard = a.flag("standard")
+    if let path = a.option("text") {
+        guard !standard else { throw UsageError("pass either --standard or --text") }
+        return try String(contentsOf: fileURL(path), encoding: .utf8)
+    }
+    if standard { return CalibrationPassages.standard }
+    if let name { return EnrollmentService.passage(name: name, region: region) }
+    if required { throw UsageError("say what the recording reads: --standard, --text <file>, or --name <name>") }
+    return nil
+}
+
+func printCalibration(_ calibration: VoiceCalibration, suggestions: [TextReplacement]) {
+    guard let best = calibration.best else {
+        print("Calibration: no voice model could transcribe the recording.")
+        return
+    }
+    print("Calibration (word error rate, best first):")
+    for (i, s) in calibration.scores.enumerated() {
+        print("  \(i + 1). \(pad(SpeechModelLibrary.info(s.engine).displayName, 24)) \(pad(percent(s.wordErrorRate), 6))  “\(s.transcript)”")
+    }
+    print("Best: \(SpeechModelLibrary.info(best.engine).displayName)")
+    if !suggestions.isEmpty {
+        print("Suggested corrections:")
+        for r in suggestions { print("  heard “\(r.heard)” → “\(r.meant)”") }
+    }
+}
+
+func engine(_ raw: String) throws -> SpeechEngineKind {
+    guard let kind = SpeechEngineKind(rawValue: raw.lowercased()) else {
+        throw UsageError("unknown engine “\(raw)” (use \(SpeechEngineKind.allCases.map(\.rawValue).joined(separator: ", ")))")
+    }
+    return kind
+}
+
+func region(_ raw: String) throws -> AccentRegion {
+    guard let r = AccentRegions.region(raw.lowercased()) else {
+        throw UsageError("unknown region “\(raw)” (list them with `calibrate --regions`)")
+    }
+    return r
+}
+
+func describe(_ status: ModelStatus) -> String {
+    switch status {
+    case .notDownloaded: "not downloaded"
+    case .downloading(let f): "downloading \(Int(f * 100))%"
+    case .downloaded: "downloaded"
+    case .loading: "loading"
+    case .ready: "ready"
+    case .failed(let reason): "failed: \(reason)"
+    }
+}
+
+func percent(_ fraction: Double) -> String { String(format: "%.1f%%", fraction * 100) }
+
+func seconds(since start: ContinuousClock.Instant) -> String {
+    (ContinuousClock.now - start).formatted(.units(allowed: [.seconds], fractionalPart: .show(length: 1)))
+}
+
+/// "cohere 24, apple 1" — how many lines each engine produced.
+func engineSummary(_ engines: [SpeechEngineKind?]) -> String {
+    var counts: [String: Int] = [:]
+    for e in engines { counts[e?.rawValue ?? "unknown", default: 0] += 1 }
+    return counts.sorted { $0.value > $1.value }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
+}
+
+/// Downloads `kind` unless it's already on this Mac, printing progress.
+func ensureDownloaded(_ kind: SpeechEngineKind) async throws {
+    guard kind != .apple else { return }
+    let status = await SpeechModelLibrary.shared.status(kind)
+    if SessionVoices.availableEngines([kind: status]).contains(kind) { return }
+    try await download(kind)
+}
+
+func download(_ kind: SpeechEngineKind) async throws {
+    let info = SpeechModelLibrary.info(kind)
+    eprint("Downloading \(info.displayName) (\(ByteCountFormatter.string(fromByteCount: info.downloadBytes, countStyle: .file)))…")
+    let updates = SpeechModelLibrary.shared.statusUpdates
+    let progress = Task {
+        var shown = -1
+        for await (k, status) in updates where k == kind {
+            guard case .downloading(let fraction) = status else { continue }
+            let pct = Int(fraction * 100)
+            if pct / 10 > shown / 10 {
+                shown = pct
+                eprint("  \(pct)%")
+            }
+        }
+    }
+    defer { progress.cancel() }
+    try await SpeechModelLibrary.shared.download(kind)
 }
 
 @MainActor
 func process(_ a: inout Arguments) async throws {
     let url = try fileURL(try a.positional(0, "<file>"))
     let profileStore = SpeakerProfileStore(directory: directoryURL(a.option("profiles"), default: AppPaths.default.profiles))
-    let engineName = a.option("engine") ?? IntelligenceEngineKind.apple.rawValue
-    guard let engine = IntelligenceEngineKind(rawValue: engineName) else { throw UsageError("--engine must be apple or claude") }
+    let speechEngine = try a.option("engine").map(engine) ?? .cohere
+    let intelligenceName = a.option("intelligence") ?? IntelligenceEngineKind.apple.rawValue
+    guard let intelligence = IntelligenceEngineKind(rawValue: intelligenceName) else {
+        throw UsageError("--intelligence must be apple or claude")
+    }
+    let spelling = try a.option("spelling").map { raw in
+        guard let s = SpellingVariant(rawValue: raw.lowercased()) else {
+            throw UsageError("--spelling must be british, american or unchanged")
+        }
+        return s
+    } ?? .unchanged
     let locale = a.option("locale") ?? AppSettings.systemLocaleID
     let title = a.option("title")
     let out = a.option("out")
@@ -255,17 +468,19 @@ func process(_ a: inout Arguments) async throws {
     let autoLanguage = !a.flag("no-auto-language")
     try a.checkUnused()
 
+    try await ensureDownloaded(speechEngine)
     let profiles = await profileStore.all()
-    eprint("Processing \(url.lastPathComponent) with \(profiles.count) enrolled voice(s)…")
+    eprint("Processing \(url.lastPathComponent) with \(SpeechModelLibrary.info(speechEngine).displayName) and \(profiles.count) enrolled voice(s)…")
     let config = MeetingSession.Config(
-        title: title, kind: .inPerson, localeID: locale, autoLanguage: autoLanguage, engineKind: engine,
-        recordAudio: false, meetingsDirectory: meetingsDir, liveAnalysis: analysis)
+        title: title, kind: .inPerson, localeID: locale, autoLanguage: autoLanguage, engineKind: intelligence,
+        speechEngine: speechEngine, spelling: spelling, recordAudio: false, meetingsDirectory: meetingsDir,
+        liveAnalysis: analysis)
     let started = ContinuousClock.now
     let meeting = try await MeetingSession.processFile(url: url, config: config, profiles: profiles)
-    let elapsed = ContinuousClock.now - started
     eprint(
-        "Done in \(elapsed.formatted(.units(allowed: [.seconds], fractionalPart: .show(length: 1)))): \(meeting.segments.count) lines, \(meeting.participants.count) participant(s); saved to \(meetingsDir.appending(path: meeting.id.uuidString).path)"
+        "Done in \(seconds(since: started)): \(meeting.segments.count) lines, \(meeting.participants.count) participant(s); saved to \(meetingsDir.appending(path: meeting.id.uuidString).path)"
     )
+    eprint("Lines by engine: \(engineSummary(meeting.segments.map(\.engine)))")
     if meeting.report == nil { eprint("No report was written (no intelligence engine available or it failed).") }
 
     let markdown = ReportRenderer.markdown(meeting)
@@ -436,6 +651,8 @@ func speechShapedNoise(seconds: Double, sampleRate: Double) -> [Float] {
 
 let commandFlags: [String: Set<String>] = [
     "detect": ["watch"],
+    "enroll": ["standard"],
+    "calibrate": ["standard", "regions"],
     "process": ["no-analysis", "no-auto-language"],
 ]
 
@@ -456,8 +673,9 @@ do {
     case "detect": try await detect(&args)
     case "enroll": try await enroll(&args)
     case "profiles": try await profiles(&args)
+    case "models": try await models(&args)
     case "transcribe": try await transcribe(&args)
-    case "accent": try await accent(&args)
+    case "calibrate": try await calibrate(&args)
     case "process": try await process(&args)
     case "doa": try doa(&args)
     case "system-audio": try await systemAudio(&args)

@@ -1,11 +1,23 @@
-import Combine
 import Foundation
-import Sparkle
 import SwiftUI
 
-/// SwiftUI's `@State` macro needs a compiler plugin missing from the Command Line Tools; the property wrapper works.
-private typealias ViewState = SwiftUI.State
+#if Sparkle
+import Combine
+import Sparkle
+#endif
 
+/// How this build gets updates. Direct-download builds (the default `Sparkle` package trait) update
+/// themselves with Sparkle; Mac App Store builds (`--disable-default-traits`) are updated by the App Store.
+enum DistributionChannel {
+    /// DMG from GitHub Releases, updated by Sparkle.
+    case direct
+    /// `swift run` / unbundled build: no feed URL, no updates.
+    case development
+    /// Mac App Store build: Sparkle is not linked.
+    case appStore
+}
+
+#if Sparkle
 /// Sparkle updater for the bundled app. Updates come from the appcast attached to the latest
 /// GitHub Release (`SUFeedURL`) and must carry an EdDSA signature matching `SUPublicEDKey`.
 ///
@@ -20,6 +32,7 @@ final class AppUpdater {
     private(set) var canCheckForUpdates = false
 
     var isAvailable: Bool { controller != nil }
+    var channel: DistributionChannel { isAvailable ? .direct : .development }
 
     var automaticallyChecksForUpdates: Bool {
         get {
@@ -66,7 +79,17 @@ final class AppUpdater {
     func checkForUpdates() {
         controller?.checkForUpdates(nil)
     }
+}
+#else
+/// Mac App Store build: the App Store installs updates, so there is nothing to drive in-app.
+@MainActor @Observable
+final class AppUpdater {
+    var isAvailable: Bool { false }
+    var channel: DistributionChannel { .appStore }
+}
+#endif
 
+extension AppUpdater {
     /// Marketing version and build number of the running app, e.g. "1.2.0 (42)".
     static var versionDescription: String {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -76,13 +99,17 @@ final class AppUpdater {
     }
 }
 
-/// "Check for Updates…" for the app menu and the menu bar extra.
+/// "Check for Updates…" for the app menu and the menu bar extra; absent when this build can't update itself.
 struct CheckForUpdatesButton: View {
     let updater: AppUpdater
 
     var body: some View {
-        Button("Check for Updates…") { updater.checkForUpdates() }
-            .disabled(!updater.canCheckForUpdates)
+        #if Sparkle
+        if updater.isAvailable {
+            Button("Check for Updates…") { updater.checkForUpdates() }
+                .disabled(!updater.canCheckForUpdates)
+        }
+        #endif
     }
 }
 
@@ -93,6 +120,7 @@ struct UpdateSettingsSection: View {
     var body: some View {
         Section {
             LabeledContent("Version", value: AppUpdater.versionDescription)
+            #if Sparkle
             if updater.isAvailable {
                 Toggle("Automatically check for updates", isOn: $updater.automaticallyChecksForUpdates)
                 Toggle("Automatically download and install updates", isOn: $updater.automaticallyDownloadsUpdates)
@@ -106,15 +134,22 @@ struct UpdateSettingsSection: View {
                     CheckForUpdatesButton(updater: updater)
                 }
             }
+            #endif
         } header: {
             Text("Updates")
         } footer: {
-            Text(
-                updater.isAvailable
-                    ? "Updates are downloaded from GitHub Releases and verified with Voiccenger's signing key before installing."
-                    : "Updates are available in the installed app. Development builds don't update themselves."
-            )
-            .settingsFootnote()
+            Text(footer).settingsFootnote()
+        }
+    }
+
+    private var footer: String {
+        switch updater.channel {
+        case .direct:
+            "Updates are downloaded from GitHub Releases and verified with Voiccenger's signing key before installing."
+        case .development:
+            "Updates are available in the installed app. Development builds don't update themselves."
+        case .appStore:
+            "Voiccenger is updated by the Mac App Store."
         }
     }
 }

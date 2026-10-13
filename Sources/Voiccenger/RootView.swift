@@ -40,6 +40,11 @@ struct RootView: View {
             case .spatial: SpatialView()
             }
         }
+        .sheet(
+            item: Binding(get: { coordinator.pendingRecording }, set: { if $0 == nil { coordinator.cancelPendingRecording() } })
+        ) { _ in
+            RecordingConsentSheet()
+        }
         .alert(
             "Something went wrong",
             isPresented: Binding(get: { coordinator.lastError != nil }, set: { if !$0 { coordinator.lastError = nil } }),
@@ -62,11 +67,39 @@ struct RootView: View {
 }
 
 struct MenuBarLabel: View {
-    let status: MeetingCoordinator.Status
+    let coordinator: MeetingCoordinator
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: StatusSymbol.name(for: status))
+        let status = coordinator.status
+        icon(status)
             .accessibilityLabel("Voiccenger: \(StatusSymbol.label(for: status))")
+            .onChange(of: coordinator.pendingRecording) { _, request in
+                // A recording asked for from the menu bar or a notification needs a window for the consent sheet.
+                guard request != nil, !MainWindow.isVisible else { return }
+                openWindow(id: WindowID.main)
+                NSApp.activate()
+            }
+    }
+
+    /// Red while recording (menu bar symbols are otherwise monochrome templates).
+    @ViewBuilder
+    private func icon(_ status: MeetingCoordinator.Status) -> some View {
+        if status == .recording,
+            let symbol = NSImage(systemSymbolName: StatusSymbol.name(for: status), accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.white, .systemRed]))
+        {
+            Image(nsImage: symbol)
+        } else {
+            Image(systemName: StatusSymbol.name(for: status))
+        }
+    }
+}
+
+enum MainWindow {
+    /// Whether a main window is on screen (SwiftUI identifies them "<WindowGroup id>-AppWindow-<n>").
+    @MainActor static var isVisible: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.identifier?.rawValue.hasPrefix(WindowID.main) == true }
     }
 }
 

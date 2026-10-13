@@ -42,7 +42,7 @@ struct VoiccengerApp: App {
                 .environment(updater)
                 .task { await coordinator.launch() }
         } label: {
-            MenuBarLabel(status: coordinator.status)
+            MenuBarLabel(coordinator: coordinator)
         }
         .menuBarExtraStyle(.menu)
 

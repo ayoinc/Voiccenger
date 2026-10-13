@@ -59,30 +59,6 @@ enum Fixtures {
         guard let url = url("meeting.truth.json") else { throw CocoaError(.fileNoSuchFile) }
         return try JSONDecoder().decode([Turn].self, from: Data(contentsOf: url))
     }
-
-    /// Lower-cased words without punctuation, for order-insensitive text comparison.
-    static func normalizedWords(_ text: String) -> [String] {
-        text.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-    }
-
-    /// Word error rate of `hypothesis` against `reference` (Levenshtein over normalized words).
-    static func wordErrorRate(reference: String, hypothesis: String) -> Double {
-        let ref = normalizedWords(reference)
-        let hyp = normalizedWords(hypothesis)
-        guard !ref.isEmpty else { return hyp.isEmpty ? 0 : 1 }
-        var previous = Array(0...hyp.count)
-        for i in 1...ref.count {
-            var current = [i] + Array(repeating: 0, count: hyp.count)
-            for j in stride(from: 1, through: hyp.count, by: 1) {
-                let substitution = previous[j - 1] + (ref[i - 1] == hyp[j - 1] ? 0 : 1)
-                current[j] = min(substitution, previous[j] + 1, current[j - 1] + 1)
-            }
-            previous = current
-        }
-        return Double(previous[hyp.count]) / Double(ref.count)
-    }
 }
 
 /// Collects transcriber events concurrently so the producer never waits on the test.

@@ -32,6 +32,9 @@ jobs:
   release:
     runs-on: macos-26
     timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
     env:
       HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
       HAS_NOTARY: ${{ secrets.NOTARY_API_KEY_P8 != '' }}
@@ -179,3 +182,82 @@ jobs:
       - name: Remove signing keychain
         if: always() && env.HAS_SIGNING == 'true'
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  # Same version/build, sandboxed and without Sparkle, uploaded to App Store Connect for TestFlight.
+  # Submitting for App Review stays a manual step in App Store Connect.
+  app-store:
+    needs: release
+    if: ${{ !inputs.prerelease }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      HAS_MAS: ${{ secrets.MAS_APP_CERTIFICATE_P12 != '' && secrets.MAS_PROVISIONING_PROFILE != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Import App Store certificates and profile
+        if: env.HAS_MAS == 'true'
+        env:
+          APP_P12: ${{ secrets.MAS_APP_CERTIFICATE_P12 }}
+          APP_P12_PASSWORD: ${{ secrets.MAS_APP_CERTIFICATE_PASSWORD }}
+          INSTALLER_P12: ${{ secrets.MAS_INSTALLER_CERTIFICATE_P12 }}
+          INSTALLER_P12_PASSWORD: ${{ secrets.MAS_INSTALLER_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/mas.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          curl -fsSL -o "$RUNNER_TEMP/AppleWWDRCAG3.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$KEYCHAIN"
+          echo "$APP_P12" | base64 --decode >"$RUNNER_TEMP/app.p12"
+          echo "$INSTALLER_P12" | base64 --decode >"$RUNNER_TEMP/installer.p12"
+          security import "$RUNNER_TEMP/app.p12" -k "$KEYCHAIN" -P "$APP_P12_PASSWORD" -T /usr/bin/codesign
+          security import "$RUNNER_TEMP/installer.p12" -k "$KEYCHAIN" -P "$INSTALLER_P12_PASSWORD" -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/installer.p12"
+          echo "$PROFILE" | base64 --decode >"$RUNNER_TEMP/Voiccenger.provisionprofile"
+          security find-identity -v "$KEYCHAIN"
+
+      - name: Build App Store package
+        if: env.HAS_MAS == 'true'
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          BUILD_NUMBER: ${{ needs.release.outputs.build }}
+          MAS_APP_IDENTITY: "Apple Distribution: Ayodele Ajayi (T8242XY72S)"
+          MAS_INSTALLER_IDENTITY: "3rd Party Mac Developer Installer: Ayodele Ajayi (T8242XY72S)"
+        run: |
+          MAS_PROVISIONING_PROFILE_PATH="$RUNNER_TEMP/Voiccenger.provisionprofile" \
+            scripts/make-mas-pkg.sh "dist/Voiccenger-$VERSION.pkg"
+
+      - name: Upload to App Store Connect (TestFlight)
+        if: env.HAS_MAS == 'true'
+        env:
+          P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          export API_PRIVATE_KEYS_DIR="$RUNNER_TEMP/keys"
+          mkdir -p "$API_PRIVATE_KEYS_DIR"
+          echo "$P8" | base64 --decode >"$API_PRIVATE_KEYS_DIR/AuthKey_$KEY_ID.p8"
+          trap 'rm -rf "$API_PRIVATE_KEYS_DIR"' EXIT
+          xcrun altool --validate-app -f "dist/Voiccenger-$VERSION.pkg" -t macos --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+          xcrun altool --upload-app -f "dist/Voiccenger-$VERSION.pkg" -t macos --apiKey "$KEY_ID" --apiIssuer "$ISSUER_ID"
+          echo "Uploaded Voiccenger $VERSION to App Store Connect; it appears in TestFlight after processing." >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Remove signing keychain
+        if: always() && env.HAS_MAS == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/mas.keychain-db" || true

@@ -35,7 +35,7 @@ struct FixturePipelineTests {
         try await SpeakerModels.prepare()
         for name in Self.voices {
             let samples = try AudioResampler.load16kMono(url: Self.fixtures.appending(path: "enroll_\(name).wav"))
-            _ = try await EnrollmentService.enroll(name: name, samples16k: samples, store: store, accentCandidates: [])
+            _ = try await EnrollmentService.enroll(name: name, samples16k: samples, store: store)
         }
         let profiles = await store.all()
         #expect(profiles.count == 4)

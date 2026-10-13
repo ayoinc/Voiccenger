@@ -24,10 +24,12 @@ public struct TranscriptUpdate: Sendable, Hashable {
     public var localeID: String
     /// Word-level timing when available; lets the aligner split a result across speaker turns.
     public var words: [TimedWord]
+    /// Engine that produced `text`; nil for legacy/unknown.
+    public var engine: SpeechEngineKind?
 
     public init(
         channel: AudioChannel, text: String, range: TimeRange, confidence: Double?, localeID: String,
-        words: [TimedWord] = []
+        words: [TimedWord] = [], engine: SpeechEngineKind? = nil
     ) {
         self.channel = channel
         self.text = text
@@ -35,6 +37,7 @@ public struct TranscriptUpdate: Sendable, Hashable {
         self.confidence = confidence
         self.localeID = localeID
         self.words = words
+        self.engine = engine
     }
 }
 
@@ -76,11 +79,13 @@ public struct TranscriptSegment: Codable, Sendable, Identifiable, Hashable {
     public var direction: DirectionEstimate?
     /// Filled asynchronously by the intelligence engine.
     public var insight: UtteranceInsight?
+    /// Engine that produced `text`; nil in meetings saved before engines were selectable.
+    public var engine: SpeechEngineKind?
 
     public init(
         id: UUID = UUID(), channel: AudioChannel, speakerKey: String, range: TimeRange, text: String,
         confidence: Double?, localeID: String, direction: DirectionEstimate? = nil,
-        insight: UtteranceInsight? = nil
+        insight: UtteranceInsight? = nil, engine: SpeechEngineKind? = nil
     ) {
         self.id = id
         self.channel = channel
@@ -91,5 +96,6 @@ public struct TranscriptSegment: Codable, Sendable, Identifiable, Hashable {
         self.localeID = localeID
         self.direction = direction
         self.insight = insight
+        self.engine = engine
     }
 }

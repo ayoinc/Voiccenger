@@ -6,14 +6,16 @@ public struct SpeakerProfile: Codable, Sendable, Identifiable, Hashable {
     public var id: UUID
     public var name: String
     public var embeddings: [[Float]]
-    /// Recognizer locale that best fits this person's accent, e.g. "en-IN". Set by accent detection.
+    /// Legacy: recognizer locale picked by Apple-locale accent ranking. Superseded by `voice`.
     public var preferredLocaleID: String?
     public var colorIndex: Int
     public var createdAt: Date
+    /// Accent, language, spelling, vocabulary and engine choice for this person.
+    public var voice: VoiceSettings
 
     public init(
         id: UUID = UUID(), name: String, embeddings: [[Float]], preferredLocaleID: String? = nil,
-        colorIndex: Int = 0, createdAt: Date = Date()
+        colorIndex: Int = 0, createdAt: Date = Date(), voice: VoiceSettings = .default
     ) {
         self.id = id
         self.name = name
@@ -21,6 +23,23 @@ public struct SpeakerProfile: Codable, Sendable, Identifiable, Hashable {
         self.preferredLocaleID = preferredLocaleID
         self.colorIndex = colorIndex
         self.createdAt = createdAt
+        self.voice = voice
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, embeddings, preferredLocaleID, colorIndex, createdAt, voice
+    }
+
+    /// Profiles saved before `voice` existed decode with default voice settings.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        embeddings = try c.decode([[Float]].self, forKey: .embeddings)
+        preferredLocaleID = try c.decodeIfPresent(String.self, forKey: .preferredLocaleID)
+        colorIndex = try c.decode(Int.self, forKey: .colorIndex)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        voice = try c.decodeIfPresent(VoiceSettings.self, forKey: .voice) ?? .default
     }
 }
 

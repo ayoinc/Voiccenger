@@ -7,6 +7,9 @@
 #   BUILD_NUMBER   CFBundleVersion, must increase every release for Sparkle (default: commit count)
 #   SIGN_IDENTITY  codesign identity (default "-" = ad hoc). A Developer ID identity enables the
 #                  hardened runtime and secure timestamps required for notarization.
+#   APP_STORE=1    Mac App Store variant: no Sparkle (--disable-default-traits), sandbox entitlements,
+#                  embedded provisioning profile (MAS_PROVISIONING_PROFILE_PATH), compiled asset-catalog
+#                  icon (needs Xcode's actool). SIGN_IDENTITY must be the "Apple Distribution" identity.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,10 +25,19 @@ VERSION="${VERSION:-${latest_tag#v}}"
 VERSION="${VERSION:-0.0.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-$(git rev-list --count HEAD 2>/dev/null || echo 0)}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+APP_STORE="${APP_STORE:-0}"
+
+TRAITS=()
+if [[ "$APP_STORE" == "1" ]]; then
+    [[ "$SIGN_IDENTITY" != "-" ]] || { echo "error: APP_STORE=1 needs SIGN_IDENTITY (Apple Distribution)" >&2; exit 1; }
+    [[ -f "${MAS_PROVISIONING_PROFILE_PATH:-}" ]] || { echo "error: set MAS_PROVISIONING_PROFILE_PATH" >&2; exit 1; }
+    xcrun --find actool >/dev/null 2>&1 || { echo "error: APP_STORE=1 needs Xcode (actool) for the icon" >&2; exit 1; }
+    TRAITS=(--disable-default-traits)
+fi
 
 echo "==> Building release product"
-swift build -c release --product Voiccenger "${SCRATCH[@]+"${SCRATCH[@]}"}"
-BIN_DIR="$(swift build -c release --show-bin-path "${SCRATCH[@]+"${SCRATCH[@]}"}")"
+swift build -c release --product Voiccenger "${TRAITS[@]+"${TRAITS[@]}"}" "${SCRATCH[@]+"${SCRATCH[@]}"}"
+BIN_DIR="$(swift build -c release --show-bin-path "${TRAITS[@]+"${TRAITS[@]}"}" "${SCRATCH[@]+"${SCRATCH[@]}"}")"
 
 APP="$ROOT/dist/Voiccenger.app"
 CONTENTS="$APP/Contents"
@@ -39,6 +51,16 @@ cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 echo "    version $VERSION ($BUILD_NUMBER)"
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 cp "$ROOT/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+if [[ "$APP_STORE" == "1" ]]; then
+    # App Store builds update through the store and must not advertise a Sparkle feed.
+    /usr/libexec/PlistBuddy -c "Delete :SUFeedURL" -c "Delete :SUPublicEDKey" "$CONTENTS/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$CONTENTS/Info.plist"
+    xcrun actool "$ROOT/Resources/Assets.xcassets" --compile "$CONTENTS/Resources" --platform macosx \
+        --minimum-deployment-target 26.0 --app-icon AppIcon --output-partial-info-plist "$ROOT/.build-mas-icon.plist" \
+        --output-format human-readable-text --notices --warnings >/dev/null
+    rm -f "$ROOT/.build-mas-icon.plist"
+    cp "$MAS_PROVISIONING_PROFILE_PATH" "$CONTENTS/embedded.provisionprofile"
+fi
 
 # SwiftPM resource bundles (Bundle.module looks in the main bundle's resource directory).
 shopt -s nullglob
@@ -81,6 +103,7 @@ else
 fi
 
 ENTITLEMENTS="$ROOT/Resources/Voiccenger.entitlements"
+[[ "$APP_STORE" == "1" ]] && ENTITLEMENTS="$ROOT/Resources/Voiccenger-MAS.entitlements"
 if [[ "$SIGN_IDENTITY" == "-" ]]; then
     echo "==> Signing (ad hoc)"
     if [[ -d "$CONTENTS/Frameworks" ]]; then

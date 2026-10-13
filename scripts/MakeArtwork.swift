@@ -3,6 +3,7 @@
 //
 // Output:
 //   Resources/AppIcon.icns   app icon (all macOS sizes, via iconutil)
+//   Resources/Assets.xcassets/AppIcon.appiconset   same icon as an asset catalog (Mac App Store build)
 //   docs/icon.png            512 px icon for the README
 //   docs/banner.png          README banner
 //   Resources/dmg-background.tiff   installer window background (1x + 2x), 660 × 400 pt
@@ -265,6 +266,25 @@ p.waitUntilExit()
 guard p.terminationStatus == 0 else { fatalError("iconutil failed") }
 try? FileManager.default.removeItem(at: iconset)
 print("wrote \(icns.path)")
+
+// Asset catalog copy of the icon; the App Store build compiles it with actool into Assets.car.
+let appiconset = resources.appendingPathComponent("Assets.xcassets/AppIcon.appiconset")
+try? FileManager.default.removeItem(at: appiconset)
+try FileManager.default.createDirectory(at: appiconset, withIntermediateDirectories: true)
+var images: [[String: String]] = []
+for base in [16, 32, 128, 256, 512] {
+    for scale in [1, 2] {
+        let file = "icon_\(base)x\(base)\(scale == 2 ? "@2x" : "").png"
+        try savePNG(renderIcon(size: base * scale), appiconset.appendingPathComponent(file))
+        images.append(["idiom": "mac", "size": "\(base)x\(base)", "scale": "\(scale)x", "filename": file])
+    }
+}
+let catalogInfo = ["author": "xcode", "version": "1"]
+try JSONSerialization.data(withJSONObject: ["images": images, "info": catalogInfo], options: [.prettyPrinted, .sortedKeys])
+    .write(to: appiconset.appendingPathComponent("Contents.json"))
+try JSONSerialization.data(withJSONObject: ["info": catalogInfo], options: [.prettyPrinted, .sortedKeys])
+    .write(to: resources.appendingPathComponent("Assets.xcassets/Contents.json"))
+print("wrote Resources/Assets.xcassets")
 
 try savePNG(renderIcon(size: 512), docs.appendingPathComponent("icon.png"))
 print("wrote docs/icon.png")

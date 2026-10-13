@@ -37,7 +37,7 @@ import VCModels
         let truth = try Fixtures.meetingTruth()
         let finals = try await FileTranscriber.transcribe(url: url, localeID: "en-GB")
         let text = finals.map(\.text).joined(separator: " ")
-        let wer = Fixtures.wordErrorRate(reference: truth.map(\.text).joined(separator: " "), hypothesis: text)
+        let wer = WordErrorRate.compute(reference: truth.map(\.text).joined(separator: " "), hypothesis: text)
         print("FileTranscriber en-GB meeting.wav WER \(String(format: "%.3f", wer)) over \(finals.count) finals")
         #expect(wer < 0.2)
 
@@ -78,7 +78,7 @@ import VCModels
 
         let finals = await log.finals
         let words = finals.flatMap(\.words)
-        let wer = Fixtures.wordErrorRate(
+        let wer = WordErrorRate.compute(
             reference: truth.map(\.text).joined(separator: " "), hypothesis: finals.map(\.text).joined(separator: " "))
         print("LiveTranscriber en-GB meeting.wav WER \(String(format: "%.3f", wer)), \(await log.volatileCount) volatile, \(finals.count) finals")
         #expect(wer < 0.2)
@@ -148,7 +148,7 @@ import VCModels
         #expect(finals.filter { $0.range.end <= boundary }.allSatisfy { $0.localeID == "en-GB" })
         #expect(finals.filter { $0.range.start >= boundary }.allSatisfy { $0.localeID == "en-US" })
         #expect(finals.contains { $0.localeID == "en-US" })
-        let wer = Fixtures.wordErrorRate(
+        let wer = WordErrorRate.compute(
             reference: truth.map(\.text).joined(separator: " "),
             hypothesis: finals.sorted { $0.range.start < $1.range.start }.map(\.text).joined(separator: " "))
         print("LiveTranscriber with en-GB→en-US switch WER \(String(format: "%.3f", wer))")

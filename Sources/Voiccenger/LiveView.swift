@@ -199,17 +199,22 @@ private struct SessionHeader: View {
                         .frame(width: 120)
                 }
                 Spacer()
+                EngineStatusChip(
+                    engine: session.config.speechEngine,
+                    reported: session.speechEngineStatuses[session.config.speechEngine])
                 ForEach(session.currentLocales.sorted(by: { $0.key.rawValue < $1.key.rawValue }), id: \.key) { channel, locale in
                     Label(Format.localeName(locale), systemImage: channel == .microphone ? "mic" : "speaker.wave.2")
                         .font(.callout)
+                        .lineLimit(1)
                         .foregroundStyle(.secondary)
                         .help("\(channel == .microphone ? "Room" : "Meeting audio") is transcribed as \(Format.localeName(locale))")
                 }
                 if let engine = session.intelligenceEngineName {
                     Label(engine, systemImage: "sparkles")
                         .font(.callout)
+                        .lineLimit(1)
                         .foregroundStyle(.secondary)
-                        .help("Live analysis engine")
+                        .help("Live analysis engine: \(engine)")
                 }
             }
             ForEach(session.warnings, id: \.self) { warning in
@@ -285,7 +290,7 @@ struct TranscriptRow: View {
                         .padding(.horizontal, 4)
                         .padding(.vertical, 1)
                         .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
-                        .help(Format.localeName(segment.localeID))
+                        .help(segmentSourceDescription)
                     if let intent = segment.insight?.intent, intent != .statement {
                         Text(intent.title)
                             .font(.caption2)
@@ -307,6 +312,12 @@ struct TranscriptRow: View {
             }
         }
         .accessibilityElement(children: .combine)
+    }
+
+    private var segmentSourceDescription: String {
+        let language = Format.localeName(segment.localeID)
+        guard let engine = segment.engine else { return language }
+        return "\(language) · transcribed by \(engine.displayName)"
     }
 }
 
@@ -333,6 +344,85 @@ private struct PendingRow: View {
             }
         }
         .accessibilityLabel(time == nil ? "Being transcribed: \(text)" : "Awaiting speaker: \(text)")
+    }
+}
+
+/// The meeting's voice model and whether it's rewriting lines yet ("Cohere · warming up"), or "Apple preview"
+/// when it can't be used.
+private struct EngineStatusChip: View {
+    let engine: SpeechEngineKind
+    /// Latest status from the session; nil until the model library has reported it.
+    let reported: ModelStatus?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            indicator
+            Text(title)
+                .lineLimit(1)
+        }
+        .font(.callout)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(.quaternary, in: Capsule())
+        .fixedSize()
+        .help(help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Voice model")
+        .accessibilityValue(title)
+        .accessibilityHint(help)
+    }
+
+    private var status: ModelStatus? { engine == .apple ? .ready : reported }
+
+    private var title: String {
+        guard engine != .apple else { return engine.displayName }
+        switch status {
+        case nil: return engine.shortName
+        case .ready: return "\(engine.shortName) · ready"
+        case .loading, .downloaded: return "\(engine.shortName) · warming up"
+        case .downloading(let fraction): return "\(engine.shortName) · downloading \(Format.percent(fraction))"
+        case .notDownloaded, .failed: return "Apple preview"
+        }
+    }
+
+    @ViewBuilder
+    private var indicator: some View {
+        switch status {
+        case .ready:
+            dot(.green)
+        case .loading, .downloaded, .downloading:
+            dot(.orange).symbolEffect(.pulse)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .symbolRenderingMode(.multicolor)
+                .imageScale(.small)
+        case .notDownloaded, nil:
+            dot(.secondary)
+        }
+    }
+
+    private func dot(_ color: Color) -> some View {
+        Image(systemName: "circle.fill")
+            .font(.system(size: 7))
+            .foregroundStyle(color)
+    }
+
+    private var help: String {
+        let name = engine.displayName
+        switch status {
+        case _ where engine == .apple:
+            return "Apple Speech transcribes this meeting."
+        case .ready, nil:
+            return "Apple Speech previews words as they're spoken; \(name) writes each finished line."
+        case .loading, .downloaded:
+            return "\(name) is loading. Until it's ready, lines are written by Apple Speech."
+        case .downloading:
+            return "\(name) is downloading. Until it's ready, lines are written by Apple Speech."
+        case .notDownloaded:
+            return "\(name) isn't downloaded, so Apple Speech writes the transcript. Download it in Settings › Voice Models."
+        case .failed(let message):
+            return "\(name) couldn't start (\(message)), so Apple Speech writes the transcript."
+        }
     }
 }
 

@@ -9,10 +9,11 @@ struct SettingsView: View {
         TabView {
             Tab("General", systemImage: "gearshape") { GeneralSettings() }
             Tab("Transcription", systemImage: "text.bubble") { TranscriptionSettings() }
+            Tab("Voice Models", systemImage: "waveform.badge.magnifyingglass") { VoiceModelsSettings() }
             Tab("Intelligence", systemImage: "sparkles") { IntelligenceSettings() }
             Tab("Audio", systemImage: "mic") { AudioSettings() }
         }
-        .frame(width: 520)
+        .frame(width: 560)
         .scenePadding()
     }
 }
@@ -34,7 +35,7 @@ private struct GeneralSettings: View {
                 }
                 .disabled(!settings.autoDetectMeetings)
             } footer: {
-                Text("Voiccenger notices when an app like Zoom, Teams, FaceTime or a browser meeting starts using the microphone, and stops recording when it ends.")
+                Text(onlineFootnote)
                     .settingsFootnote()
             }
             Section {
@@ -45,13 +46,23 @@ private struct GeneralSettings: View {
             }
             Section {
                 Toggle("Keep audio recordings", isOn: $settings.recordAudio)
+                Toggle("Remind me to tell people before recording", isOn: Binding(
+                    get: { !settings.recordingConsentAcknowledged },
+                    set: { settings.recordingConsentAcknowledged = !$0 }
+                ))
             } footer: {
-                Text("Saves each meeting's audio next to its transcript.")
+                Text("Saves each meeting's audio next to its transcript. The reminder asks you to let participants know before each recording.")
                     .settingsFootnote()
             }
             UpdateSettingsSection(updater: updater)
         }
         .formStyle(.grouped)
+    }
+
+    private var onlineFootnote: String {
+        let base = "Voiccenger notices when an app like Zoom, Teams, FaceTime or a browser meeting starts using the microphone, and stops recording when it ends."
+        guard settings.autoRecordOnline, !settings.recordingConsentAcknowledged else { return base }
+        return base + " Until you choose “Don't remind me again” when recording, you're notified instead of meetings being recorded automatically."
     }
 }
 
@@ -71,9 +82,9 @@ private struct TranscriptionSettings: View {
         Form {
             Section {
                 if loading {
-                    LabeledContent("Language") { ProgressView().controlSize(.small) }
+                    LabeledContent("Live preview language") { ProgressView().controlSize(.small) }
                 } else {
-                    Picker("Language", selection: $settings.localeID) {
+                    Picker("Live preview language", selection: $settings.localeID) {
                         if !supported.contains(settings.localeID) {
                             Text(Format.localeName(settings.localeID)).tag(settings.localeID)
                         }
@@ -83,7 +94,7 @@ private struct TranscriptionSettings: View {
                         }
                     }
                     if !installed.contains(settings.localeID) {
-                        LabeledContent("Speech model") {
+                        LabeledContent("Preview speech model") {
                             if let downloadProgress {
                                 ProgressView(value: downloadProgress)
                                     .frame(width: 140)
@@ -100,9 +111,19 @@ private struct TranscriptionSettings: View {
                             .foregroundStyle(.red)
                     }
                 }
-                Toggle("Switch language and accent automatically", isOn: $settings.autoLanguage)
+                Toggle("Switch language automatically", isOn: $settings.autoLanguage)
             } footer: {
-                Text("The language is used when a meeting starts. With automatic switching, Voiccenger changes the recognizer when someone speaks another language or with a different accent, and uses each enrolled person's accent.")
+                Text("Apple Speech shows words in this language as they're spoken; the voice model chosen in Voice Models then writes the final text in the same language. With automatic switching, Voiccenger follows the meeting when someone changes language.")
+                    .settingsFootnote()
+            }
+            Section {
+                Picker("Spelling", selection: $settings.spelling) {
+                    ForEach(SpellingVariant.allCases, id: \.self) { variant in
+                        Text(variant.title).tag(variant)
+                    }
+                }
+            } footer: {
+                Text("Converts English transcripts to British or American spelling. Enrolled people can have their own spelling in People.")
                     .settingsFootnote()
             }
             Section {

@@ -7,9 +7,10 @@ import VCModels
 /// One-shot recognition of in-memory samples or a file with a non-volatile transcriber.
 enum OfflineRecognizer {
     /// Transcribes `samples` (mono Float32 at `sampleRate`, time 0 = first sample) and returns final results.
+    /// `contextualStrings` bias recognition toward names and jargon.
     static func transcribe(
         samples: [Float], sampleRate: Double, locale: Locale, channel: AudioChannel,
-        timeOffset: TimeInterval = 0
+        timeOffset: TimeInterval = 0, contextualStrings: [String] = []
     ) async throws -> [TranscriptUpdate] {
         let transcriber = TranscriberFactory.make(locale: locale, volatile: false)
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
@@ -25,6 +26,11 @@ enum OfflineRecognizer {
         let analyzer = SpeechAnalyzer(modules: [transcriber], options: analyzerOptions)
         do {
             try await analyzer.prepareToAnalyze(in: analyzerFormat)
+            if !contextualStrings.isEmpty {
+                let context = AnalysisContext()
+                context.contextualStrings[.general] = contextualStrings
+                try await analyzer.setContext(context)
+            }
             try await analyzer.start(inputSequence: stream)
             try await analyzer.finalizeAndFinishThroughEndOfInput()
         } catch {

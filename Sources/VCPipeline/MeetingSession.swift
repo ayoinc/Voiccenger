@@ -27,9 +27,15 @@ public final class MeetingSession {
         public var detectedMeeting: DetectedMeeting?
         public var microphoneDeviceUID: String?
         public var arrayGeometry: MicArrayGeometry?
+        /// Apple live-preview locale; its language is the meeting's language for the voice model.
         public var localeID: String
         public var autoLanguage: Bool
+        /// Voice model that produces the final text of each line.
+        public var speechEngine: SpeechEngineKind
+        /// Spelling for speakers without their own preference.
+        public var spelling: SpellingVariant
         public var engineKind: IntelligenceEngineKind
+        /// Names and jargon to recognize (enrolled names and vocabularies are added automatically).
         public var contextualStrings: [String]
         public var recordAudio: Bool
         /// Root of the `MeetingStore` the finished meeting is saved to.
@@ -49,7 +55,8 @@ public final class MeetingSession {
             title: String? = nil, kind: MeetingKind = .inPerson, detectedMeeting: DetectedMeeting? = nil,
             microphoneDeviceUID: String? = nil, arrayGeometry: MicArrayGeometry? = nil,
             localeID: String = AppSettings.systemLocaleID, autoLanguage: Bool = true,
-            engineKind: IntelligenceEngineKind = .apple, contextualStrings: [String] = [], recordAudio: Bool = true,
+            engineKind: IntelligenceEngineKind = .apple, speechEngine: SpeechEngineKind = .cohere,
+            spelling: SpellingVariant = .unchanged, contextualStrings: [String] = [], recordAudio: Bool = true,
             meetingsDirectory: URL = AppPaths.default.meetings, speakerConfig: SpeakerIDConfig = .init(),
             mode: ProcessingMode = .live, liveAnalysis: Bool = true, alignmentTimeout: TimeInterval = 15,
             analysisBacklog: Int = 6, analysisContextLines: Int = 8
@@ -62,6 +69,8 @@ public final class MeetingSession {
             self.localeID = localeID
             self.autoLanguage = autoLanguage
             self.engineKind = engineKind
+            self.speechEngine = speechEngine
+            self.spelling = spelling
             self.contextualStrings = contextualStrings
             self.recordAudio = recordAudio
             self.meetingsDirectory = meetingsDirectory
@@ -124,6 +133,8 @@ public final class MeetingSession {
     /// Set when the report couldn't be generated; the meeting is still saved.
     public private(set) var reportError: String?
     public private(set) var intelligenceEngineName: String?
+    /// Download/load state of each voice model, for the engine status shown while recording.
+    public private(set) var speechEngineStatuses: [SpeechEngineKind: ModelStatus] = [:]
     /// The saved meeting, once `stop()` has finished.
     public private(set) var meeting: Meeting?
 
@@ -134,9 +145,11 @@ public final class MeetingSession {
     // MARK: Pipeline state
 
     @ObservationIgnored private var profiles: [SpeakerProfile]
+    @ObservationIgnored private var voices: SessionVoices
+    @ObservationIgnored private let library: SpeechModelLibrary
     @ObservationIgnored private var clock: SessionClock?
     @ObservationIgnored private var sources: [any AudioSource] = []
-    @ObservationIgnored private var transcribers: [AudioChannel: LiveTranscriber] = [:]
+    @ObservationIgnored private var transcribers: [AudioChannel: RefiningTranscriber] = [:]
     @ObservationIgnored private var identifiers: [AudioChannel: SpeakerIdentifier] = [:]
     /// Capture loops; each returns the session time of the end of the last chunk it forwarded.
     @ObservationIgnored private var captureTasks: [Task<TimeInterval, Never>] = []
@@ -144,6 +157,12 @@ public final class MeetingSession {
     @ObservationIgnored private var eventTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var tickTask: Task<Void, Never>?
     @ObservationIgnored private var recorderTasks: [Task<String?, Never>] = []
+    @ObservationIgnored private var statusTask: Task<Void, Never>?
+    /// Whole-meeting 16 kHz audio, kept when an enrolled speaker may need another engine or language.
+    @ObservationIgnored private var archive: MeetingAudioArchive?
+    /// Lines being re-transcribed for their speaker's engine/language.
+    @ObservationIgnored private var rerouteTasks: [Task<Void, Never>] = []
+    @ObservationIgnored private var rerouteFailureReported = false
     @ObservationIgnored private var analysisWorker: Task<Void, Never>?
     @ObservationIgnored private var analysisInput: AsyncStream<AnalysisJob>.Continuation?
     @ObservationIgnored private var engine: (any MeetingIntelligence)?
@@ -163,13 +182,19 @@ public final class MeetingSession {
     private var diarizationLag: TimeInterval { config.speakerConfig.windowSeconds + 0.5 }
     private static let maxDirectionHistory = 6_000
 
-    public init(config: Config, profiles: [SpeakerProfile], id: UUID = UUID()) {
+    public init(config: Config, profiles: [SpeakerProfile], id: UUID = UUID(), library: SpeechModelLibrary = .shared) {
         self.id = id
         self.config = config
         self.profiles = profiles
+        self.voices = SessionVoices(
+            profiles: profiles, contextualStrings: config.contextualStrings, sessionSpelling: config.spelling)
+        self.library = library
         self.roster = ParticipantRoster(profiles: profiles)
         self.pending = PendingAlignmentQueue(timeout: config.mode == .live ? config.alignmentTimeout : nil)
     }
+
+    /// The meeting's language for the voice model ("en" for "en-GB").
+    private var sessionLanguage: String { SessionVoices.languageCode(ofLocale: config.localeID) }
 
     // MARK: - Lifecycle
 
@@ -191,10 +216,13 @@ public final class MeetingSession {
     }
 
     /// Runs a recorded file through the live pipeline (faster than realtime) and returns the saved meeting.
-    public static func processFile(url: URL, config: Config, profiles: [SpeakerProfile]) async throws -> Meeting {
+    /// Each line waits for the voice model (loading it if downloaded) instead of keeping Apple's preview text.
+    public static func processFile(
+        url: URL, config: Config, profiles: [SpeakerProfile], library: SpeechModelLibrary = .shared
+    ) async throws -> Meeting {
         var config = config
         config.mode = .offline
-        let session = MeetingSession(config: config, profiles: profiles)
+        let session = MeetingSession(config: config, profiles: profiles, library: library)
         // Without an explicit title the report proposes one; the file name is the fallback.
         session.sourceName = url.deletingPathExtension().lastPathComponent
         try await session.run(channels: [.microphone]) { clock in
@@ -224,6 +252,9 @@ public final class MeetingSession {
         for task in recorderTasks { if let name = await task.value { audioFiles.append(name) } }
 
         for update in pending.drain() { attribute(update) }
+        for task in rerouteTasks { await Self.finish(task, timeout: live ? .seconds(30) : nil) }
+        rerouteTasks = []
+        statusTask?.cancel()
         pendingFinals = []
         volatileText = [:]
 
@@ -270,10 +301,14 @@ public final class MeetingSession {
         let existing = await store.all()
         let profile = SpeakerProfile(
             name: name?.nonEmpty ?? participant.displayName, embeddings: embeddings,
-            preferredLocaleID: participant.localeID, colorIndex: EnrollmentService.nextColorIndex(in: existing))
+            colorIndex: EnrollmentService.nextColorIndex(in: existing),
+            voice: VoiceSettings(
+                languageCode: SessionVoices.languageCode(ofLocale: participant.localeID ?? config.localeID)))
         try await store.upsert(profile)
         profiles.append(profile)
+        voices.upsert(profile)
         for identifier in identifiers.values { await identifier.setProfiles(profiles) }
+        for transcriber in transcribers.values { await transcriber.setPrompt(voices.prompt) }
         rekey(key, to: SpeakerTurn.profileKey(profile.id), profile: profile)
         return profile
     }
@@ -312,20 +347,28 @@ public final class MeetingSession {
         } catch {
             for source in sources { await source.stop() }
             for transcriber in transcribers.values { await transcriber.finish() }
+            statusTask?.cancel()
             state = .failed(error.localizedDescription)
             throw error
         }
     }
 
     private func prepare(channels: [AudioChannel]) async throws {
-        let candidates = Self.unique([config.localeID] + profiles.compactMap(\.preferredLocaleID))
-        try await SpeechAssets.ensureInstalled(localeIDs: candidates)
-        let contextual = Self.unique(config.contextualStrings + profiles.map(\.name))
+        try await SpeechAssets.ensureInstalled(localeIDs: [config.localeID])
+        for kind in SpeechEngineKind.allCases { speechEngineStatuses[kind] = await library.status(kind) }
+        observeEngineStatuses()
+        if config.speechEngine != .apple,
+            !SessionVoices.availableEngines(speechEngineStatuses).contains(config.speechEngine)
+        {
+            warn("\(SpeechModelLibrary.info(config.speechEngine).displayName) isn't downloaded yet; lines use Apple's transcription until it's ready.")
+        }
+        if voices.mayReroute(sessionLanguage: sessionLanguage) { archive = MeetingAudioArchive() }
 
         for channel in channels {
-            let transcriber = LiveTranscriber(
-                channel: channel, localeID: config.localeID, contextualStrings: contextual,
-                autoLanguage: config.autoLanguage, candidateLocaleIDs: candidates)
+            let transcriber = RefiningTranscriber(
+                channel: channel, appleLocaleID: config.localeID, engine: config.speechEngine,
+                languageCode: sessionLanguage, prompt: voices.prompt, customization: nil, library: library,
+                autoLanguage: config.autoLanguage, waitForEngine: config.mode == .offline)
             try await transcriber.start()
             transcribers[channel] = transcriber
             currentLocales[channel] = config.localeID
@@ -357,7 +400,7 @@ public final class MeetingSession {
     // MARK: - Fan-out
 
     /// One capture loop per source; every chunk is copied to independent consumer streams so a slow
-    /// consumer (transcriber, diarizer, recorder, DOA) never blocks capture or the others.
+    /// consumer (transcriber, diarizer, archive, recorder, DOA) never blocks capture or the others.
     private func launch(source: any AudioSource, stream: AsyncStream<AudioChunk>) {
         let channel = source.channel
         var sinks: [AsyncStream<AudioChunk>.Continuation] = []
@@ -376,6 +419,11 @@ public final class MeetingSession {
                 Task.detached { [weak self] in
                     await Self.feedIdentifier(s, identifier, collector, channel: channel, session: self)
                 })
+        }
+        if let archive {
+            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
+            sinks.append(c)
+            consumerTasks.append(Task.detached { await Self.feedArchive(s, archive, channel: channel) })
         }
         if channel == .microphone, let geometry = config.arrayGeometry {
             // Direction is advisory live: keep only the newest chunks if estimation falls behind.
@@ -416,7 +464,7 @@ public final class MeetingSession {
             })
     }
 
-    private func launchEvents(channel: AudioChannel, transcriber: LiveTranscriber) {
+    private func launchEvents(channel: AudioChannel, transcriber: RefiningTranscriber) {
         let events = transcriber.events
         eventTasks.append(
             Task.detached { [weak self] in
@@ -433,9 +481,23 @@ public final class MeetingSession {
         }
     }
 
-    private nonisolated static func feedTranscriber(_ stream: AsyncStream<AudioChunk>, _ t: LiveTranscriber) async {
+    private func observeEngineStatuses() {
+        let updates = library.statusUpdates
+        statusTask = Task { [weak self] in
+            for await (kind, status) in updates { self?.speechEngineStatuses[kind] = status }
+        }
+    }
+
+    private nonisolated static func feedTranscriber(_ stream: AsyncStream<AudioChunk>, _ t: RefiningTranscriber) async {
         for await chunk in stream { await t.append(chunk) }
         await t.finish()
+    }
+
+    private nonisolated static func feedArchive(
+        _ stream: AsyncStream<AudioChunk>, _ archive: MeetingAudioArchive, channel: AudioChannel
+    ) async {
+        for await chunk in stream { await archive.append(chunk) }
+        await archive.finish(channel)
     }
 
     private nonisolated static func feedIdentifier(
@@ -600,12 +662,69 @@ public final class MeetingSession {
             }
             roster.setLocale(update.localeID, for: piece.speakerKey)
             let segment = TranscriptSegment(
-                channel: update.channel, speakerKey: piece.speakerKey, range: piece.range, text: piece.text,
-                confidence: piece.confidence, localeID: update.localeID,
-                direction: update.channel == .microphone ? direction(during: piece.range) : nil)
+                channel: update.channel, speakerKey: piece.speakerKey, range: piece.range,
+                text: voices.customize(piece.text, speakerKey: piece.speakerKey), confidence: piece.confidence,
+                localeID: update.localeID,
+                direction: update.channel == .microphone ? direction(during: piece.range) : nil, engine: update.engine)
             segments.append(segment)
-            enqueueAnalysis(of: segment)
+            if let archive,
+                let route = voices.route(
+                    speakerKey: piece.speakerKey, segmentEngine: update.engine,
+                    segmentLanguage: SessionVoices.languageCode(ofLocale: update.localeID),
+                    available: SessionVoices.availableEngines(speechEngineStatuses))
+            {
+                reroute(segment, with: route, archive: archive)
+            } else {
+                enqueueAnalysis(of: segment)
+            }
         }
+    }
+
+    /// Audio either side of a line included when it's re-transcribed, so edge words aren't clipped.
+    private static let reroutePadding: TimeInterval = 0.1
+
+    /// Re-transcribes a line from the archived audio with its speaker's engine/language, then analyses it.
+    private func reroute(_ segment: TranscriptSegment, with route: EngineRoute, archive: MeetingAudioArchive) {
+        let library = self.library
+        let prompt = voices.prompt
+        let range = TimeRange(
+            start: max(0, segment.range.start - Self.reroutePadding), end: segment.range.end + Self.reroutePadding)
+        rerouteTasks.append(
+            Task { [weak self] in
+                let samples = await archive.waitForSamples(channel: segment.channel, range: range)
+                var transcript: EngineTranscript?
+                do {
+                    if !samples.isEmpty {
+                        let transcriber = try await library.transcriber(route.engine)
+                        transcript = try await transcriber.transcribe(
+                            samples16k: samples, languageCode: route.languageCode, prompt: prompt)
+                    }
+                } catch {
+                    self?.rerouteFailed(route, error)
+                }
+                self?.finishReroute(segment.id, transcript: transcript, route: route)
+            })
+    }
+
+    private func finishReroute(_ segmentID: UUID, transcript: EngineTranscript?, route: EngineRoute) {
+        guard let i = segments.lastIndex(where: { $0.id == segmentID }) else { return }
+        if let transcript, let text = transcript.text.nonEmpty {
+            segments[i].text = voices.customize(text, speakerKey: segments[i].speakerKey)
+            segments[i].engine = transcript.engine
+            if SessionVoices.languageCode(ofLocale: segments[i].localeID) != route.languageCode {
+                segments[i].localeID = route.languageCode
+                noteLocale(route.languageCode)
+            }
+        }
+        enqueueAnalysis(of: segments[i])
+    }
+
+    private func rerouteFailed(_ route: EngineRoute, _ error: Error) {
+        guard !rerouteFailureReported else { return }
+        rerouteFailureReported = true
+        warn(
+            "\(SpeechModelLibrary.info(route.engine).displayName) couldn't re-transcribe a speaker's line (\(error.localizedDescription)); keeping the meeting engine's text."
+        )
     }
 
     // MARK: - Direction / seats
@@ -701,7 +820,9 @@ public final class MeetingSession {
 
     private func enqueueAnalysis(of segment: TranscriptSegment) {
         guard let analysisInput else { return }
-        let context = segments.dropLast().suffix(config.analysisContextLines).map(contextLine)
+        // Lines before this one: a re-transcribed line is analysed after later lines were added.
+        let index = segments.lastIndex { $0.id == segment.id } ?? segments.endIndex
+        let context = segments[..<index].suffix(config.analysisContextLines).map(contextLine)
         analysisInput.yield(AnalysisJob(line: contextLine(segment), context: Array(context)))
     }
 
@@ -761,10 +882,5 @@ public final class MeetingSession {
         let value = await task.value
         timer.cancel()
         return value
-    }
-
-    private static func unique(_ items: [String]) -> [String] {
-        var seen: Set<String> = []
-        return items.compactMap { $0.nonEmpty }.filter { seen.insert($0).inserted }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import os
+import VCModels
 
 /// Failures surfaced by the transcription module.
 public enum TranscriptionError: Error, LocalizedError, Sendable, Equatable {
@@ -17,6 +18,10 @@ public enum TranscriptionError: Error, LocalizedError, Sendable, Equatable {
     case notRunning
     /// None of the candidate locales could be evaluated (unsupported or not installed).
     case noUsableCandidates([String])
+    /// The voice model's files are not on this Mac; download it first.
+    case modelNotDownloaded(SpeechEngineKind)
+    /// The voice model cannot transcribe this ISO 639-1 language.
+    case unsupportedLanguage(String, SpeechEngineKind)
 
     public var errorDescription: String? {
         switch self {
@@ -34,6 +39,10 @@ public enum TranscriptionError: Error, LocalizedError, Sendable, Equatable {
             "The transcriber is not running."
         case .noUsableCandidates(let ids):
             "None of the candidate locales (\(ids.joined(separator: ", "))) are installed and supported."
+        case .modelNotDownloaded(let kind):
+            "\(SpeechModelLibrary.info(kind).displayName) is not downloaded."
+        case .unsupportedLanguage(let code, let kind):
+            "\(SpeechModelLibrary.info(kind).displayName) does not support the language “\(code)”."
         }
     }
 }

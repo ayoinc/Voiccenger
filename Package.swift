@@ -8,17 +8,33 @@ let package = Package(
         .executable(name: "Voiccenger", targets: ["Voiccenger"]),
         .executable(name: "voiccenger-cli", targets: ["voiccenger-cli"]),
     ],
+    traits: [
+        .default(enabledTraits: ["Sparkle"]),
+        .trait(
+            name: "Sparkle",
+            description: "Self-updating via Sparkle for direct-download builds. Disable for the Mac App Store build."
+        ),
+    ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git", .upToNextMinor(from: "0.17.7")),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.10.0"),
+        .package(url: "https://github.com/argmaxinc/argmax-oss-swift.git", from: "1.1.1"),
     ],
     targets: [
         // Shared value types and protocols. No framework dependencies beyond Foundation.
         .target(name: "VCModels"),
         // Microphone / system-audio capture, recording, meeting + conversation detection.
         .target(name: "VCAudio", dependencies: ["VCModels"]),
-        // Live transcription (SpeechAnalyzer), language + accent detection.
-        .target(name: "VCTranscription", dependencies: ["VCModels"]),
+        // Live transcription (SpeechAnalyzer) and accurate voice models (Cohere via FluidAudio, Whisper via
+        // WhisperKit), accent regions, transcript customization and calibration.
+        .target(
+            name: "VCTranscription",
+            dependencies: [
+                "VCModels",
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
+            ]
+        ),
         // Diarization + enrolled-voice identification (FluidAudio).
         .target(
             name: "VCSpeakers",
@@ -35,7 +51,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "Voiccenger",
-            dependencies: ["VCPipeline", .product(name: "Sparkle", package: "Sparkle")]
+            dependencies: [
+                "VCPipeline",
+                .product(name: "Sparkle", package: "Sparkle", condition: .when(traits: ["Sparkle"])),
+            ]
         ),
         .executableTarget(name: "voiccenger-cli", dependencies: ["VCPipeline"]),
 

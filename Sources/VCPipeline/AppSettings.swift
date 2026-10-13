@@ -18,6 +18,10 @@ public final class AppSettings {
         static let inputDeviceUID = "inputDeviceUID"
         static let arrayPresetName = "micArrayPreset"
         static let recordAudio = "recordAudio"
+        static let speechEngine = "speechEngine"
+        static let spelling = "spelling"
+        static let downloadModelsAutomatically = "downloadModelsAutomatically"
+        static let recordingConsentAcknowledged = "recordingConsentAcknowledged"
     }
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -39,6 +43,19 @@ public final class AppSettings {
     public var arrayPresetName: String? { didSet { defaults.set(arrayPresetName, forKey: Key.arrayPresetName) } }
     /// Keep audio recordings next to each meeting's transcript.
     public var recordAudio: Bool { didSet { defaults.set(recordAudio, forKey: Key.recordAudio) } }
+    /// Voice model that transcribes meetings (Apple only previews live text until it's ready).
+    public var speechEngine: SpeechEngineKind { didSet { defaults.set(speechEngine.rawValue, forKey: Key.speechEngine) } }
+    /// Spelling for speakers without their own preference.
+    public var spelling: SpellingVariant { didSet { defaults.set(spelling.rawValue, forKey: Key.spelling) } }
+    /// Download the selected voice model when it's missing.
+    public var downloadModelsAutomatically: Bool {
+        didSet { defaults.set(downloadModelsAutomatically, forKey: Key.downloadModelsAutomatically) }
+    }
+    /// The user confirmed they tell participants when they record (and asked not to be reminded). Until then
+    /// every recording asks first and detected meetings are never recorded automatically.
+    public var recordingConsentAcknowledged: Bool {
+        didSet { defaults.set(recordingConsentAcknowledged, forKey: Key.recordingConsentAcknowledged) }
+    }
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -48,6 +65,7 @@ public final class AppSettings {
             Key.inPersonDetection: false,
             Key.autoLanguage: true,
             Key.recordAudio: true,
+            Key.downloadModelsAutomatically: true,
         ])
         autoDetectMeetings = defaults.bool(forKey: Key.autoDetectMeetings)
         autoRecordOnline = defaults.bool(forKey: Key.autoRecordOnline)
@@ -59,6 +77,10 @@ public final class AppSettings {
         inputDeviceUID = defaults.string(forKey: Key.inputDeviceUID)
         arrayPresetName = defaults.string(forKey: Key.arrayPresetName)
         recordAudio = defaults.bool(forKey: Key.recordAudio)
+        speechEngine = defaults.string(forKey: Key.speechEngine).flatMap(SpeechEngineKind.init(rawValue:)) ?? .cohere
+        spelling = defaults.string(forKey: Key.spelling).flatMap(SpellingVariant.init(rawValue:)) ?? .unchanged
+        downloadModelsAutomatically = defaults.bool(forKey: Key.downloadModelsAutomatically)
+        recordingConsentAcknowledged = defaults.bool(forKey: Key.recordingConsentAcknowledged)
     }
 
     public var arrayGeometry: MicArrayGeometry? {
@@ -81,7 +103,8 @@ public final class AppSettings {
     ) -> MeetingSession.Config {
         MeetingSession.Config(
             kind: kind, detectedMeeting: detected, microphoneDeviceUID: inputDeviceUID, arrayGeometry: arrayGeometry,
-            localeID: localeID, autoLanguage: autoLanguage, engineKind: engine, contextualStrings: customVocabulary,
-            recordAudio: recordAudio, meetingsDirectory: meetingsDirectory)
+            localeID: localeID, autoLanguage: autoLanguage, engineKind: engine, speechEngine: speechEngine,
+            spelling: spelling, contextualStrings: customVocabulary, recordAudio: recordAudio,
+            meetingsDirectory: meetingsDirectory)
     }
 }

@@ -3,14 +3,14 @@ import Foundation
 
 /// Mono Float32 sample-rate converter that keeps filter state across chunks, so a stream cut
 /// into 100 ms pieces converts exactly like one long buffer. Not thread-safe: owned by one actor.
-final class StreamingResampler {
-    let inputRate: Double
-    let outputRate: Double
+public final class StreamingResampler {
+    public let inputRate: Double
+    public let outputRate: Double
     private let inputFormat: AVAudioFormat
     private let outputFormat: AVAudioFormat
     private let converter: AVAudioConverter
 
-    init?(from inputRate: Double, to outputRate: Double) {
+    public init?(from inputRate: Double, to outputRate: Double) {
         guard inputRate > 0, outputRate > 0,
             let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: inputRate, channels: 1, interleaved: false),
             let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: outputRate, channels: 1, interleaved: false),
@@ -25,7 +25,7 @@ final class StreamingResampler {
     }
 
     /// Converts the next piece of the stream. Output may lag input by the filter delay.
-    func process(_ samples: [Float]) throws -> [Float] {
+    public func process(_ samples: [Float]) throws -> [Float] {
         guard !samples.isEmpty else { return [] }
         guard let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: AVAudioFrameCount(samples.count)) else {
             return []
@@ -38,7 +38,7 @@ final class StreamingResampler {
     }
 
     /// Flushes the converter's remaining samples and resets it for reuse.
-    func finish() throws -> [Float] {
+    public func finish() throws -> [Float] {
         let tail = try drain(input: nil)
         converter.reset()
         return tail
