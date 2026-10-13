@@ -86,9 +86,9 @@ public final class MicrophoneSource: AudioSource {
             self?.stop(session: session)
         }
         let observer = Task.detached { [weak self] in
-            for await _ in NotificationCenter.default.notifications(
-                named: .AVAudioEngineConfigurationChange, object: handle.engine)
-            {
+            // Filter by identity: the 26.x SDK only accepts a `Sendable` `object:` here.
+            for await note in NotificationCenter.default.notifications(named: .AVAudioEngineConfigurationChange) {
+                guard (note.object as AnyObject?) === handle.engine else { continue }
                 guard let self else { return }
                 self.restartAfterConfigurationChange(engine: handle.engine)
             }
