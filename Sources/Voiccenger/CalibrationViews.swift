@@ -222,7 +222,7 @@ struct EngineComparisonNote: View {
 
     var body: some View {
         let available = SpeechEngineKind.allCases.filter { $0 == .apple || models.isAvailable($0) }
-        let missing = SpeechEngineKind.allCases.filter { $0 != .apple && !models.isAvailable($0) }
+        let missing = SpeechEngineKind.allCases.filter { $0 != .apple && !$0.info.isCloud && !models.isAvailable($0) }
         VStack(alignment: .leading, spacing: 4) {
             Label("Compares \(Format.list(available.map(\.displayName))).", systemImage: "chart.bar.xaxis")
             if !missing.isEmpty {
@@ -231,6 +231,10 @@ struct EngineComparisonNote: View {
                     systemImage: "arrow.down.circle"
                 )
                 .foregroundStyle(.secondary)
+            }
+            if available.contains(.deepgram) {
+                Label("The reading is also sent to Deepgram, because a Deepgram API key is set up.", systemImage: "icloud.and.arrow.up")
+                    .foregroundStyle(.secondary)
             }
         }
         .font(.callout)

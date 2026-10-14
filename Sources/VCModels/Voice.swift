@@ -9,6 +9,9 @@ public enum SpeechEngineKind: String, Codable, Sendable, CaseIterable, Hashable,
     case cohere
     /// OpenAI Whisper large-v3 turbo (WhisperKit): close second on accents; 99 languages incl. Swahili, Yoruba, Hausa, Amharic.
     case whisper
+    /// Deepgram Nova-3 in the cloud: streams live text over a WebSocket and transcribes files over HTTPS with
+    /// word timings and keyterm hints. Audio leaves this Mac; needs the user's own Deepgram API key.
+    case deepgram
 
     public var id: String { rawValue }
 }

@@ -103,15 +103,18 @@ let usage = """
           --store dir                  Profile store (default: the app's library)
           --accent id / --lives id     Accent and home regions, e.g. ng, gb (see `calibrate --regions`)
           --language code              Language they speak in meetings (default: en)
-          --engine cohere|whisper|apple Voice model for their lines (overrides calibration)
+          --engine cohere|whisper|apple|deepgram Voice model for their lines (overrides calibration)
           --standard | --text file     The recording reads the standard passage / this text: also calibrate
                                        the voice models on it and save the best as their engine
       profiles [--store dir]           List enrolled voices.
-      models                           List voice models: status, size, languages, measured accuracy.
+      models                           List voice models: status, size, languages, measured accuracy
+                                       (checks a Deepgram key with Deepgram).
       models download <engine>         Download a voice model (cohere, whisper).
       models delete <engine>           Delete a downloaded voice model.
-      transcribe <file> [--engine cohere|whisper|apple] [--language en]
+      transcribe <file> [--engine cohere|whisper|apple|deepgram] [--language en]
                                        Transcribe an audio file with timestamps (default engine: cohere).
+                                       deepgram sends the audio to Deepgram (key: Keychain, DEEPGRAM_API_KEY
+                                       or ~/.deepgram_secret).
       calibrate <wav> [options]        Score every downloaded voice model on a reading of a known text.
           --standard                   The recording reads the Speech Accent Archive passage
           --text file                  The recording reads this text
@@ -123,7 +126,8 @@ let usage = """
       process <file> [options]         Run a recording through the full meeting pipeline
                                        (transcription, speaker identification, analysis, report).
           --profiles dir               Enrolled voices (default: the app's library)
-          --engine cohere|whisper|apple Voice model (default: cohere; downloaded if missing)
+          --engine cohere|whisper|apple|deepgram Voice model (default: cohere; downloaded if missing;
+                                       deepgram streams the audio to Deepgram)
           --intelligence apple|claude  Intelligence engine (default: apple; falls back to the other)
           --locale id                  Apple preview locale and meeting language (default: system locale)
           --spelling british|american  Spelling for speakers without their own preference
@@ -248,8 +252,11 @@ func models(_ a: inout Arguments) async throws {
     case nil:
         try a.checkUnused()
         for info in SpeechModelLibrary.allInfo {
+            if info.isCloud, await library.status(info.kind) == .downloaded { try? await library.prewarm(info.kind) }
             let status = describe(await library.status(info.kind))
-            let size = info.downloadBytes > 0 ? ByteCountFormatter.string(fromByteCount: info.downloadBytes, countStyle: .file) : "built in"
+            let size =
+                info.isCloud
+                ? "cloud" : info.downloadBytes > 0 ? ByteCountFormatter.string(fromByteCount: info.downloadBytes, countStyle: .file) : "built in"
             let wer = info.africanWordErrorRate.map { "African-accent WER \(percent($0))" } ?? ""
             print(
                 "\(pad(info.kind.rawValue, 8)) \(pad(info.displayName, 24)) \(pad(status, 16)) \(pad(size, 9)) \(pad("\(info.languageCodes.count) languages", 13)) \(wer)"
@@ -263,6 +270,7 @@ func models(_ a: inout Arguments) async throws {
             print("Apple Speech is built in; its language assets download on first use.")
             return
         }
+        guard !SpeechModelLibrary.info(kind).isCloud else { throw UsageError(cloudKeyHint) }
         try await download(kind)
         let status = describe(await library.status(kind))
         print("\(SpeechModelLibrary.info(kind).displayName): \(status)")
@@ -270,6 +278,7 @@ func models(_ a: inout Arguments) async throws {
         let kind = try engine(try a.positional(1, "<engine>"))
         try a.checkUnused()
         guard kind != .apple else { throw UsageError("Apple Speech is built in and can't be deleted") }
+        guard !SpeechModelLibrary.info(kind).isCloud else { throw UsageError(cloudKeyHint) }
         try await library.delete(kind)
         print("Deleted \(SpeechModelLibrary.info(kind).displayName).")
     case let action?:
@@ -292,9 +301,10 @@ func transcribe(_ a: inout Arguments) async throws {
         updates = try await FileTranscriber.transcribe(url: url, localeID: locale)
     } else {
         try await ensureDownloaded(kind)
-        eprint("Loading \(SpeechModelLibrary.info(kind).displayName)…")
+        let cloud = SpeechModelLibrary.info(kind).isCloud
+        eprint(cloud ? "Checking the Deepgram API key…" : "Loading \(SpeechModelLibrary.info(kind).displayName)…")
         try await SpeechModelLibrary.shared.prewarm(kind)
-        eprint("Loaded in \(seconds(since: started)).")
+        eprint("\(cloud ? "Checked" : "Loaded") in \(seconds(since: started)).")
         updates = try await FileTranscriber.transcribe(
             url: url, engine: kind, languageCode: language, prompt: [], customization: nil)
     }
@@ -414,9 +424,12 @@ func engineSummary(_ engines: [SpeechEngineKind?]) -> String {
     return counts.sorted { $0.value > $1.value }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
 }
 
-/// Downloads `kind` unless it's already on this Mac, printing progress.
+let cloudKeyHint =
+    "Deepgram runs in the cloud: nothing to download. Give it your API key in Settings › Voice Models, DEEPGRAM_API_KEY or ~/.deepgram_secret."
+
+/// Downloads `kind` unless it's already on this Mac (or in the cloud), printing progress.
 func ensureDownloaded(_ kind: SpeechEngineKind) async throws {
-    guard kind != .apple else { return }
+    guard kind != .apple, !SpeechModelLibrary.info(kind).isCloud else { return }
     let status = await SpeechModelLibrary.shared.status(kind)
     if SessionVoices.availableEngines([kind: status]).contains(kind) { return }
     try await download(kind)

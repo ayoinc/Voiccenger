@@ -400,6 +400,13 @@ private struct EngineStatusChip: View {
 
     private var title: String {
         guard engine != .apple else { return engine.displayName }
+        if engine == .deepgram {
+            switch status {
+            case .ready: return "Deepgram · live"
+            case .failed: return "Deepgram · on-device fallback"
+            case nil, .loading, .downloaded, .downloading, .notDownloaded: return "Deepgram · connecting"
+            }
+        }
         switch status {
         case nil: return engine.shortName
         case .ready: return "\(engine.shortName) · ready"
@@ -436,6 +443,12 @@ private struct EngineStatusChip: View {
         switch status {
         case _ where engine == .apple:
             return "Apple Speech transcribes this meeting."
+        case .ready where engine == .deepgram:
+            return "Audio is streamed to Deepgram, which writes the live text and each finished line."
+        case .failed(let message) where engine == .deepgram:
+            return "Deepgram isn't transcribing (\(message)), so this Mac writes the transcript instead."
+        case .loading where engine == .deepgram, .downloaded where engine == .deepgram:
+            return "Connecting to Deepgram."
         case .ready, nil:
             return "Apple Speech previews words as they're spoken; \(name) writes each finished line."
         case .loading, .downloaded:

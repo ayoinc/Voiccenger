@@ -10,7 +10,7 @@ Download the latest `Voiccenger-x.y.z.dmg` from [Releases](https://github.com/ay
 ## Requirements
 - macOS 26 on Apple silicon, Apple Intelligence enabled (on-device engine).
 - Swift 6.2+ (Command Line Tools are enough; Xcode not required).
-- Optional: Anthropic API key (Claude engine), USB mic array (ReSpeaker 4/6-mic, miniDSP UMA-8) for seat direction.
+- Optional: Anthropic API key (Claude engine), Deepgram API key (cloud voice model), USB mic array (ReSpeaker 4/6-mic, miniDSP UMA-8) for seat direction.
 - Disk: Cohere Transcribe 2.2 GB and/or Whisper Large v3 Turbo 1.7 GB, downloaded on first use.
 
 ## Voice models and accents
@@ -21,20 +21,23 @@ Apple's recogniser has a single English acoustic model: the en-US, en-GB and en-
 | Cohere Transcribe (FluidAudio, Neural Engine) | Default: most accurate on accented English | 2.2 GB | 14 |
 | Whisper Large v3 Turbo (WhisperKit) | Alternative; languages Cohere lacks (Swahili, Yoruba, Hausa, Amharic, Somali, Afrikaans…) | 1.7 GB | 99 |
 | Apple Speech | Instant grey preview while someone talks; fallback while a model downloads | built in | per locale |
+| Deepgram Nova-3 (cloud, optional) | Fastest live text, streamed like [Granola](https://granola.ai); less accurate on African accents than Cohere/Whisper, better than Apple. **Sends audio to Deepgram**; needs your own API key | none | 63 + `multi` |
 
-Live, Apple shows words instantly; each finished stretch of speech is re-transcribed by the selected model and replaces the preview.
+Live, Apple shows words instantly; each finished stretch of speech is re-transcribed by the selected model and replaces the preview. With Deepgram selected, each channel instead streams 16 kHz audio over one WebSocket to Deepgram (`nova-3`, interim results, smart formatting, enrolled names as keyterms, `mip_opt_out=true`): interim results are the grey preview and Deepgram's finals, with its word timings, are the lines. A dropped connection reconnects and resends the audio Deepgram hadn't finalised; if the key is missing or rejected, or Deepgram can't be reached within 5 s, that channel falls back to the on-device path and the live chip says so.
+
+**Deepgram key.** Settings › Voice Models › Deepgram stores the key in the Keychain (service `com.voiccenger.app`, account `deepgram-api-key`) and checks it with Deepgram (`GET /v1/projects`, once per launch). The direct-download app and `voiccenger-cli` also read `DEEPGRAM_API_KEY`, then `~/.deepgram_secret`; the sandboxed App Store build uses the Keychain or the environment only. The key is sent only in the `Authorization` header to Deepgram, never logged. `voiccenger-cli transcribe file.wav --engine deepgram` and `process file.wav --engine deepgram` use it too; `models` shows whether it works. Calibration includes Deepgram once its key is valid.
 
 **Benchmark.** 89 speakers from the [Speech Accent Archive](https://accent.gmu.edu/) (54 African: Yoruba, Igbo, Hausa, Ewe, Ga, Fante, Twi, Krio, Mende, Wolof, Bambara, Swahili, Luganda, Luo, Kikuyu, Somali, Oromo, Amharic, Tigrinya, Shona, Sesotho, Zulu, Tswana, Afrikaans, Lingala…) reading the same paragraph. Word error rate, lower is better:
 
-| Speakers | Apple | Parakeet v3 | Voiccenger + Whisper | Voiccenger + Cohere |
-|---|---|---|---|---|
-| All 89 | 10.2% | 9.1% | 5.7% | **5.1%** |
-| African (54) | 10.1% | 8.0% | 5.1% | **4.3%** |
-| West African (34) | 9.5% | 6.5% | 4.9% | **3.4%** |
-| East/Southern African (20) | 11.1% | 10.5% | **5.5%** | 5.7% |
-| Native English (8) | 1.3% | 1.1% | **0.5%** | 0.9% |
+| Speakers | Apple | Parakeet v3 | Deepgram Nova-3 | Voiccenger + Whisper | Voiccenger + Cohere |
+|---|---|---|---|---|---|
+| All 89 | 10.2% | 9.1% | 7.4% | 5.7% | **5.1%** |
+| African (54) | 10.1% | 8.0% | 7.2% | 5.1% | **4.3%** |
+| West African (34) | 9.5% | 6.5% | 6.1% | 4.9% | **3.4%** |
+| East/Southern African (20) | 11.1% | 10.5% | 9.3% | **5.5%** | 5.7% |
+| Native English (8) | 1.3% | 1.1% | 0.7% | **0.5%** | 0.9% |
 
-"Voiccenger +" columns are measured through the app's own transcription path (`voiccenger-cli transcribe --engine …`). Running the models on whole clips does slightly better (Cohere 4.5% / 3.9% African; Whisper 5.1% / 4.1%), since the app splits audio at pauses.
+"Voiccenger +" columns are measured through the app's own transcription path (`voiccenger-cli transcribe --engine …`). Running the models on whole clips does slightly better (Cohere 4.5% / 3.9% African; Whisper 5.1% / 4.1%), since the app splits audio at pauses. Deepgram was measured through its pre-recorded API with `language=en` (`language=multi` is worse: 8.7% African), so Voiccenger sends the meeting's or person's language.
 
 Parakeet v3 drifted out of English for accented speakers (Dutch words, Greek script), so it isn't offered. No single model wins for everyone, which is why each person can calibrate.
 
@@ -102,19 +105,20 @@ NOTARY_KEYCHAIN_PROFILE=voiccenger-notary scripts/notarize.sh dist/Voiccenger-$V
 | Online meeting detection | Core Audio process list: a known conferencing app/browser using the mic for ≥2 s starts, ≥5 s absent ends (`VCAudio.MeetingDetector`) |
 | In-person detection | Energy VAD, ~30 s speech in 60 s (`ConversationDetector`), opt-in |
 | Capture | Mic via AVAudioEngine; remote voices via Core Audio process tap on the meeting app — separate channels |
-| Transcription | Apple `SpeechAnalyzer` streams a preview; utterances (joined across pauses < 3 s, ≤ 30 s) are re-transcribed by Cohere Transcribe or Whisper; Apple's word timings are transferred to the final text |
+| Transcription | Apple `SpeechAnalyzer` streams a preview; utterances (joined across pauses < 3 s, ≤ 30 s) are re-transcribed by Cohere Transcribe or Whisper; Apple's word timings are transferred to the final text. Or Deepgram Nova-3 streams over a WebSocket per channel, with its word times mapped back to the session clock across gaps and reconnects |
 | Language/accent | Per-person calibration picks the best model; accent region seeds vocabulary; language switching (e.g. English ↔ French) on low confidence |
 | Speakers | FluidAudio diarization + WeSpeaker embeddings; enrolled people matched by cosine with multi-sample profiles, ambiguity margin and per-cluster voting |
 | Seat direction | GCC-PHAT steered response power over all mic pairs, per-speaker circular mean |
 | Intent, corrections, suggestions | Apple Foundation Models (default) or Claude, per utterance. A correction is shown only as a self-correction, a contradiction of an earlier line or a likely mishearing, checked against the words spoken; filler or repetition clean-ups are never corrections |
 | Report | Topics, decisions, action items (owner/due), notes, things that could have been said, open questions, corrections, per-person points; Markdown export with the voice model used. Every item cites numbered transcript lines and is kept only when those lines support it (shared content words, a commitment/request/decision/question cue, the owner as the committer or the person asked); per-person points cite that person's own lines, skip small talk and name nothing those lines don't; promises are never reported as done; only people with transcript lines appear; meetings with little substance get a brief report |
 
-Data: `~/Library/Application Support/Voiccenger/`. Claude key stored in the Keychain.
+Data: `~/Library/Application Support/Voiccenger/`. Claude and Deepgram keys stored in the Keychain.
 
 ## Measured
 - Accented English (89 real speakers, see above): 5.1% word error rate with Cohere Transcribe vs 10.2% with Apple; 4.3% vs 10.1% for African speakers.
 - Speaker attribution, 4 enrolled synthetic voices, 10-turn meeting: 10/10.
 - Cohere warm-up ~11 s per launch on the Neural Engine (0.3 GB memory); Whisper ~1 s.
+- Deepgram on the 48 s fixture meeting streamed in real time: first interim 0.6 s after speech starts, finals ~0.5 s after most turns end, 0.8% WER; 10/10 speaker turns with enrolled voices.
 - DOA error at 20 dB SNR: ≤1° on presets.
 
 ## Limitations
@@ -124,6 +128,7 @@ Data: `~/Library/Application Support/Voiccenger/`. Claude key stored in the Keyc
 - Unenrolled similar voices can merge at the default clustering threshold (0.7); enroll people for reliable naming.
 - Speaker labels lag ~10 s behind live text (diarization windows).
 - Seat direction needs a multi-channel array; the built-in Mac mic can't localize.
+- Deepgram streams at about real time, so `process --engine deepgram` takes roughly as long as the recording. New names enrolled mid-meeting reach Deepgram's keyterms on its next connection.
 - If system-audio permission is denied the tap yields silence, not an error.
 - Report grounding is lexical: an item that shares words with its cited lines and has the right cue can still misread them. Long overview sentences are only checked for promises reported as done ("agreed on a budget freeze" for a feature freeze survives there).
 - With CLT only, SwiftUI's `@State` macro is unavailable; views use a `ViewState = SwiftUI.State` alias.
@@ -132,7 +137,7 @@ Data: `~/Library/Application Support/Voiccenger/`. Claude key stored in the Keyc
 Icon and banner are rendered in code: `swift scripts/MakeArtwork.swift` regenerates `Resources/AppIcon.icns`, the App Store icon catalog `Resources/Assets.xcassets`, the DMG background, `docs/icon.png` and `docs/banner.png`. The mark is a meeting table seen from above: waveform bars form the ring of seats, each speaker has a colour, and the beam points at whoever is talking.
 
 ## Privacy
-See [PRIVACY.md](PRIVACY.md). Everything runs on-device except model downloads and the optional Claude engine.
+See [PRIVACY.md](PRIVACY.md). Everything runs on-device except model downloads and the optional Claude and Deepgram services.
 
 ## License
 MIT — see [LICENSE](LICENSE). Uses [FluidAudio](https://github.com/FluidInference/FluidAudio) (Apache-2.0).

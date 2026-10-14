@@ -149,7 +149,7 @@ public final class MeetingSession {
     @ObservationIgnored private let library: SpeechModelLibrary
     @ObservationIgnored private var clock: SessionClock?
     @ObservationIgnored private var sources: [any AudioSource] = []
-    @ObservationIgnored private var transcribers: [AudioChannel: RefiningTranscriber] = [:]
+    @ObservationIgnored private var transcribers: [AudioChannel: any ChannelTranscriber] = [:]
     @ObservationIgnored private var identifiers: [AudioChannel: SpeakerIdentifier] = [:]
     /// Capture loops; each returns the session time of the end of the last chunk it forwarded.
     @ObservationIgnored private var captureTasks: [Task<TimeInterval, Never>] = []
@@ -357,7 +357,7 @@ public final class MeetingSession {
         try await SpeechAssets.ensureInstalled(localeIDs: [config.localeID])
         for kind in SpeechEngineKind.allCases { speechEngineStatuses[kind] = await library.status(kind) }
         observeEngineStatuses()
-        if config.speechEngine != .apple,
+        if config.speechEngine != .apple, config.speechEngine != .deepgram,
             !SessionVoices.availableEngines(speechEngineStatuses).contains(config.speechEngine)
         {
             warn("\(SpeechModelLibrary.info(config.speechEngine).displayName) isn't downloaded yet; lines use Apple's transcription until it's ready.")
@@ -365,11 +365,11 @@ public final class MeetingSession {
         if voices.mayReroute(sessionLanguage: sessionLanguage) { archive = MeetingAudioArchive() }
 
         for channel in channels {
-            let transcriber = RefiningTranscriber(
-                channel: channel, appleLocaleID: config.localeID, engine: config.speechEngine,
-                languageCode: sessionLanguage, prompt: voices.prompt, customization: nil, library: library,
-                autoLanguage: config.autoLanguage, waitForEngine: config.mode == .offline)
+            let transcriber = makeTranscriber(channel: channel)
             try await transcriber.start()
+            if let deepgram = transcriber as? DeepgramLiveTranscriber, let reason = await deepgram.fallbackReason {
+                warn("Deepgram isn't transcribing this meeting (\(reason)); lines are transcribed on this Mac instead.")
+            }
             transcribers[channel] = transcriber
             currentLocales[channel] = config.localeID
             noteLocale(config.localeID)
@@ -395,6 +395,33 @@ public final class MeetingSession {
             warn("No intelligence engine is available; live insights and the report are disabled.")
         }
         intelligenceEngineName = engine?.engineName
+    }
+
+    /// Deepgram streams when it's the meeting's engine (falling back to on-device per channel when it can't be
+    /// used); every other engine refines Apple's live preview.
+    private func makeTranscriber(channel: AudioChannel) -> any ChannelTranscriber {
+        let offline = config.mode == .offline
+        guard config.speechEngine == .deepgram else {
+            return RefiningTranscriber(
+                channel: channel, appleLocaleID: config.localeID, engine: config.speechEngine,
+                languageCode: sessionLanguage, prompt: voices.prompt, customization: nil, library: library,
+                autoLanguage: config.autoLanguage, waitForEngine: offline)
+        }
+        var options = DeepgramLiveTranscriber.Options()
+        // Files are streamed faster than realtime; Deepgram may still be catching up when the input ends.
+        if offline { options.finishTimeout = .seconds(600) }
+        return DeepgramLiveTranscriber(
+            channel: channel, localeID: config.localeID, languageCode: sessionLanguage, prompt: voices.prompt,
+            library: library, fallbackEngine: deepgramFallbackEngine, autoLanguage: config.autoLanguage,
+            waitForEngine: offline, options: options)
+    }
+
+    /// The most accurate downloaded on-device model for the meeting's language, else Apple.
+    private var deepgramFallbackEngine: SpeechEngineKind {
+        let available = SessionVoices.availableEngines(speechEngineStatuses)
+        return [SpeechEngineKind.cohere, .whisper].first {
+            available.contains($0) && SpeechModelLibrary.info($0).languageCodes.contains(sessionLanguage)
+        } ?? .apple
     }
 
     // MARK: - Fan-out
@@ -464,7 +491,7 @@ public final class MeetingSession {
             })
     }
 
-    private func launchEvents(channel: AudioChannel, transcriber: RefiningTranscriber) {
+    private func launchEvents(channel: AudioChannel, transcriber: any ChannelTranscriber) {
         let events = transcriber.events
         eventTasks.append(
             Task.detached { [weak self] in
@@ -488,7 +515,7 @@ public final class MeetingSession {
         }
     }
 
-    private nonisolated static func feedTranscriber(_ stream: AsyncStream<AudioChunk>, _ t: RefiningTranscriber) async {
+    private nonisolated static func feedTranscriber(_ stream: AsyncStream<AudioChunk>, _ t: any ChannelTranscriber) async {
         for await chunk in stream { await t.append(chunk) }
         await t.finish()
     }

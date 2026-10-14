@@ -113,7 +113,7 @@ import VCModels
             let tokenizer = WhisperTranscriber.tokenizerFolder(base: base)
             try fm.createDirectory(at: tokenizer, withIntermediateDirectories: true)
             try Data("{}".utf8).write(to: tokenizer.appendingPathComponent("tokenizer.json"))
-        case .apple:
+        case .apple, .deepgram:
             break
         }
     }
@@ -179,7 +179,9 @@ import VCModels
     }
 
     @Test func catalogueDescribesEveryEngine() {
-        #expect(SpeechModelLibrary.allInfo.map(\.kind) == [.cohere, .whisper, .apple])
+        #expect(SpeechModelLibrary.allInfo.map(\.kind) == [.cohere, .whisper, .deepgram, .apple])
+        #expect(SpeechModelLibrary.allInfo.filter(\.isCloud).map(\.kind) == [.deepgram])
+        #expect(SpeechModelLibrary.info(.deepgram).downloadBytes == 0)
         let whisper = SpeechModelLibrary.info(.whisper)
         #expect(whisper.languageCodes.count >= 99)
         #expect(["sw", "yo", "ha", "am"].allSatisfy(whisper.languageCodes.contains))

@@ -27,16 +27,18 @@ public struct SpeechModelInfo: Sendable, Hashable, Identifiable {
     public let displayName: String
     /// One line, user-facing.
     public let summary: String
-    /// Approximate download size; 0 for Apple (built into macOS).
+    /// Approximate download size; 0 for Apple (built into macOS) and cloud engines.
     public let downloadBytes: Int64
     /// ISO 639-1 languages the engine transcribes.
     public let languageCodes: [String]
     /// Word error rate on 54 African speakers of the Speech Accent Archive (lower is better).
     public let africanWordErrorRate: Double?
+    /// Audio is sent to a third-party service (Deepgram) instead of being transcribed on this Mac.
+    public let isCloud: Bool
 
     public init(
         kind: SpeechEngineKind, displayName: String, summary: String, downloadBytes: Int64, languageCodes: [String],
-        africanWordErrorRate: Double?
+        africanWordErrorRate: Double?, isCloud: Bool = false
     ) {
         self.kind = kind
         self.displayName = displayName
@@ -44,6 +46,7 @@ public struct SpeechModelInfo: Sendable, Hashable, Identifiable {
         self.downloadBytes = downloadBytes
         self.languageCodes = languageCodes
         self.africanWordErrorRate = africanWordErrorRate
+        self.isCloud = isCloud
     }
 }
 
@@ -52,6 +55,8 @@ public struct SpeechModelInfo: Sendable, Hashable, Identifiable {
 /// Layout under `root`: `cohere-transcribe/q8/` (FluidAudio's folder for `Repo.cohereTranscribeCoreml`) and
 /// `whisper/` (WhisperKit `downloadBase`: `models/argmaxinc/whisperkit-coreml/<variant>` plus the tokenizer in
 /// `models/openai/whisper-large-v3`). Apple Speech is part of macOS and always counts as ready when available.
+/// Deepgram has no files: it is `.downloaded` while an API key resolves, `.ready` once Deepgram accepted the key
+/// (checked once per launch and key), `.failed` without a key or when Deepgram rejects it or can't be reached.
 public actor SpeechModelLibrary {
     public static let shared = SpeechModelLibrary(root: defaultRoot)
 
@@ -61,17 +66,28 @@ public actor SpeechModelLibrary {
     }
 
     public nonisolated let root: URL
+    nonisolated let deepgram: DeepgramAccount
     private nonisolated let broadcaster: StatusBroadcaster
     private var instances: [SpeechEngineKind: any AccurateTranscriber] = [:]
     private var downloads: [SpeechEngineKind: Task<Void, any Error>] = [:]
     private var loads: [SpeechEngineKind: Task<any AccurateTranscriber, any Error>] = [:]
+    /// The Deepgram key Deepgram accepted this launch, and one it rejected (not checked again).
+    private var acceptedDeepgram: DeepgramClient?
+    private var rejectedDeepgramKey: String?
+    private var deepgramCheck: (key: String, task: Task<DeepgramClient, any Error>)?
 
     public init(root: URL) {
+        self.init(root: root, deepgram: .live)
+    }
+
+    init(root: URL, deepgram: DeepgramAccount) {
         self.root = root
+        self.deepgram = deepgram
         var statuses: [SpeechEngineKind: ModelStatus] = [:]
-        for kind in SpeechEngineKind.allCases {
+        for kind in SpeechEngineKind.allCases where kind != .deepgram {
             statuses[kind] = Self.filesStatus(kind, root: root)
         }
+        statuses[.deepgram] = Self.deepgramKeyStatus(deepgram)
         broadcaster = StatusBroadcaster(statuses)
     }
 
@@ -94,11 +110,16 @@ public actor SpeechModelLibrary {
                 kind: .apple, displayName: "Apple Speech",
                 summary: "Built into macOS: instant live text, nothing to download, but the weakest on accented speech.",
                 downloadBytes: 0, languageCodes: appleLanguageCodes, africanWordErrorRate: 0.101)
+        case .deepgram:
+            SpeechModelInfo(
+                kind: .deepgram, displayName: "Deepgram Nova-3 (cloud)",
+                summary: "The fastest live text: audio is streamed to Deepgram, so it needs your own Deepgram API key and an internet connection. Less accurate on African accents than Cohere or Whisper, more accurate than Apple.",
+                downloadBytes: 0, languageCodes: Deepgram.languageCodes, africanWordErrorRate: 0.072, isCloud: true)
         }
     }
 
     /// Most accurate on accents first.
-    public nonisolated static var allInfo: [SpeechModelInfo] { [.cohere, .whisper, .apple].map(info) }
+    public nonisolated static var allInfo: [SpeechModelInfo] { [.cohere, .whisper, .deepgram, .apple].map(info) }
 
     /// Languages macOS 26 SpeechTranscriber transcribes.
     static let appleLanguageCodes = ["en", "fr", "de", "es", "it", "pt", "ja", "ko", "zh", "yue"]
@@ -115,19 +136,24 @@ public actor SpeechModelLibrary {
     }
 
     public func isReady(_ kind: SpeechEngineKind) -> Bool {
-        kind == .apple ? SpeechTranscriber.isAvailable : instances[kind] != nil
+        switch kind {
+        case .apple: SpeechTranscriber.isAvailable
+        case .deepgram: acceptedDeepgram != nil
+        case .cohere, .whisper: instances[kind] != nil
+        }
     }
 
-    /// True when every file the engine loads is present (always true for Apple).
+    /// True when every file the engine loads is present (always true for Apple); for Deepgram, when an API key
+    /// resolves.
     public nonisolated func isDownloaded(_ kind: SpeechEngineKind) -> Bool {
-        Self.filesPresent(kind, root: root)
+        kind == .deepgram ? deepgram.resolveKey() != nil : Self.filesPresent(kind, root: root)
     }
 
     // MARK: - Download / delete
 
-    /// Idempotent; concurrent calls share one download. Progress via `statusUpdates`.
+    /// Idempotent; concurrent calls share one download. Progress via `statusUpdates`. No-op for Apple and Deepgram.
     public func download(_ kind: SpeechEngineKind) async throws {
-        guard kind != .apple else { return }
+        guard kind != .apple, !Self.info(kind).isCloud else { return }
         if let running = downloads[kind] { return try await running.value }
         if isDownloaded(kind) {
             if case .failed = broadcaster.status(kind) { broadcaster.set(kind, .downloaded) }
@@ -163,9 +189,10 @@ public actor SpeechModelLibrary {
         }
     }
 
-    /// Cancels a running download or load, unloads the engine and removes its files. No-op for Apple.
+    /// Cancels a running download or load, unloads the engine and removes its files. No-op for Apple and
+    /// Deepgram (its key is removed with `deepgramKeyChanged()` after clearing it from the keychain).
     public func delete(_ kind: SpeechEngineKind) throws {
-        guard kind != .apple else { return }
+        guard kind != .apple, !Self.info(kind).isCloud else { return }
         downloads.removeValue(forKey: kind)?.cancel()
         loads.removeValue(forKey: kind)?.cancel()
         instances[kind] = nil
@@ -178,16 +205,19 @@ public actor SpeechModelLibrary {
     // MARK: - Loading
 
     /// Load + warm-up inference; status → `.ready`. Throws `TranscriptionError.modelNotDownloaded` when files are missing.
+    /// For Deepgram: checks the API key with Deepgram (`DeepgramError` when there's none or it's rejected).
     public func prewarm(_ kind: SpeechEngineKind) async throws {
         _ = try await transcriber(kind)
     }
 
-    /// Ready instance (loads/warms if needed; throws if not downloaded). `.apple` returns an Apple-backed offline transcriber.
+    /// Ready instance (loads/warms if needed; throws if not downloaded). `.apple` returns an Apple-backed offline
+    /// transcriber; `.deepgram` one that calls Deepgram with the checked key.
     public func transcriber(_ kind: SpeechEngineKind) async throws -> any AccurateTranscriber {
         if kind == .apple {
             guard SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
             return AppleOfflineTranscriber()
         }
+        if kind == .deepgram { return DeepgramTranscriber(client: try await deepgramClient()) }
         if let instance = instances[kind] { return instance }
         if let running = loads[kind] { return try await running.value }
         guard isDownloaded(kind) else { throw TranscriptionError.modelNotDownloaded(kind) }
@@ -233,7 +263,7 @@ public actor SpeechModelLibrary {
     /// Top-level items `delete` removes.
     static func storage(_ kind: SpeechEngineKind, root: URL) -> [URL] {
         switch kind {
-        case .apple: []
+        case .apple, .deepgram: []
         case .cohere: [cohereDirectory(root: root).deletingLastPathComponent()]
         case .whisper: [whisperBase(root: root)]
         }
@@ -242,7 +272,7 @@ public actor SpeechModelLibrary {
     static func filesPresent(_ kind: SpeechEngineKind, root: URL) -> Bool {
         let fm = FileManager.default
         switch kind {
-        case .apple:
+        case .apple, .deepgram:
             return true
         case .cohere:
             let dir = cohereDirectory(root: root)
@@ -267,7 +297,7 @@ public actor SpeechModelLibrary {
         _ kind: SpeechEngineKind, root: URL, progress: @escaping @Sendable (Double) -> Void
     ) async throws {
         switch kind {
-        case .apple:
+        case .apple, .deepgram:
             return
         case .cohere:
             // `ModelHub.download` lands the files in `root/<folderName>`. It reports downloading as the first
@@ -289,7 +319,71 @@ public actor SpeechModelLibrary {
         case .apple: AppleOfflineTranscriber()
         case .cohere: try await CohereTranscriber.load(from: cohereDirectory(root: root))
         case .whisper: try await WhisperTranscriber.load(base: whisperBase(root: root))
+        // `transcriber(_:)` hands out Deepgram before loading anything.
+        case .deepgram: throw DeepgramError.missingKey
         }
+    }
+
+    // MARK: - Deepgram
+
+    /// A client whose key Deepgram accepted (`GET /v1/projects` → 200), checked once per launch and key;
+    /// concurrent callers share one check. Status: `.loading` while checking, then `.ready` or `.failed`.
+    func deepgramClient() async throws -> DeepgramClient {
+        guard let key = deepgram.resolveKey()?.value else {
+            acceptedDeepgram = nil
+            broadcaster.set(.deepgram, .failed(DeepgramError.missingKey.statusMessage))
+            throw DeepgramError.missingKey
+        }
+        if let accepted = acceptedDeepgram, accepted.key == key { return accepted }
+        if rejectedDeepgramKey == key {
+            broadcaster.set(.deepgram, .failed(DeepgramError.invalidKey.statusMessage))
+            throw DeepgramError.invalidKey
+        }
+        if let check = deepgramCheck, check.key == key { return try await check.task.value }
+        broadcaster.set(.deepgram, .loading)
+        let client = DeepgramClient(key: key, account: deepgram)
+        let task = Task<DeepgramClient, any Error> {
+            try await client.validate()
+            return client
+        }
+        deepgramCheck = (key, task)
+        do {
+            let accepted = try await task.value
+            if deepgramCheck?.task == task {
+                deepgramCheck = nil
+                acceptedDeepgram = accepted
+                broadcaster.set(.deepgram, .ready)
+            }
+            return accepted
+        } catch {
+            if deepgramCheck?.task == task {
+                deepgramCheck = nil
+                if error as? DeepgramError == .invalidKey { rejectedDeepgramKey = key }
+                broadcaster.set(.deepgram, .failed((error as? DeepgramError)?.statusMessage ?? error.localizedDescription))
+                transcriptionLog.error("Deepgram key check failed: \(error.localizedDescription, privacy: .public)")
+            }
+            throw error
+        }
+    }
+
+    /// Call after storing or removing the key: forgets earlier checks and shows `.downloaded` (a key to check)
+    /// or "Add your Deepgram API key".
+    public func deepgramKeyChanged() {
+        acceptedDeepgram = nil
+        rejectedDeepgramKey = nil
+        deepgramCheck?.task.cancel()
+        deepgramCheck = nil
+        broadcaster.set(.deepgram, Self.deepgramKeyStatus(deepgram))
+    }
+
+    /// How the live connection is doing: `.ready` while streaming, `.failed(reason)` when a channel fell back to
+    /// on-device transcription.
+    func reportDeepgramConnection(_ status: ModelStatus) {
+        broadcaster.set(.deepgram, status)
+    }
+
+    private static func deepgramKeyStatus(_ account: DeepgramAccount) -> ModelStatus {
+        account.resolveKey() == nil ? .failed(DeepgramError.missingKey.statusMessage) : .downloaded
     }
 
     /// One second of quiet, deterministic noise.

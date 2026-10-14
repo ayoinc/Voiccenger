@@ -48,7 +48,12 @@ struct RecordingConsentSheet: View {
     }
 
     private var privacyNote: String {
-        if coordinator.settings.engine == .claude {
+        let claude = coordinator.settings.engine == .claude
+        if coordinator.sendsAudioToDeepgram {
+            let analysis = claude ? " Transcript text is sent to Anthropic for analysis because Claude is selected in Settings › Intelligence." : ""
+            return "Audio is sent to Deepgram for transcription, because Deepgram is the voice model for this meeting or for someone in it. Recordings and transcripts are saved on this Mac.\(analysis)"
+        }
+        if claude {
             return "Audio and transcripts are saved on this Mac. Transcript text is sent to Anthropic for analysis because Claude is selected in Settings › Intelligence."
         }
         return "Audio and transcripts stay on this Mac."

@@ -21,12 +21,12 @@ let package = Package(
         .package(url: "https://github.com/argmaxinc/argmax-oss-swift.git", from: "1.1.1"),
     ],
     targets: [
-        // Shared value types and protocols. No framework dependencies beyond Foundation.
+        // Shared value types and protocols, plus the keychain store. Foundation and Security only.
         .target(name: "VCModels"),
         // Microphone / system-audio capture, recording, meeting + conversation detection.
         .target(name: "VCAudio", dependencies: ["VCModels"]),
-        // Live transcription (SpeechAnalyzer) and accurate voice models (Cohere via FluidAudio, Whisper via
-        // WhisperKit), accent regions, transcript customization and calibration.
+        // Live transcription (SpeechAnalyzer), accurate voice models (Cohere via FluidAudio, Whisper via
+        // WhisperKit) and Deepgram Nova-3 (cloud, HTTPS + WebSocket), accent regions, customization and calibration.
         .target(
             name: "VCTranscription",
             dependencies: [

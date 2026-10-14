@@ -2,6 +2,7 @@ import Foundation
 import Security
 import Testing
 @testable import VCIntelligence
+import VCModels
 
 @Suite struct KeychainStoreTests {
     @Test func storesReplacesAndDeletes() throws {

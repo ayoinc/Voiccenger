@@ -16,6 +16,7 @@ extension SpeechEngineKind {
         case .apple: "Apple"
         case .cohere: "Cohere"
         case .whisper: "Whisper"
+        case .deepgram: "Deepgram"
         }
     }
 }

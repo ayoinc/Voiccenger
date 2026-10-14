@@ -64,6 +64,13 @@ public final class MeetingCoordinator {
     public var isRecording: Bool { status == .recording }
     public var recentMeetings: [Meeting] { Array(meetings.prefix(5)) }
 
+    /// Recording would send audio to Deepgram: it's the meeting's voice model, or an enrolled person's (chosen
+    /// or calibrated) voice model, whose lines are re-transcribed with it.
+    public var sendsAudioToDeepgram: Bool {
+        settings.speechEngine == .deepgram
+            || profiles.contains { ($0.voice.preferredEngine ?? $0.voice.calibration?.best?.engine) == .deepgram }
+    }
+
     @ObservationIgnored private var detector: MeetingDetector?
     @ObservationIgnored private var detectorTask: Task<Void, Never>?
     @ObservationIgnored private var monitor: MicrophoneSource?
