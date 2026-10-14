@@ -22,9 +22,13 @@ public enum TranscriptionError: Error, LocalizedError, Sendable, Equatable {
     case modelNotDownloaded(SpeechEngineKind)
     /// The voice model cannot transcribe this ISO 639-1 language.
     case unsupportedLanguage(String, SpeechEngineKind)
+    /// Speech recognition permission was denied (System Settings › Privacy & Security › Speech Recognition).
+    case speechRecognitionNotAuthorized
 
     public var errorDescription: String? {
         switch self {
+        case .speechRecognitionNotAuthorized:
+            "Speech recognition isn't allowed. Turn on Voiccenger in System Settings › Privacy & Security › Speech Recognition."
         case .speechTranscriberUnavailable:
             "Speech transcription is not available on this Mac."
         case .unsupportedLocale(let id):

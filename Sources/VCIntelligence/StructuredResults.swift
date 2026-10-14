@@ -161,6 +161,43 @@ struct RawParticipant: Decodable, Equatable {
     }
 }
 
+/// One outline point: what one speaker said, citing that speaker's lines.
+struct RawOutlinePoint: Decodable, Equatable {
+    var speaker: String?
+    var text: String?
+    var lines: [Int]
+
+    init(speaker: String?, text: String?, lines: [Int]) {
+        self.speaker = speaker
+        self.text = text
+        self.lines = lines
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyKey.self)
+        speaker = c.lenientString("speaker")
+        text = c.lenientString("text")
+        lines = c.lenientLines("lines")
+    }
+}
+
+/// One stretch of the conversation outline.
+struct RawOutlineSegment: Decodable, Equatable {
+    var heading: String?
+    var points: [RawOutlinePoint]
+
+    init(heading: String?, points: [RawOutlinePoint]) {
+        self.heading = heading
+        self.points = points
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyKey.self)
+        heading = c.lenientString("heading")
+        points = c.lossyArray("points")
+    }
+}
+
 struct RawReport: Decodable, Equatable {
     var title: String?
     var overview: String?
@@ -172,11 +209,13 @@ struct RawReport: Decodable, Equatable {
     var openQuestions: [RawItem]
     var corrections: [RawCorrection]
     var participantSummaries: [RawParticipant]
+    var outline: [RawOutlineSegment]
 
     init(
         title: String? = nil, overview: String? = nil, topics: [RawTopic] = [], decisions: [RawItem] = [],
         actionItems: [RawActionItem] = [], notesToRemember: [RawItem] = [], missedOpportunities: [String] = [],
-        openQuestions: [RawItem] = [], corrections: [RawCorrection] = [], participantSummaries: [RawParticipant] = []
+        openQuestions: [RawItem] = [], corrections: [RawCorrection] = [], participantSummaries: [RawParticipant] = [],
+        outline: [RawOutlineSegment] = []
     ) {
         self.title = title
         self.overview = overview
@@ -188,6 +227,7 @@ struct RawReport: Decodable, Equatable {
         self.openQuestions = openQuestions
         self.corrections = corrections
         self.participantSummaries = participantSummaries
+        self.outline = outline
     }
 
     init(from decoder: any Decoder) throws {
@@ -202,6 +242,7 @@ struct RawReport: Decodable, Equatable {
         openQuestions = c.lossyArray("openQuestions")
         corrections = c.lossyArray("corrections")
         participantSummaries = c.lossyArray("participantSummaries")
+        outline = c.lossyArray("outline")
     }
 }
 

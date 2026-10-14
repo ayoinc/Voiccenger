@@ -32,6 +32,9 @@ public final class MeetingSession {
         public var autoLanguage: Bool
         /// Voice model that produces the final text of each line.
         public var speechEngine: SpeechEngineKind
+        /// Deepgram model that streams the meeting when `speechEngine` is Deepgram, and re-transcribes lines of
+        /// people without a Deepgram model of their own.
+        public var deepgramModel: String
         /// Spelling for speakers without their own preference.
         public var spelling: SpellingVariant
         public var engineKind: IntelligenceEngineKind
@@ -56,6 +59,7 @@ public final class MeetingSession {
             microphoneDeviceUID: String? = nil, arrayGeometry: MicArrayGeometry? = nil,
             localeID: String = AppSettings.systemLocaleID, autoLanguage: Bool = true,
             engineKind: IntelligenceEngineKind = .apple, speechEngine: SpeechEngineKind = .cohere,
+            deepgramModel: String = Deepgram.defaultModel,
             spelling: SpellingVariant = .unchanged, contextualStrings: [String] = [], recordAudio: Bool = true,
             meetingsDirectory: URL = AppPaths.default.meetings, speakerConfig: SpeakerIDConfig = .init(),
             mode: ProcessingMode = .live, liveAnalysis: Bool = true, alignmentTimeout: TimeInterval = 15,
@@ -70,6 +74,7 @@ public final class MeetingSession {
             self.autoLanguage = autoLanguage
             self.engineKind = engineKind
             self.speechEngine = speechEngine
+            self.deepgramModel = deepgramModel
             self.spelling = spelling
             self.contextualStrings = contextualStrings
             self.recordAudio = recordAudio
@@ -163,6 +168,8 @@ public final class MeetingSession {
     /// Lines being re-transcribed for their speaker's engine/language.
     @ObservationIgnored private var rerouteTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var rerouteFailureReported = false
+    /// The Deepgram model the meeting's lines came from (Nova-3 when the chosen one couldn't stream).
+    @ObservationIgnored private var liveDeepgramModel = Deepgram.defaultModel
     @ObservationIgnored private var analysisWorker: Task<Void, Never>?
     @ObservationIgnored private var analysisInput: AsyncStream<AnalysisJob>.Continuation?
     @ObservationIgnored private var engine: (any MeetingIntelligence)?
@@ -354,21 +361,38 @@ public final class MeetingSession {
     }
 
     private func prepare(channels: [AudioChannel]) async throws {
-        try await SpeechAssets.ensureInstalled(localeIDs: [config.localeID])
+        if AppleSpeech.isAvailable { try await SpeechAssets.ensureInstalled(localeIDs: [config.localeID]) }
         for kind in SpeechEngineKind.allCases { speechEngineStatuses[kind] = await library.status(kind) }
         observeEngineStatuses()
         if config.speechEngine != .apple, config.speechEngine != .deepgram,
             !SessionVoices.availableEngines(speechEngineStatuses).contains(config.speechEngine)
         {
-            warn("\(SpeechModelLibrary.info(config.speechEngine).displayName) isn't downloaded yet; lines use Apple's transcription until it's ready.")
+            let name = SpeechModelLibrary.info(config.speechEngine).displayName
+            if AppleSpeech.isAvailable {
+                warn("\(name) isn't downloaded yet; lines use Apple's transcription until it's ready.")
+            } else {
+                // Without Apple Speech the voice model makes the live text too (RefiningTranscriber).
+                let stand = library.previewEngine(preferring: config.speechEngine, languageCode: sessionLanguage)
+                warn(
+                    stand != config.speechEngine
+                        ? "\(name) isn't downloaded yet; this meeting is transcribed with \(SpeechModelLibrary.info(stand).displayName)."
+                        : "\(name) isn't downloaded yet; lines appear once it is. (Apple Speech, which fills in meanwhile, needs macOS 26.)")
+            }
         }
         if voices.mayReroute(sessionLanguage: sessionLanguage) { archive = MeetingAudioArchive() }
 
         for channel in channels {
             let transcriber = makeTranscriber(channel: channel)
             try await transcriber.start()
-            if let deepgram = transcriber as? DeepgramLiveTranscriber, let reason = await deepgram.fallbackReason {
-                warn("Deepgram isn't transcribing this meeting (\(reason)); lines are transcribed on this Mac instead.")
+            if let deepgram = transcriber as? DeepgramLiveTranscriber {
+                if let reason = await deepgram.fallbackReason {
+                    warn("Deepgram isn't transcribing this meeting (\(reason)); lines are transcribed on this Mac instead.")
+                } else if let reason = await deepgram.modelFallbackReason {
+                    warn("\(reason).")
+                    liveDeepgramModel = Deepgram.defaultModel
+                } else {
+                    liveDeepgramModel = config.deepgramModel
+                }
             }
             transcribers[channel] = transcriber
             currentLocales[channel] = config.localeID
@@ -386,15 +410,12 @@ public final class MeetingSession {
         }
 
         // The engine is needed for the report even when live analysis is off.
-        if let choice = ReportWriter.engine(preferring: config.engineKind) {
-            engine = choice.engine
-            if choice.isFallback {
-                warn("The selected intelligence engine is unavailable; using \(choice.engine.engineName) instead.")
-            }
-        } else {
-            warn("No intelligence engine is available; live insights and the report are disabled.")
+        let choice = ReportWriter.engine(preferring: config.engineKind)
+        engine = choice.engine
+        if choice.isFallback {
+            warn("The selected intelligence engine is unavailable; using \(choice.engine.engineName) instead.")
         }
-        intelligenceEngineName = engine?.engineName
+        intelligenceEngineName = choice.engine.engineName
     }
 
     /// Deepgram streams when it's the meeting's engine (falling back to on-device per channel when it can't be
@@ -410,6 +431,7 @@ public final class MeetingSession {
         var options = DeepgramLiveTranscriber.Options()
         // Files are streamed faster than realtime; Deepgram may still be catching up when the input ends.
         if offline { options.finishTimeout = .seconds(600) }
+        options.model = config.deepgramModel
         return DeepgramLiveTranscriber(
             channel: channel, localeID: config.localeID, languageCode: sessionLanguage, prompt: voices.prompt,
             library: library, fallbackEngine: deepgramFallbackEngine, autoLanguage: config.autoLanguage,
@@ -698,7 +720,8 @@ public final class MeetingSession {
                 let route = voices.route(
                     speakerKey: piece.speakerKey, segmentEngine: update.engine,
                     segmentLanguage: SessionVoices.languageCode(ofLocale: update.localeID),
-                    available: SessionVoices.availableEngines(speechEngineStatuses))
+                    available: SessionVoices.availableEngines(speechEngineStatuses),
+                    sessionDeepgramModel: liveDeepgramModel)
             {
                 reroute(segment, with: route, archive: archive)
             } else {
@@ -714,6 +737,7 @@ public final class MeetingSession {
     private func reroute(_ segment: TranscriptSegment, with route: EngineRoute, archive: MeetingAudioArchive) {
         let library = self.library
         let prompt = voices.prompt
+        let deepgramModel = route.deepgramModel ?? config.deepgramModel
         let range = TimeRange(
             start: max(0, segment.range.start - Self.reroutePadding), end: segment.range.end + Self.reroutePadding)
         rerouteTasks.append(
@@ -722,7 +746,7 @@ public final class MeetingSession {
                 var transcript: EngineTranscript?
                 do {
                     if !samples.isEmpty {
-                        let transcriber = try await library.transcriber(route.engine)
+                        let transcriber = try await library.transcriber(route.engine, deepgramModel: deepgramModel)
                         transcript = try await transcriber.transcribe(
                             samples16k: samples, languageCode: route.languageCode, prompt: prompt)
                     }
@@ -736,6 +760,7 @@ public final class MeetingSession {
     private func finishReroute(_ segmentID: UUID, transcript: EngineTranscript?, route: EngineRoute) {
         guard let i = segments.lastIndex(where: { $0.id == segmentID }) else { return }
         if let transcript, let text = transcript.text.nonEmpty {
+            if let reason = transcript.modelFallbackReason { warn("\(reason) for some lines.") }
             segments[i].text = voices.customize(text, speakerKey: segments[i].speakerKey)
             segments[i].engine = transcript.engine
             if SessionVoices.languageCode(ofLocale: segments[i].localeID) != route.languageCode {
@@ -876,10 +901,7 @@ public final class MeetingSession {
     }
 
     private func generateReport(for meeting: Meeting) async -> MeetingReport? {
-        guard let engine else {
-            reportError = ReportWriter.ReportWriterError.noEngine.localizedDescription
-            return nil
-        }
+        guard let engine else { return nil }
         do {
             return try await ReportWriter.report(for: meeting, engine: engine, title: config.title)
         } catch let error as ReportWriter.ReportWriterError {

@@ -17,7 +17,7 @@ public struct AccentDetector: Sendable {
     public func rank(samples: [Float], sampleRate: Double, candidateLocaleIDs: [String]) async throws
         -> [LocaleScore]
     {
-        guard SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
+        guard #available(macOS 26.0, *), SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
         var scores: [LocaleScore] = []
         var evaluated = Set<String>()
         for id in candidateLocaleIDs {

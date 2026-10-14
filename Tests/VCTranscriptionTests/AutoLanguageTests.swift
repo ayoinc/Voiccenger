@@ -140,6 +140,7 @@ private func expectCheck(
         LocaleScore(localeID: id, meanConfidence: confidence, wordCount: words, transcript: "")
     }
 
+    @available(macOS 26.0, *)
     @Test func switchesWhenWinnerBeatsCurrentByTheMargin() {
         let decision = LiveTranscriber.decide(
             scores: [score("fr-FR", 0.92), score("en-GB", 0.41)], current: "en-GB", observed: 0.4,
@@ -148,6 +149,7 @@ private func expectCheck(
         #expect(decision?.reason.contains("fr-FR") == true)
     }
 
+    @available(macOS 26.0, *)
     @Test func smallAccentDifferencesDoNotCauseFlapping() {
         let decision = LiveTranscriber.decide(
             scores: [score("en-US", 0.47), score("en-GB", 0.45)], current: "en-GB", observed: 0.3,
@@ -155,6 +157,7 @@ private func expectCheck(
         #expect(decision == nil)
     }
 
+    @available(macOS 26.0, *)
     @Test func currentLocaleWinningKeepsIt() {
         let decision = LiveTranscriber.decide(
             scores: [score("en-GB", 0.6), score("fr-FR", 0.2)], current: "en-GB", observed: 0.45,
@@ -162,6 +165,7 @@ private func expectCheck(
         #expect(decision == nil)
     }
 
+    @available(macOS 26.0, *)
     @Test func observedConfidenceIsTheBaselineWhenCurrentWasNotScored() {
         let policy = AutoLanguagePolicy()
         #expect(
@@ -172,6 +176,7 @@ private func expectCheck(
                 == nil)
     }
 
+    @available(macOS 26.0, *)
     @Test func winnerThatHeardNothingIsRejected() {
         let decision = LiveTranscriber.decide(
             scores: [score("fr-FR", 0.9, words: 0)], current: "en-GB", observed: 0.1, policy: AutoLanguagePolicy())

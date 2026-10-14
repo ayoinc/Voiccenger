@@ -64,12 +64,15 @@ public struct ContextLine: Codable, Sendable, Hashable {
     public var speaker: String
     public var time: TimeInterval
     public var text: String
+    /// When the line ends (session seconds), if known; reports use it for the end of an outline segment.
+    public var end: TimeInterval?
 
-    public init(segmentID: UUID, speaker: String, time: TimeInterval, text: String) {
+    public init(segmentID: UUID, speaker: String, time: TimeInterval, text: String, end: TimeInterval? = nil) {
         self.segmentID = segmentID
         self.speaker = speaker
         self.time = time
         self.text = text
+        self.end = end
     }
 }
 
@@ -106,6 +109,53 @@ public struct ParticipantSummary: Codable, Sendable, Hashable {
     }
 }
 
+/// One point of the conversation outline: what one speaker said, with the transcript lines it rests on.
+public struct OutlinePoint: Codable, Sendable, Hashable {
+    public var speaker: String
+    public var text: String
+    /// Start of the first cited line (session seconds).
+    public var time: TimeInterval
+    /// The transcript lines (segment IDs) the point cites, in transcript order.
+    public var segmentIDs: [UUID]
+    /// `text` is the speaker's own sentence, taken from the transcript, not a summary.
+    public var isQuote: Bool
+
+    public init(speaker: String, text: String, time: TimeInterval, segmentIDs: [UUID], isQuote: Bool = false) {
+        self.speaker = speaker
+        self.text = text
+        self.time = time
+        self.segmentIDs = segmentIDs
+        self.isQuote = isQuote
+    }
+}
+
+/// A stretch of the meeting in the conversation outline. Consecutive segments cover the whole meeting.
+public struct OutlineSegment: Codable, Sendable, Hashable {
+    public var heading: String
+    public var start: TimeInterval
+    public var end: TimeInterval
+    public var points: [OutlinePoint]
+    /// Built from the transcript (quoted sentences) because the language model left this stretch out.
+    public var isExtracted: Bool
+
+    public init(heading: String, start: TimeInterval, end: TimeInterval, points: [OutlinePoint], isExtracted: Bool = false) {
+        self.heading = heading
+        self.start = start
+        self.end = end
+        self.points = points
+        self.isExtracted = isExtracted
+    }
+}
+
+/// How a report was written.
+public enum ReportKind: String, Codable, Sendable, Hashable {
+    /// By a language model, checked against the transcript.
+    case languageModel
+    /// Extracted from the transcript without any language model: quoted sentences, question lines and possible
+    /// action items found by word cues.
+    case transcriptOutline
+}
+
 /// Post-meeting report.
 public struct MeetingReport: Codable, Sendable, Hashable {
     public var title: String
@@ -120,14 +170,17 @@ public struct MeetingReport: Codable, Sendable, Hashable {
     public var openQuestions: [String]
     public var corrections: [CorrectionNote]
     public var participantSummaries: [ParticipantSummary]
+    /// What was discussed, in order: segments covering the whole meeting, each with attributed points.
+    public var outline: [OutlineSegment]
+    public var kind: ReportKind
     public var generatedBy: String
     public var generatedAt: Date
 
     public init(
         title: String, overview: String, topics: [TopicSummary], decisions: [String], actionItems: [ActionItem],
         notesToRemember: [String], missedOpportunities: [String], openQuestions: [String],
-        corrections: [CorrectionNote], participantSummaries: [ParticipantSummary], generatedBy: String,
-        generatedAt: Date = Date()
+        corrections: [CorrectionNote], participantSummaries: [ParticipantSummary], outline: [OutlineSegment] = [],
+        kind: ReportKind = .languageModel, generatedBy: String, generatedAt: Date = Date()
     ) {
         self.title = title
         self.overview = overview
@@ -139,8 +192,34 @@ public struct MeetingReport: Codable, Sendable, Hashable {
         self.openQuestions = openQuestions
         self.corrections = corrections
         self.participantSummaries = participantSummaries
+        self.outline = outline
+        self.kind = kind
         self.generatedBy = generatedBy
         self.generatedAt = generatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case title, overview, topics, decisions, actionItems, notesToRemember, missedOpportunities, openQuestions
+        case corrections, participantSummaries, outline, kind, generatedBy, generatedAt
+    }
+
+    /// Reports saved before the outline existed decode with an empty outline, as language-model reports.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try c.decode(String.self, forKey: .title)
+        overview = try c.decode(String.self, forKey: .overview)
+        topics = try c.decode([TopicSummary].self, forKey: .topics)
+        decisions = try c.decode([String].self, forKey: .decisions)
+        actionItems = try c.decode([ActionItem].self, forKey: .actionItems)
+        notesToRemember = try c.decode([String].self, forKey: .notesToRemember)
+        missedOpportunities = try c.decode([String].self, forKey: .missedOpportunities)
+        openQuestions = try c.decode([String].self, forKey: .openQuestions)
+        corrections = try c.decode([CorrectionNote].self, forKey: .corrections)
+        participantSummaries = try c.decode([ParticipantSummary].self, forKey: .participantSummaries)
+        outline = try c.decodeIfPresent([OutlineSegment].self, forKey: .outline) ?? []
+        kind = try c.decodeIfPresent(ReportKind.self, forKey: .kind) ?? .languageModel
+        generatedBy = try c.decode(String.self, forKey: .generatedBy)
+        generatedAt = try c.decode(Date.self, forKey: .generatedAt)
     }
 }
 

@@ -11,6 +11,7 @@ import VCModels
 ///
 /// Audio of any sample rate is resampled once to a continuous 16 kHz session timeline; every buffer handed to the
 /// analyzer after a gap carries its session-clock start time, so result and word ranges are session-clock seconds.
+@available(macOS 26.0, *)
 public actor LiveTranscriber {
     public let channel: AudioChannel
     public nonisolated let events: AsyncStream<TranscriptEvent>
@@ -269,6 +270,7 @@ public actor LiveTranscriber {
 }
 
 /// One analyzer run in one locale. Owned and used only by its `LiveTranscriber` actor.
+@available(macOS 26.0, *)
 private final class RecognitionSession {
     let generation: Int
     let localeID: String

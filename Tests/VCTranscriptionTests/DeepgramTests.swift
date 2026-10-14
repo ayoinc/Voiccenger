@@ -1,5 +1,4 @@
 import Foundation
-import Synchronization
 import Testing
 import VCModels
 @testable import VCTranscription

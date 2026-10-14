@@ -1,9 +1,9 @@
 import Foundation
 import VCModels
 
-/// Live transcription of one channel by Deepgram Nova-3 over a WebSocket, as Granola does it: audio is resampled
-/// to 16 kHz Int16 and streamed; interim results become `.volatile` events and finals `.final` events with
-/// Deepgram's punctuated words on the session clock.
+/// Live transcription of one channel by Deepgram (Nova-3 unless `Options.model` names another) over a
+/// WebSocket, as Granola does it: audio is resampled to 16 kHz Int16 and streamed; interim results become
+/// `.volatile` events and finals `.final` events with Deepgram's punctuated words on the session clock.
 ///
 /// Timing: Deepgram's times count seconds of audio received on the current connection. `StreamClock` maps
 /// them back to the session clock, including across gaps in the input and after a reconnect.
@@ -26,6 +26,9 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
         public var maximumBufferSeconds: Double = 30
         /// Delays before reconnect attempts; the last repeats.
         public var reconnectDelays: [Duration] = [.milliseconds(250), .seconds(1), .seconds(2), .seconds(4)]
+        /// Deepgram model to stream with. One that can't stream the language (or that Deepgram refuses) is
+        /// replaced by Nova-3, with the reason in `modelFallbackReason`.
+        public var model: String = Deepgram.defaultModel
 
         public init() {}
     }
@@ -40,6 +43,9 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
     private let library: SpeechModelLibrary
     private let options: Options
     private let makeFallback: @Sendable ([String]) -> any ChannelTranscriber
+    /// The model and `language` of the stream, settled by `start()`.
+    private var model = Deepgram.defaultModel
+    private var streamLanguage: String?
 
     private enum Phase: Equatable {
         case idle, connecting, streaming, reconnecting, fallback
@@ -106,6 +112,8 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
 
     /// Why this channel gave up on Deepgram; nil while Deepgram transcribes it.
     public private(set) var fallbackReason: String?
+    /// Why Deepgram streams with Nova-3 instead of `Options.model`; nil when the chosen model is used.
+    public private(set) var modelFallbackReason: String?
 
     // MARK: - ChannelTranscriber
 
@@ -115,14 +123,36 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
         guard !isFinished else { throw TranscriptionError.notRunning }
         guard phase == .idle else { return }
         phase = .connecting
-        guard let language = Deepgram.requestLanguage(languageCode) else {
+        let choice = await library.deepgramModelChoice(options.model, languageCode: languageCode, live: true)
+        model = choice.model
+        modelFallbackReason = choice.fallbackReason
+        if let reason = choice.fallbackReason {
+            transcriptionLog.info("\(self.channel.rawValue, privacy: .public): \(reason, privacy: .public)")
+        }
+        guard let language = choice.language else {
             try await switchToFallback(
-                reason: "Deepgram Nova-3 doesn't transcribe “\(languageCode)”", report: false)
+                reason: "Deepgram \(Deepgram.modelDisplayName(choice.model)) doesn't transcribe “\(languageCode)”",
+                report: false)
             return
         }
+        streamLanguage = language
         do {
             client = try await library.deepgramClient()
-            try await connect(language: language)
+            do {
+                try await connect(language: language)
+            } catch DeepgramError.requestFailed(let status, let message)
+                where (400..<500).contains(status) && !Deepgram.isDefaultModel(model)
+            {
+                // Deepgram refused the model for this stream; Nova-3 streams instead.
+                guard let nova3Language = Deepgram.requestLanguage(languageCode) else {
+                    throw DeepgramError.requestFailed(status, message)
+                }
+                modelFallbackReason =
+                    "Deepgram refused \(Deepgram.modelDisplayName(model)) (\(message)), so Nova-3 is used instead"
+                model = Deepgram.defaultModel
+                streamLanguage = nova3Language
+                try await connect(language: nova3Language)
+            }
         } catch {
             try await switchToFallback(reason: Self.reason(error))
             return
@@ -172,7 +202,7 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
         // Audio still waiting for a connection gets one more try, else goes on-device.
         if phase == .reconnecting, !(unsent.isEmpty && inFlight.isEmpty) {
             do {
-                try await connect(language: Deepgram.requestLanguage(languageCode) ?? languageCode)
+                try await connect(language: streamLanguage ?? languageCode)
             } catch {
                 try? await switchToFallback(reason: Self.reason(error))
             }
@@ -196,7 +226,7 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
     private func connect(language: String) async throws {
         guard let client else { throw DeepgramError.missingKey }
         let socket = client.account.makeSocket(
-            client.streamingRequest(language: language, keyterms: Deepgram.keyterms(prompt)))
+            client.streamingRequest(model: model, language: language, keyterms: Deepgram.keyterms(prompt)))
         do {
             try await Self.open(socket, timeout: options.connectTimeout)
         } catch {
@@ -301,7 +331,7 @@ public actor DeepgramLiveTranscriber: ChannelTranscriber {
             try? await Task.sleep(for: delays.isEmpty ? .seconds(1) : delays[min(attempt, delays.count - 1)])
             guard phase == .reconnecting, !Task.isCancelled else { return }
             do {
-                try await connect(language: Deepgram.requestLanguage(languageCode) ?? languageCode)
+                try await connect(language: streamLanguage ?? languageCode)
                 reconnectTask = nil
                 return
             } catch let error as DeepgramError where error == .invalidKey || error == .outOfCredit {

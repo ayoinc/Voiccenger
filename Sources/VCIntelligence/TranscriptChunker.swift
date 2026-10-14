@@ -36,6 +36,36 @@ public enum TranscriptChunker {
         return chunks
     }
 
+    /// As many chunks as `chunk` makes, but of about equal cost, so no chunk is a short tail without the context
+    /// of its subject. A chunk still exceeds `tokenBudget` only when one line alone does.
+    public static func balancedChunk(
+        _ lines: [NumberedLine], tokenBudget: Int, cost: (NumberedLine) -> Int = defaultCost
+    ) -> [[NumberedLine]] {
+        let greedy = chunk(lines, tokenBudget: tokenBudget, cost: cost)
+        guard greedy.count > 1 else { return greedy }
+        let target = Double(lines.reduce(0) { $0 + cost($1) }) / Double(greedy.count)
+        var chunks: [[NumberedLine]] = []
+        var current: [NumberedLine] = []
+        var used = 0
+        for line in lines {
+            let lineCost = cost(line)
+            // Close at the budget, or (while chunks remain to fill) once the line would take the chunk further past
+            // the target than it stays short of it.
+            let overBudget = used + lineCost > tokenBudget
+            let pastTarget = Double(used) + Double(lineCost) / 2 > target && chunks.count < greedy.count - 1
+            if !current.isEmpty, overBudget || pastTarget {
+                chunks.append(current)
+                current = []
+                used = 0
+            }
+            current.append(line)
+            used += lineCost
+        }
+        if !current.isEmpty { chunks.append(current) }
+        // An uneven split can need one chunk more than greedy filling; greedy is then the better answer.
+        return chunks.count <= greedy.count ? chunks : greedy
+    }
+
     /// Estimated cost of a line as it appears in a prompt, including its newline.
     public static func defaultCost(_ line: NumberedLine) -> Int {
         TokenEstimator.estimate(TranscriptFormatter.format(line)) + 1

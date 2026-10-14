@@ -33,6 +33,7 @@ import Testing
         #expect(!text.contains("Open questions"))
     }
 
+    @available(macOS 26.0, *)
     @Test func compactionShrinksMonotonicallyAndTerminates() {
         var notes = Self.bulkyNotes(items: 37)
         var previousCost = AppleIntelligenceEngine.cost(of: notes)
@@ -51,6 +52,7 @@ import Testing
         #expect(notes.overview == "The team set the launch date.")
     }
 
+    @available(macOS 26.0, *)
     @Test func fittedRespectsLimitOrThrows() throws {
         let notes = Self.bulkyNotes(items: 40)
         let limit = 300

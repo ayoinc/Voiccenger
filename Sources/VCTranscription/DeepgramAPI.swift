@@ -1,8 +1,8 @@
 import Foundation
 import VCModels
 
-/// Deepgram Nova-3: constants, API key lookup, request building and response decoding shared by the file
-/// path (`DeepgramTranscriber`) and the live path (`DeepgramLiveTranscriber`).
+/// Deepgram (Nova-3 unless the user picks another model): constants, API key lookup, request building and
+/// response decoding shared by the file path (`DeepgramTranscriber`) and the live path (`DeepgramLiveTranscriber`).
 ///
 /// The key is only ever sent in the `Authorization` header. It never appears in URLs, errors or logs.
 public enum Deepgram {
@@ -14,7 +14,6 @@ public enum Deepgram {
     public static let consoleURL = URL(string: "https://console.deepgram.com")!
     public static let privacyPolicyURL = URL(string: "https://deepgram.com/privacy")!
 
-    static let model = "nova-3"
     static let restBase = URL(string: "https://api.deepgram.com")!
     static let streamingBase = URL(string: "wss://api.deepgram.com")!
     /// Keyterms sent per request; Deepgram caps the total at 500 tokens.
@@ -92,7 +91,7 @@ public enum Deepgram {
     }
 
     /// Options shared by both paths. `mip_opt_out` keeps the audio out of Deepgram's Model Improvement Program.
-    static func commonQuery(language: String, keyterms: [String]) -> [(String, String)] {
+    static func commonQuery(model: String, language: String, keyterms: [String]) -> [(String, String)] {
         [
             ("model", model), ("smart_format", "true"), ("punctuate", "true"), ("mip_opt_out", "true"),
             ("language", language),
@@ -100,17 +99,21 @@ public enum Deepgram {
     }
 
     /// `POST /v1/listen` for a WAV body.
-    static func listenURL(base: URL = restBase, language: String, keyterms: [String]) -> URL {
-        url(base: base, path: "/v1/listen", query: commonQuery(language: language, keyterms: keyterms))
+    static func listenURL(base: URL = restBase, model: String = defaultModel, language: String, keyterms: [String]) -> URL {
+        url(base: base, path: "/v1/listen", query: commonQuery(model: model, language: language, keyterms: keyterms))
     }
 
     /// `wss://…/v1/listen` for 16 kHz mono Int16 little-endian frames with interim results.
-    static func streamingURL(base: URL = streamingBase, language: String, keyterms: [String]) -> URL {
+    static func streamingURL(
+        base: URL = streamingBase, model: String = defaultModel, language: String, keyterms: [String]
+    ) -> URL {
         let stream: [(String, String)] = [
             ("encoding", "linear16"), ("sample_rate", "16000"), ("channels", "1"), ("interim_results", "true"),
             ("endpointing", "300"), ("utterance_end_ms", "1000"),
         ]
-        return url(base: base, path: "/v1/listen", query: commonQuery(language: language, keyterms: keyterms) + stream)
+        return url(
+            base: base, path: "/v1/listen",
+            query: commonQuery(model: model, language: language, keyterms: keyterms) + stream)
     }
 
     /// Strict percent-encoding (RFC 3986 unreserved characters only), so "+" and "&" in a term survive.
@@ -415,9 +418,47 @@ struct DeepgramClient: Sendable {
         _ = try await send(request)
     }
 
+    /// The speech-to-text models the key can use: `GET /v1/projects` → the first project's
+    /// `GET /v1/projects/{id}/models`; Deepgram's public `GET /v1/models` when the key has no project or can't
+    /// read its models (keys without the project scope get 401/403 there).
+    func models(now: Date = Date()) async throws -> DeepgramModelCatalog {
+        struct Projects: Decodable {
+            struct Project: Decodable {
+                let projectID: String
+                enum CodingKeys: String, CodingKey { case projectID = "project_id" }
+            }
+            let projects: [Project]?
+        }
+        func get(_ path: String) async throws -> Data {
+            var request = URLRequest(url: account.restBase.appending(path: path))
+            request.timeoutInterval = 20
+            return try await send(request)
+        }
+        func decode(_ data: Data, source: DeepgramModelCatalog.Source) throws -> DeepgramModelCatalog {
+            do {
+                return try DeepgramModelCatalog.decode(data, source: source, fetchedAt: now)
+            } catch {
+                throw DeepgramError.malformedResponse
+            }
+        }
+        if let projects = try? JSONDecoder().decode(Projects.self, from: try await get("v1/projects")),
+            let project = projects.projects?.first
+        {
+            do {
+                return try decode(try await get("v1/projects/\(project.projectID)/models"), source: .project)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                transcriptionLog.info("Deepgram project models unavailable (\(error.localizedDescription, privacy: .public)); using the public list")
+            }
+        }
+        return try decode(try await get("v1/models"), source: .publicList)
+    }
+
     /// Pre-recorded transcription of a WAV body.
-    func listen(wav: Data, language: String, keyterms: [String]) async throws -> Deepgram.ListenResponse {
-        var request = URLRequest(url: Deepgram.listenURL(base: account.restBase, language: language, keyterms: keyterms))
+    func listen(wav: Data, model: String, language: String, keyterms: [String]) async throws -> Deepgram.ListenResponse {
+        var request = URLRequest(
+            url: Deepgram.listenURL(base: account.restBase, model: model, language: language, keyterms: keyterms))
         request.httpMethod = "POST"
         request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
         request.httpBody = wav
@@ -431,9 +472,9 @@ struct DeepgramClient: Sendable {
     }
 
     /// The live socket request, authorized.
-    func streamingRequest(language: String, keyterms: [String]) -> URLRequest {
+    func streamingRequest(model: String, language: String, keyterms: [String]) -> URLRequest {
         var request = URLRequest(
-            url: Deepgram.streamingURL(base: account.streamingBase, language: language, keyterms: keyterms))
+            url: Deepgram.streamingURL(base: account.streamingBase, model: model, language: language, keyterms: keyterms))
         Deepgram.authorize(&request, key: key)
         return request
     }

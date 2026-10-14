@@ -1,7 +1,6 @@
 import FluidAudio
 import Foundation
 import Speech
-import Synchronization
 import VCModels
 
 /// Lifecycle of a voice model on this Mac.
@@ -75,6 +74,9 @@ public actor SpeechModelLibrary {
     private var acceptedDeepgram: DeepgramClient?
     private var rejectedDeepgramKey: String?
     private var deepgramCheck: (key: String, task: Task<DeepgramClient, any Error>)?
+    /// The models the accepted key can use, fetched on demand and kept for the launch (per key).
+    private var deepgramCatalog: (key: String, catalog: DeepgramModelCatalog)?
+    private var deepgramCatalogFetch: (key: String, task: Task<DeepgramModelCatalog, any Error>)?
 
     public init(root: URL) {
         self.init(root: root, deepgram: .live)
@@ -105,6 +107,12 @@ public actor SpeechModelLibrary {
                 kind: .whisper, displayName: "Whisper Large v3 Turbo",
                 summary: "Close second on accents, with word timings and name hints. 100 languages including Swahili, Yoruba, Hausa and Amharic.",
                 downloadBytes: 1_660_000_000, languageCodes: WhisperTranscriber.languageCodes, africanWordErrorRate: 0.051)
+        case .apple where AppleSpeech.usesClassic:
+            // The African-accent benchmark measured macOS 26's SpeechTranscriber; the classic recognizer wasn't.
+            SpeechModelInfo(
+                kind: .apple, displayName: "Apple Speech (classic)",
+                summary: "Built into macOS: nothing to download, live text every couple of seconds. Less accurate than Cohere or Whisper, especially on accented speech; on this Mac's language it runs \(ClassicSpeech.isOnDevice(localeID: Locale.current.identifier) ? "on this Mac" : "on Apple's servers").",
+                downloadBytes: 0, languageCodes: appleLanguageCodes, africanWordErrorRate: nil)
         case .apple:
             SpeechModelInfo(
                 kind: .apple, displayName: "Apple Speech",
@@ -137,7 +145,7 @@ public actor SpeechModelLibrary {
 
     public func isReady(_ kind: SpeechEngineKind) -> Bool {
         switch kind {
-        case .apple: SpeechTranscriber.isAvailable
+        case .apple: AppleSpeech.engineAvailable
         case .deepgram: acceptedDeepgram != nil
         case .cohere, .whisper: instances[kind] != nil
         }
@@ -211,13 +219,16 @@ public actor SpeechModelLibrary {
     }
 
     /// Ready instance (loads/warms if needed; throws if not downloaded). `.apple` returns an Apple-backed offline
-    /// transcriber; `.deepgram` one that calls Deepgram with the checked key.
-    public func transcriber(_ kind: SpeechEngineKind) async throws -> any AccurateTranscriber {
+    /// transcriber; `.deepgram` one that calls Deepgram with the checked key and `deepgramModel` (nil = Nova-3;
+    /// a model that can't transcribe a call's language falls back to Nova-3, see `deepgramModelChoice`).
+    public func transcriber(_ kind: SpeechEngineKind, deepgramModel: String? = nil) async throws -> any AccurateTranscriber {
         if kind == .apple {
-            guard SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
+            guard AppleSpeech.engineAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
             return AppleOfflineTranscriber()
         }
-        if kind == .deepgram { return DeepgramTranscriber(client: try await deepgramClient()) }
+        if kind == .deepgram {
+            return DeepgramTranscriber(client: try await deepgramClient(), model: deepgramModel, library: self)
+        }
         if let instance = instances[kind] { return instance }
         if let running = loads[kind] { return try await running.value }
         guard isDownloaded(kind) else { throw TranscriptionError.modelNotDownloaded(kind) }
@@ -288,7 +299,7 @@ public actor SpeechModelLibrary {
 
     private static func filesStatus(_ kind: SpeechEngineKind, root: URL) -> ModelStatus {
         if kind == .apple {
-            return SpeechTranscriber.isAvailable ? .ready : .failed(TranscriptionError.speechTranscriberUnavailable.localizedDescription)
+            return AppleSpeech.engineAvailable ? .ready : .failed(TranscriptionError.speechTranscriberUnavailable.localizedDescription)
         }
         return filesPresent(kind, root: root) ? .downloaded : .notDownloaded
     }
@@ -373,7 +384,42 @@ public actor SpeechModelLibrary {
         rejectedDeepgramKey = nil
         deepgramCheck?.task.cancel()
         deepgramCheck = nil
+        deepgramCatalog = nil
+        deepgramCatalogFetch?.task.cancel()
+        deepgramCatalogFetch = nil
         broadcaster.set(.deepgram, Self.deepgramKeyStatus(deepgram))
+    }
+
+    /// The Deepgram speech-to-text models the key can use (see `DeepgramModelCatalog`), fetched once per launch
+    /// and key unless `refresh`; concurrent callers share one fetch. Checks the key first.
+    public func deepgramModels(refresh: Bool = false) async throws -> DeepgramModelCatalog {
+        let client = try await deepgramClient()
+        if !refresh, let cached = deepgramCatalog, cached.key == client.key { return cached.catalog }
+        if let running = deepgramCatalogFetch, running.key == client.key { return try await running.task.value }
+        let task = Task { try await client.models() }
+        deepgramCatalogFetch = (client.key, task)
+        do {
+            let catalog = try await task.value
+            if deepgramCatalogFetch?.task == task {
+                deepgramCatalogFetch = nil
+                deepgramCatalog = (client.key, catalog)
+            }
+            return catalog
+        } catch {
+            if deepgramCatalogFetch?.task == task { deepgramCatalogFetch = nil }
+            throw error
+        }
+    }
+
+    /// Which Deepgram model transcribes `languageCode` (live or a recording) when `requested` is asked for, and
+    /// why not when it falls back to Nova-3. Another model than Nova-3 is checked against the key's models
+    /// (fetched if needed); when they can't be fetched the requested model is trusted.
+    public func deepgramModelChoice(_ requested: String?, languageCode: String, live: Bool) async -> Deepgram.ModelChoice {
+        guard !Deepgram.isDefaultModel(requested) else {
+            return Deepgram.chooseModel(nil, languageCode: languageCode, live: live, catalog: nil)
+        }
+        let catalog = try? await deepgramModels()
+        return Deepgram.chooseModel(requested, languageCode: languageCode, live: live, catalog: catalog)
     }
 
     /// How the live connection is doing: `.ready` while streaming, `.failed(reason)` when a channel fell back to

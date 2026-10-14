@@ -33,37 +33,45 @@ public enum CalibrationPassages {
 /// Picks the engine that transcribes a person best, from one recording of known text.
 public enum VoiceCalibrator {
     /// Transcribes the same recording with every given engine (must be ready/downloaded), scores against `expected`; best first.
-    /// Engines that are not downloaded or fail are left out.
+    /// Deepgram is scored once per model in `deepgramModels`. Engines that are not downloaded or fail are left out.
     public static func calibrate(
         samples16k: [Float], expected: String, engines: [SpeechEngineKind], languageCode: String,
-        library: SpeechModelLibrary = .shared
+        deepgramModels: [String] = [Deepgram.defaultModel], library: SpeechModelLibrary = .shared
     ) async -> VoiceCalibration {
         var transcribers: [any AccurateTranscriber] = []
         for engine in unique(engines) {
-            do {
-                transcribers.append(try await library.transcriber(engine))
-            } catch {
-                transcriptionLog.info("Calibration skips \(engine.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            for model in engine == .deepgram ? deepgramModels : [nil] as [String?] {
+                do {
+                    transcribers.append(try await library.transcriber(engine, deepgramModel: model))
+                } catch {
+                    transcriptionLog.info("Calibration skips \(engine.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
             }
         }
         return await calibrate(
             samples16k: samples16k, expected: expected, transcribers: transcribers, languageCode: languageCode)
     }
 
-    /// Same scoring with explicit transcribers, run one after another. Transcribers that throw are left out.
-    /// Ties keep the given order.
+    /// Same scoring with explicit transcribers, run one after another. Transcribers that throw are left out, as
+    /// are repeats of an engine (and model) already scored. Ties keep the given order.
     public static func calibrate(
         samples16k: [Float], expected: String, transcribers: [any AccurateTranscriber], languageCode: String
     ) async -> VoiceCalibration {
         var scores: [EngineScore] = []
-        for transcriber in transcribers where !scores.contains(where: { $0.engine == transcriber.kind }) {
+        func scored(_ kind: SpeechEngineKind, _ model: String?) -> Bool {
+            scores.contains { $0.engine == kind && Deepgram.sameModel($0.model, model) }
+        }
+        for transcriber in transcribers where !scored(transcriber.kind, scoreModel(transcriber.kind, transcriber.model)) {
             do {
                 let result = try await transcriber.transcribe(samples16k: samples16k, languageCode: languageCode, prompt: [])
+                // A model that fell back to Nova-3 is scored as Nova-3, once.
+                let model = scoreModel(transcriber.kind, result.model ?? transcriber.model)
+                guard !scored(transcriber.kind, model) else { continue }
                 scores.append(
                     EngineScore(
                         engine: transcriber.kind,
                         wordErrorRate: WordErrorRate.compute(reference: expected, hypothesis: result.text),
-                        transcript: result.text))
+                        transcript: result.text, model: model))
             } catch {
                 transcriptionLog.error("Calibration with \(transcriber.kind.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             }
@@ -73,6 +81,13 @@ public enum VoiceCalibrator {
                 ? lhs.element.wordErrorRate < rhs.element.wordErrorRate : lhs.offset < rhs.offset
         }.map(\.element)
         return VoiceCalibration(scores: ranked)
+    }
+
+    /// The model a score records: Deepgram's (the default named "nova-3"), nil for single-model engines.
+    private static func scoreModel(_ kind: SpeechEngineKind, _ model: String?) -> String? {
+        guard kind == .deepgram else { return nil }
+        guard let model, !Deepgram.isDefaultModel(model) else { return Deepgram.defaultModel }
+        return model.lowercased()
     }
 
     /// Proposed corrections from substitutions in the best transcript vs expected (multi-word spans, proper nouns/vocabulary only; no common words).

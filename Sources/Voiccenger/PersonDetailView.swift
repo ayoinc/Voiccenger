@@ -52,6 +52,9 @@ struct PersonDetailView: View {
             if draft.voice.preferredEngine == saved.voice.preferredEngine {
                 merged.voice.preferredEngine = new.voice.preferredEngine
             }
+            if draft.voice.deepgramModel == saved.voice.deepgramModel {
+                merged.voice.deepgramModel = new.voice.deepgramModel
+            }
             self.draft = merged
         } else {
             draft = new
@@ -175,8 +178,14 @@ private struct VoiceAccentForm: View {
                 Text(automaticTitle).tag(SpeechEngineKind?.none)
                 Divider()
                 ForEach(SpeechEngineKind.allCases) { kind in
-                    Text(engineTitle(kind)).tag(SpeechEngineKind?.some(kind))
+                    let reason = EngineSupport.unsupportedReason(kind)
+                    Text(reason.map { "\(kind.displayName) — \($0)" } ?? engineTitle(kind))
+                        .tag(SpeechEngineKind?.some(kind))
+                        .disabled(reason != nil)
                 }
+            }
+            if effectiveEngine == .deepgram {
+                deepgramModelPicker
             }
             Picker("Language", selection: $profile.voice.languageCode) {
                 if !supportedLanguages.contains(profile.voice.languageCode) {
@@ -206,6 +215,11 @@ private struct VoiceAccentForm: View {
                 }
             }
             if let warning = engineWarning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .symbolRenderingMode(.multicolor)
+                    .font(.callout)
+            }
+            if effectiveEngine == .deepgram, let warning = deepgramWarning {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .symbolRenderingMode(.multicolor)
                     .font(.callout)
@@ -340,6 +354,66 @@ private struct VoiceAccentForm: View {
     private var automaticTitle: String {
         if let best = profile.voice.calibration?.best?.engine { return "Automatic (\(best.displayName))" }
         return "Automatic (meeting default: \(settings.speechEngine.displayName))"
+    }
+
+    // MARK: Deepgram model
+
+    /// Models the key can use that transcribe the person's language in recordings (their lines are
+    /// re-transcribed, not streamed).
+    private var deepgramModels: [DeepgramModel] {
+        settings.deepgramModelCatalog?.models(transcribing: profile.voice.languageCode, live: false) ?? []
+    }
+
+    @ViewBuilder
+    private var deepgramModelPicker: some View {
+        let models = deepgramModels
+        let chosen = deepgramModelBinding.wrappedValue
+        Picker("Deepgram model", selection: deepgramModelBinding) {
+            Text(deepgramAutomaticTitle).tag(String?.none)
+            Divider()
+            if let chosen, !models.contains(where: { $0.name == chosen }) {
+                Text("\(Deepgram.modelDisplayName(chosen)) (unavailable)").tag(String?.some(chosen))
+            }
+            ForEach(models) { model in
+                Text(model.displayName).tag(String?.some(model.name))
+            }
+        }
+        .disabled(settings.deepgramModelCatalog == nil)
+        .help(
+            settings.deepgramModelCatalog == nil
+                ? "Fetch the models your Deepgram key can use in Settings › Voice Models"
+                : "Deepgram models that transcribe \(Format.languageName(profile.voice.languageCode))")
+    }
+
+    /// nil = Automatic: the best Deepgram model of a calibration that compared several (stored as
+    /// `deepgramModel`), else the app-wide model.
+    private var deepgramModelBinding: Binding<String?> {
+        Binding {
+            guard let chosen = profile.voice.deepgramModel, chosen != profile.voice.calibration?.bestDeepgramModel else {
+                return nil
+            }
+            return settings.deepgramModelCatalog?.model(named: chosen)?.name ?? chosen
+        } set: { choice in
+            profile.voice.deepgramModel = choice ?? profile.voice.calibration?.bestDeepgramModel
+        }
+    }
+
+    private var deepgramAutomaticTitle: String {
+        if let best = profile.voice.calibration?.bestDeepgramModel {
+            return "Automatic (\(Deepgram.modelDisplayName(best)), calibrated)"
+        }
+        return "Automatic (app default: \(Deepgram.modelDisplayName(settings.deepgramModel)))"
+    }
+
+    /// Why the person's Deepgram model won't be used for their language, when it won't.
+    private var deepgramWarning: String? {
+        let model = profile.voice.effectiveDeepgramModel ?? settings.deepgramModel
+        let choice = Deepgram.chooseModel(
+            model, languageCode: profile.voice.languageCode, live: false, catalog: settings.deepgramModelCatalog)
+        if choice.language == nil {
+            return "Deepgram doesn't transcribe \(Format.languageName(profile.voice.languageCode)). Choose another language or voice model."
+        }
+        return choice.fallbackReason.map { "\($0) for \(profile.name)." }
     }
 
     private func engineTitle(_ kind: SpeechEngineKind) -> String {

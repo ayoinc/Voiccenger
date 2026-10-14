@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -15,7 +16,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
         with:
@@ -32,7 +33,10 @@ jobs:
 
       - uses: actions/cache@v6
         with:
-          path: .build
+          path: |
+            .build
+            .build-arm64
+            .build-x86_64
           key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
           restore-keys: spm-${{ runner.os }}-
 
@@ -44,9 +48,11 @@ jobs:
           swift scripts/MakeFixtures.swift
           scripts/test.sh
 
-      - name: Package (ad hoc)
+      - name: Package (ad hoc, universal)
         run: |
           scripts/bundle.sh
+          lipo -info dist/Voiccenger.app/Contents/MacOS/Voiccenger dist/voiccenger-cli
+          plutil -extract LSMinimumSystemVersion raw dist/Voiccenger.app/Contents/Info.plist
           scripts/make-dmg.sh dist/Voiccenger.app "dist/Voiccenger-${GITHUB_SHA::7}.dmg"
 
       - uses: actions/upload-artifact@v7
@@ -54,3 +60,78 @@ jobs:
           name: Voiccenger-${{ github.sha }}
           path: dist/*.dmg
           retention-days: 14
+
+      # The universal CLI and the generated fixtures, for the older-macOS and Intel runs below.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tiers-${{ github.sha }}
+          path: |
+            dist/voiccenger-cli
+            .fixtures/meeting.wav
+            .fixtures/meeting.truth.json
+          include-hidden-files: true
+          retention-days: 3
+
+  # Proves the lower tiers run the macOS 26-built universal binary: macOS 14 on Apple silicon
+  # (macos-14 retires 2026-11-02; then use macos-15) and Intel on macOS 15 and 26.
+  tiers:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15-intel, macos-26-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: tiers-${{ github.sha }}
+
+      - name: Capabilities
+        run: |
+          sw_vers; uname -m
+          chmod +x dist/voiccenger-cli
+          dist/voiccenger-cli capabilities --json | tee capabilities.json
+          dist/voiccenger-cli capabilities
+          # Intel: neither on-device model runs, Apple Speech (classic) is the engine.
+          if [[ "$(uname -m)" == x86_64 ]]; then
+            grep -q '"defaultSpeechEngine" : "apple"' capabilities.json
+          fi
+
+      # Every tier: Apple Speech before macOS 26's SpeechTranscriber is the classic recognizer. Headless runners
+      # may deny (or never answer) the speech-recognition permission; that case is reported as a note below
+      # instead of failing the job. A wrong transcript (word error rate over the limit) still fails.
+      - name: Apple Speech transcription of the fixture meeting
+        id: apple
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          time dist/voiccenger-cli transcribe .fixtures/meeting.wav --engine apple --language en \
+            --truth .fixtures/meeting.truth.json --max-wer 0.25 2>&1 | tee apple.log
+
+      - name: Apple Speech result
+        if: always()
+        run: |
+          wer="$(grep -o 'WER [0-9.]*%' apple.log 2>/dev/null || true)"
+          if [[ "${{ steps.apple.outcome }}" == success ]]; then
+            echo "✅ ${{ matrix.runner }}: Apple Speech transcription $wer" >>"$GITHUB_STEP_SUMMARY"
+          elif [[ -z "$wer" ]] && ! grep -q 'above --max-wer' apple.log 2>/dev/null; then
+            echo "⚠️ ${{ matrix.runner }}: Apple Speech transcription not checked (non-blocking): speech-recognition permission is unavailable on this headless runner. $(grep -m1 -i 'error' apple.log 2>/dev/null || echo 'Step timed out waiting for permission.')" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ ${{ matrix.runner }}: Apple Speech transcription $wer (limit 25%)" >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - uses: actions/cache@v6
+        if: runner.arch == 'ARM64'
+        with:
+          path: ~/Library/Application Support/Voiccenger/Models/whisper
+          key: whisper-large-v3-turbo-v1
+
+      - name: Whisper transcription of the fixture meeting (Apple silicon)
+        if: runner.arch == 'ARM64'
+        run: |
+          dist/voiccenger-cli models download whisper
+          time dist/voiccenger-cli transcribe .fixtures/meeting.wav --engine whisper --language en \
+            --truth .fixtures/meeting.truth.json --max-wer 0.25

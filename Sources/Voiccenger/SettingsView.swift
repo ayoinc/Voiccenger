@@ -6,12 +6,13 @@ private typealias ViewState = SwiftUI.State
 
 struct SettingsView: View {
     var body: some View {
+        // `.tabItem` rather than `Tab`, which needs macOS 15.
         TabView {
-            Tab("General", systemImage: "gearshape") { GeneralSettings() }
-            Tab("Transcription", systemImage: "text.bubble") { TranscriptionSettings() }
-            Tab("Voice Models", systemImage: "waveform.badge.magnifyingglass") { VoiceModelsSettings() }
-            Tab("Intelligence", systemImage: "sparkles") { IntelligenceSettings() }
-            Tab("Audio", systemImage: "mic") { AudioSettings() }
+            GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }
+            TranscriptionSettings().tabItem { Label("Transcription", systemImage: "text.bubble") }
+            VoiceModelsSettings().tabItem { Label("Voice Models", systemImage: "waveform.badge.magnifyingglass") }
+            IntelligenceSettings().tabItem { Label("Intelligence", systemImage: "sparkles") }
+            AudioSettings().tabItem { Label("Audio", systemImage: "mic") }
         }
         .frame(width: 560)
         .scenePadding()
@@ -23,6 +24,7 @@ struct SettingsView: View {
 private struct GeneralSettings: View {
     @Environment(AppSettings.self) private var settings
     @Environment(AppUpdater.self) private var updater
+    @ViewState private var showCapabilities = false
 
     var body: some View {
         @Bindable var settings = settings
@@ -55,8 +57,18 @@ private struct GeneralSettings: View {
                     .settingsFootnote()
             }
             UpdateSettingsSection(updater: updater)
+            Section {
+                LabeledContent("This Mac", value: PlatformCapabilities.current().summary)
+                Button("What This Mac Can Do…") { showCapabilities = true }
+            } footer: {
+                Text("Which features run on this Mac, and why any don't.")
+                    .settingsFootnote()
+            }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $showCapabilities) {
+            CapabilitiesView { showCapabilities = false }
+        }
     }
 
     private var onlineFootnote: String {
@@ -84,7 +96,7 @@ private struct TranscriptionSettings: View {
                 if loading {
                     LabeledContent("Live preview language") { ProgressView().controlSize(.small) }
                 } else {
-                    Picker("Live preview language", selection: $settings.localeID) {
+                    Picker(AppleSpeech.isAvailable ? "Live preview language" : "Meeting language", selection: $settings.localeID) {
                         if !supported.contains(settings.localeID) {
                             Text(Format.localeName(settings.localeID)).tag(settings.localeID)
                         }
@@ -112,8 +124,12 @@ private struct TranscriptionSettings: View {
                     }
                 }
                 Toggle("Switch language automatically", isOn: $settings.autoLanguage)
+                    .disabled(!AppleSpeech.isAvailable)
+                    .help(AppleSpeech.isAvailable ? "" : "Needs macOS 26 (Apple Speech)")
             } footer: {
-                Text("Apple Speech shows words in this language as they're spoken; the voice model chosen in Voice Models then writes the final text in the same language. With automatic switching, Voiccenger follows the meeting when someone changes language.")
+                Text(AppleSpeech.isAvailable
+                    ? "Apple Speech shows words in this language as they're spoken; the voice model chosen in Voice Models then writes the final text in the same language. With automatic switching, Voiccenger follows the meeting when someone changes language."
+                    : "The voice model chosen in Voice Models transcribes in this language and shows live text every couple of seconds while someone speaks. Instant live text and automatic language switching need macOS 26 (Apple Speech).")
                     .settingsFootnote()
             }
             Section {
@@ -164,6 +180,16 @@ private struct TranscriptionSettings: View {
     }
 
     private func load() async {
+        guard AppleSpeech.isAvailable else {
+            // No Apple locales before macOS 26: offer the voice models' languages, this Mac's region for its own.
+            let system = AppSettings.systemLocaleID
+            let systemLanguage = String(system.prefix { $0 != "-" })
+            let codes = Set([SpeechEngineKind.cohere, .whisper].flatMap { SpeechModelLibrary.info($0).languageCodes })
+            supported = codes.map { $0 == systemLanguage ? system : $0 }
+            installed = Set(supported)
+            loading = false
+            return
+        }
         async let s = SpeechAssets.supportedLocaleIDs()
         async let i = SpeechAssets.installedLocaleIDs()
         supported = await s
@@ -210,20 +236,22 @@ private struct IntelligenceSettings: View {
         Form {
             Section {
                 Picker("Engine", selection: $settings.engine) {
-                    Text("Apple Intelligence (on this Mac)").tag(IntelligenceEngineKind.apple)
-                    Text("Claude (Anthropic)").tag(IntelligenceEngineKind.claude)
+                    engineOption("Apple Intelligence (on this Mac)", .apple)
+                    engineOption("Claude (Anthropic)", .claude)
+                    engineOption(TranscriptOutlineEngine.name, .transcriptOutline)
                 }
                 .pickerStyle(.radioGroup)
             } footer: {
-                Text("Used for live corrections and suggestions during meetings and for the report afterwards. If the selected engine isn't available, the other one is used.")
+                Text("Used for live corrections and suggestions during meetings and for the report afterwards. If the selected engine isn't available, the next one that is gets used; the transcript outline works on every Mac.")
                     .settingsFootnote()
             }
             Section("Apple Intelligence") {
-                if AppleIntelligenceEngine.isAvailable {
+                let status = AppleIntelligenceStatus.current
+                if status.isAvailable {
                     Label("Available", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                 } else {
-                    Label(AppleIntelligenceEngine.unavailableReason ?? "Unavailable", systemImage: "xmark.circle.fill")
+                    Label(status.reason ?? "Unavailable", systemImage: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -251,6 +279,21 @@ private struct IntelligenceSettings: View {
         }
         .formStyle(.grouped)
         .onAppear(perform: refresh)
+    }
+
+    /// A picker row that says why the engine can't run here; Apple Intelligence can't be picked on a Mac that
+    /// will never run it (before macOS 26, Intel).
+    private func engineOption(_ title: String, _ kind: IntelligenceEngineKind) -> some View {
+        let reason: String? =
+            switch kind {
+            case .apple: AppleIntelligenceStatus.current.shortReason
+            case .claude: savedKey || keyFromEnvironment ? nil : "Add an API key below"
+            case .transcriptOutline: nil
+            }
+        let label = reason.map { Text(title) + Text(" — \($0)").foregroundStyle(.secondary) } ?? Text(title)
+        return label
+            .tag(kind)
+            .disabled(kind == .apple && AppleIntelligenceStatus.current.isPermanentlyUnavailable)
     }
 
     @ViewBuilder

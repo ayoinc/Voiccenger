@@ -1,5 +1,5 @@
 import Foundation
-import Synchronization
+import VCModels
 
 /// One WebSocket to Deepgram's live endpoint. Sends are queued in call order and never block; a failed send
 /// surfaces as an error from `receive()`. Tests substitute a scripted socket.

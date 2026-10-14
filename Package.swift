@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Voiccenger",
-    platforms: [.macOS(.v26)],
+    platforms: [.macOS("14.4")],
     products: [
         .executable(name: "Voiccenger", targets: ["Voiccenger"]),
         .executable(name: "voiccenger-cli", targets: ["voiccenger-cli"]),
@@ -56,7 +56,16 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle", condition: .when(traits: ["Sparkle"])),
             ]
         ),
-        .executableTarget(name: "voiccenger-cli", dependencies: ["VCPipeline"]),
+        // The embedded Info.plist carries the privacy usage strings macOS needs before the CLI may use speech
+        // recognition (classic Apple Speech) or the microphone.
+        .executableTarget(
+            name: "voiccenger-cli", dependencies: ["VCPipeline"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                    "-Xlinker", Context.packageDirectory + "/Resources/cli-Info.plist",
+                ])
+            ]),
 
         .testTarget(name: "VCModelsTests", dependencies: ["VCModels"]),
         .testTarget(name: "VCAudioTests", dependencies: ["VCAudio"]),

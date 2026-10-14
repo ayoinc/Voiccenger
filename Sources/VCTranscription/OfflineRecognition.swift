@@ -5,6 +5,7 @@ import Speech
 import VCModels
 
 /// One-shot recognition of in-memory samples or a file with a non-volatile transcriber.
+@available(macOS 26.0, *)
 enum OfflineRecognizer {
     /// Transcribes `samples` (mono Float32 at `sampleRate`, time 0 = first sample) and returns final results.
     /// `contextualStrings` bias recognition toward names and jargon.

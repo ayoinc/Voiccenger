@@ -9,6 +9,24 @@ import VCModels
     .enabled(if: ProcessInfo.processInfo.environment["VOICCENGER_DEEPGRAM_LIVE"] == "1" && Fixtures.url("meeting.wav") != nil),
     .serialized)
 struct DeepgramLiveTests {
+    /// Fetches the key's models, then transcribes the fixture meeting with Nova-3 and Nova-2 Meeting.
+    @Test func listsModelsAndTranscribesWithTwo() async throws {
+        let library = SpeechModelLibrary(root: FileManager.default.temporaryDirectory.appendingPathComponent("vc-dg-models"))
+        let catalog = try await library.deepgramModels()
+        print("Deepgram models (\(catalog.source)): \(catalog.models.map(\.name).joined(separator: ", "))")
+        #expect(catalog.model(named: "nova-3") != nil)
+        let url = try #require(Fixtures.url("meeting.wav"))
+        let reference = try Fixtures.meetingTruth().map(\.text).joined(separator: " ")
+        for model in ["nova-3", "nova-2-meeting"] {
+            #expect(await library.deepgramModelChoice(model, languageCode: "en", live: false).fallbackReason == nil)
+            let updates = try await FileTranscriber.transcribe(
+                url: url, engine: .deepgram, languageCode: "en", deepgramModel: model, library: library)
+            let wer = WordErrorRate.compute(reference: reference, hypothesis: updates.map(\.text).joined(separator: " "))
+            print(String(format: "Deepgram %@ file WER %.3f over %d lines", model, wer, updates.count))
+            #expect(wer < 0.2, "\(model)")
+        }
+    }
+
     @Test func streamsTheFixtureMeetingInRealTime() async throws {
         let library = SpeechModelLibrary(root: FileManager.default.temporaryDirectory.appendingPathComponent("vc-dg-live"))
         let (samples, rate) = try Fixtures.samples("meeting.wav")

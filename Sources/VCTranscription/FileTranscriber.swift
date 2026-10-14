@@ -10,7 +10,7 @@ public enum FileTranscriber {
     public static func transcribe(url: URL, localeID: String, channel: AudioChannel = .microphone) async throws
         -> [TranscriptUpdate]
     {
-        guard SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
+        guard #available(macOS 26.0, *), SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
         try await SpeechAssets.ensureInstalled(localeIDs: [localeID])
         let locale = try await SpeechAssets.resolveInstalledLocale(localeID)
         return try await OfflineRecognizer.transcribe(url: url, locale: locale, channel: channel)
@@ -21,12 +21,13 @@ public enum FileTranscriber {
     /// the engine's own (Whisper, Apple) or spread across the chunk by length (Cohere).
     /// `customization` (when given) is applied to each chunk's text, with `prompt` as extra vocabulary.
     /// Loads the engine if needed; throws `TranscriptionError.modelNotDownloaded` when its files are missing.
+    /// `deepgramModel` picks Deepgram's model (nil = Nova-3).
     public static func transcribe(
         url: URL, engine: SpeechEngineKind, languageCode: String, prompt: [String] = [],
-        customization: VoiceSettings? = nil, channel: AudioChannel = .microphone,
+        customization: VoiceSettings? = nil, channel: AudioChannel = .microphone, deepgramModel: String? = nil,
         library: SpeechModelLibrary = .shared
     ) async throws -> [TranscriptUpdate] {
-        let transcriber = try await library.transcriber(engine)
+        let transcriber = try await library.transcriber(engine, deepgramModel: deepgramModel)
         let samples = try AudioFileReader.read16k(url: url)
         var updates: [TranscriptUpdate] = []
         for chunk in SpeechChunker.split(samples) {

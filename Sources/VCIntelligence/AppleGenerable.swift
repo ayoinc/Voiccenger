@@ -8,10 +8,12 @@ import VCModels
 // the FoundationModels macro plugin ships with Xcode only, and this package builds with the Command
 // Line Tools. Property order is generation order, so each type lists what the model should decide first.
 
+@available(macOS 26.0, *)
 private func malformed(_ type: String, _ content: GeneratedContent) -> IntelligenceError {
     .malformedResponse("unexpected \(type) content: \(content.jsonString.prefix(200))")
 }
 
+@available(macOS 26.0, *)
 extension GeneratedContent {
     /// Optional string property; missing, null and blank values all read as nil.
     fileprivate func text(_ key: String) -> String? {
@@ -26,6 +28,7 @@ extension GeneratedContent {
     }
 }
 
+@available(macOS 26.0, *)
 enum GenIntent: String, CaseIterable, Generable {
     case statement
     case question
@@ -49,6 +52,7 @@ enum GenIntent: String, CaseIterable, Generable {
     var generatedContent: GeneratedContent { GeneratedContent(rawValue) }
 }
 
+@available(macOS 26.0, *)
 struct GenActionItem: Generable, Equatable {
     var task: String
     var owner: String?
@@ -81,6 +85,7 @@ struct GenActionItem: Generable, Equatable {
 }
 
 /// Kind of correction for a live utterance; `none` is the usual answer.
+@available(macOS 26.0, *)
 enum GenCorrectionKind: String, CaseIterable, Generable {
     case none
     case selfCorrection
@@ -99,6 +104,7 @@ enum GenCorrectionKind: String, CaseIterable, Generable {
     var generatedContent: GeneratedContent { GeneratedContent(rawValue) }
 }
 
+@available(macOS 26.0, *)
 struct GenInsight: Generable, Equatable {
     var intent: GenIntent
     var correctionKind: GenCorrectionKind
@@ -157,11 +163,13 @@ struct GenInsight: Generable, Equatable {
 // MARK: - Report notes (one shape for a single pass, per-part notes and merged notes)
 
 /// Transcript line numbers an item cites, listed after the item.
+@available(macOS 26.0, *)
 private func linesProperty(_ description: String = "Numbers of the transcript lines that support it (3 for L3).") -> GenerationSchema.Property {
     .init(name: "lines", description: description, type: [Int].self, guides: [.maximumCount(4)])
 }
 
 /// A list entry with the transcript lines that support it.
+@available(macOS 26.0, *)
 struct GenItem: Generable, Equatable {
     var text: String
     var lines: [Int]
@@ -189,6 +197,7 @@ struct GenItem: Generable, Equatable {
     var raw: RawItem { RawItem(text: text, lines: lines) }
 }
 
+@available(macOS 26.0, *)
 struct GenNoteActionItem: Generable, Equatable {
     var task: String
     var owner: String?
@@ -219,6 +228,7 @@ struct GenNoteActionItem: Generable, Equatable {
     var raw: RawActionItem { RawActionItem(task: task, owner: owner, due: due, lines: lines) }
 }
 
+@available(macOS 26.0, *)
 struct GenTopic: Generable, Equatable {
     var title: String
     var summary: String
@@ -227,7 +237,7 @@ struct GenTopic: Generable, Equatable {
     static var generationSchema: GenerationSchema {
         GenerationSchema(type: Self.self, properties: [
             .init(name: "title", type: String.self),
-            .init(name: "summary", description: "One or two sentences.", type: String.self),
+            .init(name: "summary", description: "Several sentences: what was said and by whom, numbers, outcome.", type: String.self),
             .init(name: "speakers", type: [String].self, guides: [.maximumCount(6)]),
         ])
     }
@@ -245,6 +255,7 @@ struct GenTopic: Generable, Equatable {
 }
 
 /// Kind of a report correction (no `none`: an entry exists only for an actual correction).
+@available(macOS 26.0, *)
 enum GenReportCorrectionKind: String, CaseIterable, Generable {
     case selfCorrection
     case contradiction
@@ -262,6 +273,7 @@ enum GenReportCorrectionKind: String, CaseIterable, Generable {
     var generatedContent: GeneratedContent { GeneratedContent(rawValue) }
 }
 
+@available(macOS 26.0, *)
 struct GenCorrection: Generable, Equatable {
     var kind: GenReportCorrectionKind
     var speaker: String
@@ -299,6 +311,7 @@ struct GenCorrection: Generable, Equatable {
     }
 }
 
+@available(macOS 26.0, *)
 struct GenParticipant: Generable, Equatable {
     var name: String
     var keyPoints: [GenItem]
@@ -323,52 +336,72 @@ struct GenParticipant: Generable, Equatable {
     }
 }
 
-struct GenNotes: Generable, Equatable {
+/// The overview as paragraphs: asked for as a list with a paragraph count, the model writes as many as asked; asked
+/// for as one string, it writes one or two sentences whatever the instructions say.
+@available(macOS 26.0, *)
+private func overviewProperty(paragraphs: ClosedRange<Int>) -> GenerationSchema.Property {
+    .init(
+        name: "overview",
+        description: "The overview, one paragraph per entry: what the meeting was for, what was discussed and who argued what, numbers and dates, how it ended.",
+        type: [String].self, guides: [.count(paragraphs)])
+}
+
+@available(macOS 26.0, *)
+extension GeneratedContent {
+    /// Paragraphs of an overview list, blank ones dropped, joined by blank lines. Numbering the model adds ("[1]
+    /// …", "… [2] …") marks paragraph starts, never content.
+    fileprivate func paragraphs(_ key: String) -> String {
+        list(key, of: String.self)
+            .flatMap { $0.replacingOccurrences(of: #"\s*\[\d+\]\s+"#, with: "\n", options: .regularExpression).components(separatedBy: "\n") }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
+}
+
+/// The summary half of a part's notes: title, topics, overview (after the topics it sums up) and each
+/// participant's key points. A merge answers in the same shape, without participants (their points are joined
+/// from the parts) and with room for more topics.
+@available(macOS 26.0, *)
+struct GenSummary: Generable, Equatable {
     var title: String
-    var overview: String
     var topics: [GenTopic]
-    var decisions: [GenItem]
-    var actionItems: [GenNoteActionItem]
-    var notesToRemember: [GenItem]
-    var missedOpportunities: [String]
-    var openQuestions: [GenItem]
-    var corrections: [GenCorrection]
+    /// Paragraphs separated by blank lines.
+    var overview: String
     var participantSummaries: [GenParticipant]
 
-    /// Caps keep the answer well inside the on-device context window; `ResultAssembler` caps again by length.
-    static var generationSchema: GenerationSchema {
-        GenerationSchema(type: Self.self, description: "Meeting notes. Empty lists are normal.", properties: [
+    /// The schema asking for `paragraphs` overview paragraphs: one for a thin meeting, several for one with
+    /// substance.
+    static func schema(paragraphs: ClosedRange<Int>) -> GenerationSchema {
+        GenerationSchema(type: Self.self, description: "Meeting summary.", properties: [
             .init(name: "title", description: "Short title.", type: String.self),
-            .init(name: "overview", description: "One to three sentences.", type: String.self),
             .init(name: "topics", type: [GenTopic].self, guides: [.maximumCount(5)]),
-            .init(name: "decisions", description: "Explicitly agreed decisions only.", type: [GenItem].self, guides: [.maximumCount(6)]),
-            .init(name: "actionItems", description: "Tasks for after the meeting only.", type: [GenNoteActionItem].self, guides: [.maximumCount(8)]),
-            .init(name: "notesToRemember", description: "Facts, numbers, dates, constraints.", type: [GenItem].self, guides: [.maximumCount(6)]),
-            .init(name: "missedOpportunities", description: "Important follow-ups nobody raised.", type: [String].self, guides: [.maximumCount(3)]),
-            .init(name: "openQuestions", description: "Questions asked and left unanswered.", type: [GenItem].self, guides: [.maximumCount(4)]),
-            .init(name: "corrections", type: [GenCorrection].self, guides: [.maximumCount(3)]),
+            overviewProperty(paragraphs: paragraphs),
             .init(name: "participantSummaries", type: [GenParticipant].self, guides: [.maximumCount(8)]),
         ])
     }
 
+    /// The answer of a merge: a whole long meeting's title, topics and overview.
+    static var mergeSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, description: "Meeting summary.", properties: [
+            .init(name: "title", description: "Short title.", type: String.self),
+            .init(name: "topics", type: [GenTopic].self, guides: [.maximumCount(8)]),
+            overviewProperty(paragraphs: 2...4),
+        ])
+    }
+
+    static var generationSchema: GenerationSchema { schema(paragraphs: 1...4) }
+
     init(_ content: GeneratedContent) throws {
         title = content.text("title") ?? ""
-        overview = content.text("overview") ?? ""
         topics = content.list("topics")
-        decisions = content.list("decisions")
-        actionItems = content.list("actionItems")
-        notesToRemember = content.list("notesToRemember")
-        missedOpportunities = content.list("missedOpportunities")
-        openQuestions = content.list("openQuestions")
-        corrections = content.list("corrections")
+        overview = content.paragraphs("overview")
         participantSummaries = content.list("participantSummaries")
     }
 
     var generatedContent: GeneratedContent {
         GeneratedContent(properties: [
-            "title": title, "overview": overview, "topics": topics, "decisions": decisions, "actionItems": actionItems,
-            "notesToRemember": notesToRemember, "missedOpportunities": missedOpportunities, "openQuestions": openQuestions,
-            "corrections": corrections, "participantSummaries": participantSummaries,
+            "title": title, "topics": topics, "overview": overview.components(separatedBy: "\n\n"),
+            "participantSummaries": participantSummaries,
         ])
     }
 
@@ -377,12 +410,133 @@ struct GenNotes: Generable, Equatable {
             title: title.isEmpty ? nil : title,
             overview: overview.isEmpty ? nil : overview,
             topics: topics.map { RawTopic(title: $0.title, summary: $0.summary, speakers: $0.speakers) },
-            decisions: decisions.map(\.raw),
-            actionItems: actionItems.map(\.raw),
-            notesToRemember: notesToRemember.map(\.raw),
-            missedOpportunities: missedOpportunities,
-            openQuestions: openQuestions.map(\.raw),
-            corrections: corrections.map(\.raw),
             participantSummaries: participantSummaries.map { RawParticipant(name: $0.name, keyPoints: $0.keyPoints.map(\.raw)) })
     }
+}
+
+/// The list half of a part's notes.
+@available(macOS 26.0, *)
+struct GenLists: Generable, Equatable {
+    var decisions: [GenItem]
+    var actionItems: [GenNoteActionItem]
+    var notesToRemember: [GenItem]
+    var missedOpportunities: [String]
+    var openQuestions: [GenItem]
+    var corrections: [GenCorrection]
+
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, description: "Meeting lists. Empty lists are normal.", properties: [
+            .init(name: "decisions", description: "Explicitly agreed decisions only.", type: [GenItem].self, guides: [.maximumCount(6)]),
+            .init(name: "actionItems", description: "Tasks for after the meeting only.", type: [GenNoteActionItem].self, guides: [.maximumCount(8)]),
+            .init(name: "notesToRemember", description: "Facts, numbers, dates, constraints.", type: [GenItem].self, guides: [.maximumCount(6)]),
+            .init(name: "missedOpportunities", description: "Important follow-ups nobody raised.", type: [String].self, guides: [.maximumCount(3)]),
+            .init(name: "openQuestions", description: "Questions asked and left unanswered.", type: [GenItem].self, guides: [.maximumCount(4)]),
+            .init(name: "corrections", type: [GenCorrection].self, guides: [.maximumCount(3)]),
+        ])
+    }
+
+    init(_ content: GeneratedContent) throws {
+        decisions = content.list("decisions")
+        actionItems = content.list("actionItems")
+        notesToRemember = content.list("notesToRemember")
+        missedOpportunities = content.list("missedOpportunities")
+        openQuestions = content.list("openQuestions")
+        corrections = content.list("corrections")
+    }
+
+    var generatedContent: GeneratedContent {
+        GeneratedContent(properties: [
+            "decisions": decisions, "actionItems": actionItems, "notesToRemember": notesToRemember,
+            "missedOpportunities": missedOpportunities, "openQuestions": openQuestions, "corrections": corrections,
+        ])
+    }
+
+    /// Both halves as one set of notes.
+    func notes(with summary: GenSummary) -> RawReport {
+        var notes = summary.raw
+        notes.decisions = decisions.map(\.raw)
+        notes.actionItems = actionItems.map(\.raw)
+        notes.notesToRemember = notesToRemember.map(\.raw)
+        notes.missedOpportunities = missedOpportunities
+        notes.openQuestions = openQuestions.map(\.raw)
+        notes.corrections = corrections.map(\.raw)
+        return notes
+    }
+}
+
+// MARK: - Conversation outline (map step on Apple Intelligence)
+
+@available(macOS 26.0, *)
+struct GenOutlinePoint: Generable, Equatable {
+    var speaker: String
+    var text: String
+    var lines: [Int]
+
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, properties: [
+            .init(name: "speaker", description: "Name of the speaker.", type: String.self),
+            .init(name: "text", description: "One specific thing they said, in your own words, without their name.", type: String.self),
+            linesProperty("Numbers of that speaker's own lines that say it."),
+        ])
+    }
+
+    init(_ content: GeneratedContent) throws {
+        guard let text = content.text("text") else { throw malformed("outline point", content) }
+        self.text = text
+        speaker = content.text("speaker") ?? ""
+        lines = content.list("lines")
+    }
+
+    var generatedContent: GeneratedContent {
+        GeneratedContent(properties: ["speaker": speaker, "text": text, "lines": lines])
+    }
+
+    var raw: RawOutlinePoint { RawOutlinePoint(speaker: speaker.isEmpty ? nil : speaker, text: text, lines: lines) }
+}
+
+@available(macOS 26.0, *)
+struct GenOutlineSegment: Generable, Equatable {
+    var heading: String
+    var points: [GenOutlinePoint]
+
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, properties: [
+            .init(name: "heading", description: "A few words naming what this stretch is about.", type: String.self),
+            .init(name: "points", description: "Two to six points, in order.", type: [GenOutlinePoint].self, guides: [.maximumCount(6)]),
+        ])
+    }
+
+    init(_ content: GeneratedContent) throws {
+        heading = content.text("heading") ?? ""
+        points = content.list("points")
+    }
+
+    var generatedContent: GeneratedContent {
+        GeneratedContent(properties: ["heading": heading, "points": points])
+    }
+
+    var raw: RawOutlineSegment { RawOutlineSegment(heading: heading.isEmpty ? nil : heading, points: points.map(\.raw)) }
+}
+
+/// The outline of one transcript chunk; kept verbatim (after grounding) in the final report.
+@available(macOS 26.0, *)
+struct GenOutline: Generable, Equatable {
+    var segments: [GenOutlineSegment]
+
+    /// At most four segments of six points keep the answer inside `AppleIntelligenceEngine.outlineResponseReserve`.
+    static var generationSchema: GenerationSchema {
+        GenerationSchema(type: Self.self, description: "What was discussed, in order.", properties: [
+            .init(name: "segments", description: "A new segment where the subject changes.", type: [GenOutlineSegment].self, guides: [.maximumCount(4)]),
+        ])
+    }
+
+    init(_ content: GeneratedContent) throws {
+        segments = content.list("segments")
+    }
+
+    var generatedContent: GeneratedContent {
+        GeneratedContent(properties: ["segments": segments])
+    }
+
+    var raw: [RawOutlineSegment] { segments.map(\.raw) }
 }

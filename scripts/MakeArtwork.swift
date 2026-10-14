@@ -332,6 +332,14 @@ func renderDMGBackground(scale: Int) -> CGImage {
             .paragraphStyle: para,
         ]
     ).draw(in: CGRect(x: 0, y: 52 * s, width: CGFloat(w), height: 24 * s))
+    NSAttributedString(
+        string: "Requires macOS 14.4 or later · Apple silicon recommended",
+        attributes: [
+            .font: NSFont.systemFont(ofSize: 11.5 * s, weight: .regular),
+            .foregroundColor: NSColor(cgColor: rgb(0x24175E, 0.6))!,
+            .paragraphStyle: para,
+        ]
+    ).draw(in: CGRect(x: 0, y: 28 * s, width: CGFloat(w), height: 18 * s))
     NSGraphicsContext.restoreGraphicsState()
     return ctx.makeImage()!
 }

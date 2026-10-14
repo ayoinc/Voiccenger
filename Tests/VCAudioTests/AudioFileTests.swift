@@ -33,7 +33,8 @@ func writeFile(_ channels: [[Float]], sampleRate: Double, to url: URL) throws {
         samples.withUnsafeBufferPointer { buffer.floatChannelData![c].update(from: $0.baseAddress!, count: samples.count) }
     }
     try file.write(from: buffer)
-    file.close()
+    // Before macOS 15 the file is finalized when `file` is released on return.
+    if #available(macOS 15.0, *) { file.close() }
 }
 
 /// Frequency (Hz) of the strongest zero-crossing rate estimate — enough to tell a 1 kHz tone from aliasing.

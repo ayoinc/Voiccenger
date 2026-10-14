@@ -262,7 +262,9 @@ struct EnrollmentSheet: View {
         let voice = replacing == nil ? VoiceSettings(accentRegionID: accentRegionID) : nil
         Task {
             // Failures are shown through `enrollment.state`.
-            _ = try? await enrollment.enroll(name: name, deviceUID: deviceUID, replacing: replacing, voice: voice)
+            _ = try? await enrollment.enroll(
+                name: name, deviceUID: deviceUID, replacing: replacing, voice: voice,
+                deepgramModels: coordinator.settings.calibrationDeepgramModels)
             await coordinator.reloadProfiles()
         }
     }

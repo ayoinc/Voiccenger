@@ -215,10 +215,7 @@ public final class MeetingCoordinator {
         guard !generatingReports.contains(meetingID),
             let meeting = meetings.first(where: { $0.id == meetingID })
         else { return }
-        guard let choice = ReportWriter.engine(preferring: settings.engine) else {
-            lastError = ReportWriter.ReportWriterError.noEngine.localizedDescription
-            return
-        }
+        let choice = ReportWriter.engine(preferring: settings.engine)
         generatingReports.insert(meetingID)
         defer { generatingReports.remove(meetingID) }
         do {
@@ -251,6 +248,11 @@ public final class MeetingCoordinator {
             }
             for j in report.topics.indices {
                 report.topics[j].speakers = report.topics[j].speakers.map { $0 == old ? trimmed : $0 }
+            }
+            for j in report.outline.indices {
+                for k in report.outline[j].points.indices where report.outline[j].points[k].speaker == old {
+                    report.outline[j].points[k].speaker = trimmed
+                }
             }
             meeting.report = report
         }

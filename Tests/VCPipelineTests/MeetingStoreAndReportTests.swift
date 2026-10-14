@@ -1,5 +1,4 @@
 import Foundation
-import Synchronization
 import Testing
 import VCModels
 
@@ -193,6 +192,72 @@ struct ReportRendererTests {
         #expect(!md.contains("## Decisions"))
         #expect(md.contains("## Transcript"))
         #expect(md.contains("Can everyone hear me?"))
+    }
+
+    @Test("The conversation outline renders each segment's time range and heading, then attributed, timed points")
+    func outlineSection() {
+        #expect(!ReportRenderer.markdown(sampleMeeting()).contains("## Conversation Outline"), "older reports have no outline")
+        var m = sampleMeeting()
+        let line = m.segments[0].id
+        m.report?.outline = [
+            OutlineSegment(heading: "Payments", start: 60, end: 125, points: [
+                OutlinePoint(speaker: "Rishi", text: "Payment integration finished", time: 65, segmentIDs: [line]),
+                OutlinePoint(speaker: "Rishi", text: "We finished the payment integration last weak.", time: 65, segmentIDs: [line], isQuote: true),
+            ], isExtracted: true),
+        ]
+        let md = ReportRenderer.markdown(m)
+        #expect(md.contains("""
+            ## Conversation Outline
+
+            ### [01:00–02:05] Payments
+
+            _Not in the AI outline: quoted from the transcript._
+
+            - **Rishi:** Payment integration finished _(01:05)_
+            - **Rishi:** “We finished the payment integration last weak.” _(01:05)_
+
+            ## Participants
+            """))
+    }
+
+    @Test("A report written without AI says so and shows only what the transcript gives")
+    func transcriptOutlineReport() {
+        var m = sampleMeeting()
+        m.report = MeetingReport(
+            title: "Planning", overview: "Rishi, Speaker 1 and Remote | 1 spoke 3 lines over about 62 minutes.", topics: [],
+            decisions: [], actionItems: [ActionItem(task: "I'll send the launch brief to marketing by Friday.", owner: "Rishi", due: "Friday")],
+            notesToRemember: [], missedOpportunities: [], openQuestions: ["Remote | 1: Can everyone hear me?"], corrections: [],
+            participantSummaries: [],
+            outline: [OutlineSegment(heading: "Payments", start: 0, end: 3_702, points: [
+                OutlinePoint(speaker: "Rishi", text: "We finished the payment integration last weak.", time: 65, segmentIDs: [], isQuote: true),
+            ], isExtracted: true)],
+            kind: .transcriptOutline, generatedBy: "Transcript outline (no AI)")
+        let md = ReportRenderer.markdown(m)
+        #expect(md.contains("> **Transcript outline (no AI).** Built from the transcript without a language model"))
+        for heading in ["## Summary", "## Transcript Outline (no AI)", "## Questions Asked", "## Possible Action Items (not verified)", "## Participants", "## Transcript"] {
+            #expect(md.contains("\n\(heading)\n"), "missing \(heading)")
+        }
+        for heading in ["## Overview", "## Topics", "## Decisions", "## Conversation Outline", "## Participant Summaries"] {
+            #expect(!md.contains("\n\(heading)\n"), "unexpected \(heading)")
+        }
+        // No "not in the AI outline" note: nothing here comes from AI.
+        #expect(!md.contains(ReportRenderer.extractedSegmentNote))
+        #expect(md.contains("### [00:00–1:01:42] Payments\n\n- **Rishi:** “We finished the payment integration last weak.” _(01:05)_\n"))
+        #expect(md.contains("- [ ] I'll send the launch brief to marketing by Friday. — owner: **Rishi**, due: Friday"))
+        #expect(md.contains("- **Report by:** Transcript outline (no AI)"))
+    }
+
+    @Test("The transcript outline is always available as the last fallback")
+    func transcriptOutlineEngineIsAlwaysThere() async throws {
+        let chosen = ReportWriter.engine(preferring: .transcriptOutline)
+        #expect(chosen.engine.engineName == "Transcript outline (no AI)" && !chosen.isFallback)
+        // Whatever is preferred, some engine comes back; the report it writes is labelled by kind.
+        let any = ReportWriter.engine(preferring: .apple)
+        #expect(!any.engine.engineName.isEmpty)
+        let report = try await ReportWriter.report(for: sampleMeeting(), engine: chosen.engine, title: "Planning")
+        #expect(report.kind == .transcriptOutline && report.title == "Planning")
+        let allQuoted = report.outline.flatMap(\.points).allSatisfy { $0.isQuote }
+        #expect(allQuoted)
     }
 
     @Test("Timestamps switch to hours past 59:59 and never go negative")

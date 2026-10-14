@@ -4,6 +4,7 @@ import Speech
 import VCModels
 
 /// Converts SpeechTranscriber results into model types.
+@available(macOS 26.0, *)
 enum ResultMapper {
     /// Word timing and confidence come from the `audioTimeRange` / `transcriptionConfidence` attributes
     /// on the result's AttributedString runs. A run without a time range (e.g. detached punctuation)

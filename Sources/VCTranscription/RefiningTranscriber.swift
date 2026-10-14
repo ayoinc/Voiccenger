@@ -1,9 +1,11 @@
 import Foundation
 import VCModels
 
-/// Live transcription: Apple streams volatile text immediately; each Apple final's audio is re-transcribed by `engine` (when ready) and emitted as the final.
-/// If the engine isn't ready (downloading/warming/failed) the Apple final passes through unchanged (engine = .apple).
-/// Words of refined finals get times via TimingTransfer from Apple's words.
+/// Live transcription: a preview source streams volatile text immediately; each preview final's audio is re-transcribed by
+/// `engine` (when ready) and emitted as the final. The preview is Apple's `LiveTranscriber` on macOS 26 and
+/// `ModelPreviewTranscriber` (the voice model itself on short voice-activity windows) where Apple Speech is unavailable.
+/// If the engine isn't ready (downloading/warming/failed) the preview final passes through unchanged.
+/// Words of refined finals get times via TimingTransfer from the preview's words.
 ///
 /// Refinement window: the engines are far more accurate on a passage than on single sentences, so
 /// consecutive Apple finals separated by pauses shorter than `joinPauseSeconds` are collected (up to
@@ -29,7 +31,9 @@ public actor RefiningTranscriber {
     static let leadingPadding: TimeInterval = 0.15
 
     private let eventContinuation: AsyncStream<TranscriptEvent>.Continuation
-    private let live: LiveTranscriber
+    private let live: any PreviewSource
+    /// Engine of the preview text: `.apple`, or the voice model when Apple Speech is unavailable.
+    private let previewEngine: SpeechEngineKind
     private let engine: SpeechEngineKind
     private let customization: VoiceSettings?
     private let library: SpeechModelLibrary
@@ -60,6 +64,8 @@ public actor RefiningTranscriber {
 
     /// - Parameters:
     ///   - appleLocaleID: locale of the live Apple preview (e.g. "en-GB").
+    ///   - engine: refining model. Without Apple Speech it also makes the preview; `.apple` (and `.deepgram`)
+    ///     then become the best downloaded on-device model (`SpeechModelLibrary.previewEngine`).
     ///   - languageCode: ISO 639-1 language the engine transcribes; follows Apple's automatic language switches.
     ///   - prompt: names and terms; Apple contextual strings and Whisper prompt.
     ///   - customization: applied to every event's text; nil leaves text unchanged.
@@ -70,20 +76,54 @@ public actor RefiningTranscriber {
         prompt: [String], customization: VoiceSettings?, library: SpeechModelLibrary = .shared,
         autoLanguage: Bool = true, waitForEngine: Bool = false
     ) {
+        self.init(
+            channel: channel, appleLocaleID: appleLocaleID, engine: engine, languageCode: languageCode, prompt: prompt,
+            customization: customization, library: library, autoLanguage: autoLanguage, waitForEngine: waitForEngine,
+            modelPreview: nil)
+    }
+
+    /// `modelPreview` forces the model-window preview with that model even where Apple Speech runs (tests).
+    init(
+        channel: AudioChannel, appleLocaleID: String, engine: SpeechEngineKind, languageCode: String,
+        prompt: [String], customization: VoiceSettings?, library: SpeechModelLibrary,
+        autoLanguage: Bool, waitForEngine: Bool, modelPreview: ModelPreviewTranscriber.PreviewModel?
+    ) {
         self.channel = channel
-        self.engine = engine
         self.languageCode = baseLanguageCode(languageCode)
         self.prompt = prompt
         self.customization = customization
         self.library = library
         self.waitForEngine = waitForEngine
-        live = LiveTranscriber(
-            channel: channel, localeID: appleLocaleID, contextualStrings: prompt, autoLanguage: autoLanguage)
+        if modelPreview == nil, #available(macOS 26.0, *), AppleSpeech.isAvailable {
+            self.engine = engine
+            previewEngine = .apple
+            live = LiveTranscriber(
+                channel: channel, localeID: appleLocaleID, contextualStrings: prompt, autoLanguage: autoLanguage)
+        } else if modelPreview == nil, AppleSpeech.usesClassic {
+            // Classic Apple recognizer on short voice windows makes the preview; a supported on-device model
+            // (Apple silicon) refines it as usual, else the classic text is final.
+            let refiner = library.previewEngine(preferring: engine, languageCode: languageCode)
+            self.engine = EngineSupport.onDeviceModels().contains(refiner) ? refiner : .apple
+            previewEngine = .apple
+            live = ModelPreviewTranscriber(
+                channel: channel, engine: .apple, localeID: appleLocaleID, languageCode: languageCode, prompt: prompt,
+                model: .library(library, engine: .apple), waitForEngine: waitForEngine)
+        } else {
+            let model = modelPreview == nil ? library.previewEngine(preferring: engine, languageCode: languageCode) : engine
+            self.engine = model
+            previewEngine = model
+            live = ModelPreviewTranscriber(
+                channel: channel, engine: model, localeID: appleLocaleID, languageCode: languageCode, prompt: prompt,
+                model: modelPreview ?? .library(library, engine: model), waitForEngine: waitForEngine)
+        }
         (events, eventContinuation) = AsyncStream.makeStream(bufferingPolicy: .unbounded)
         (jobs, jobContinuation) = AsyncStream.makeStream(bufferingPolicy: .unbounded)
     }
 
-    /// Starts Apple recognition (installing its assets if needed). The engine is used once it is ready.
+    /// Engine whose text the preview shows: `.apple`, or the voice model on Macs without Apple Speech.
+    public nonisolated var previewEngineKind: SpeechEngineKind { previewEngine }
+
+    /// Starts the preview (Apple: installing its assets if needed). The engine is used once it is ready.
     public func start() async throws {
         guard !isFinished else { throw TranscriptionError.notRunning }
         guard !isStarted else { return }
@@ -110,16 +150,16 @@ public actor RefiningTranscriber {
     /// Feeds audio (any sample rate). Dropped before `start()` and after `finish()`.
     public func append(_ chunk: AudioChunk) async {
         guard isStarted, !isFinished else { return }
+        var spans: [RecognitionTimeline.Span] = []
         do {
-            for span in try timeline.ingest(samples: chunk.samples, sampleRate: chunk.sampleRate, startTime: chunk.startTime) {
-                audio.append(span)
-            }
+            spans = try timeline.ingest(samples: chunk.samples, sampleRate: chunk.sampleRate, startTime: chunk.startTime)
+            for span in spans { audio.append(span) }
         } catch {
             transcriptionLog.error("Buffering \(self.channel.rawValue, privacy: .public) audio failed: \(error.localizedDescription, privacy: .public)")
         }
         audioEnd = max(audioEnd, chunk.range.end)
         closeWindowAfterSilence()
-        await live.append(chunk)
+        await live.append(chunk, spans: spans)
     }
 
     /// Names and terms for Apple's contextual strings and the engine prompt; applies to later windows.
@@ -132,14 +172,16 @@ public actor RefiningTranscriber {
     public func finish() async {
         guard !isFinished else { return }
         isFinished = true
+        var remaining: [RecognitionTimeline.Span] = []
         if isStarted {
             do {
-                for span in try timeline.flush() { audio.append(span) }
+                remaining = try timeline.flush()
+                for span in remaining { audio.append(span) }
             } catch {
                 transcriptionLog.error("Flushing \(self.channel.rawValue, privacy: .public) audio failed: \(error.localizedDescription, privacy: .public)")
             }
         }
-        await live.finish()
+        await live.finish(remaining: remaining)
         await pump?.value
         endOfInput()
         await worker?.value
@@ -167,7 +209,7 @@ public actor RefiningTranscriber {
             var refine = engine != .apple
             if refine, !waitForEngine { refine = await library.isReady(engine) }
             guard refine else {
-                // Apple text goes out at once; anything collected while the engine was ready goes first.
+                // Preview text goes out at once; anything collected while the engine was ready goes first.
                 closeWindow()
                 enqueue([update], refine: false)
                 return
@@ -257,27 +299,29 @@ public actor RefiningTranscriber {
         let combined = TranscriptUpdate(
             channel: channel, text: parts.map(\.text).joined(separator: " "),
             range: TimeRange(start: first.range.start, end: last.range.end), confidence: nil,
-            localeID: last.localeID, words: parts.flatMap(\.words), engine: .apple)
-        eventContinuation.yield(.volatile(customized(combined, engine: .apple)))
+            localeID: last.localeID, words: parts.flatMap(\.words), engine: previewEngine)
+        eventContinuation.yield(.volatile(customized(combined, engine: previewEngine)))
     }
 
     // MARK: - Refinement
 
     private func refine(_ job: Job) async -> [TranscriptUpdate] {
-        let apple = job.finals.map { customized($0, engine: .apple) }
-        guard job.refine, !job.samples.isEmpty, let transcriber = await readyTranscriber() else { return apple }
+        let preview = job.finals.map { customized($0, engine: previewEngine) }
+        // A lone model-preview final is already this engine's transcript of the same audio.
+        if previewEngine == engine, job.finals.count == 1 { return preview }
+        guard job.refine, !job.samples.isEmpty, let transcriber = await readyTranscriber() else { return preview }
         do {
             let refined = try await Self.refineWindow(
                 job.finals, samples: job.samples, with: transcriber, languageCode: job.languageCode,
                 prompt: job.prompt, customization: customization, previousText: lastEmittedText)
             switch refined {
-            case .heardNothing: return apple
+            case .heardNothing: return preview
             case .duplicate: return []
             case .final(let update): return [update]
             }
         } catch {
-            transcriptionLog.error("\(self.engine.rawValue, privacy: .public) refinement failed; keeping Apple text: \(error.localizedDescription, privacy: .public)")
-            return apple
+            transcriptionLog.error("\(self.engine.rawValue, privacy: .public) refinement failed; keeping preview text: \(error.localizedDescription, privacy: .public)")
+            return preview
         }
     }
 
@@ -368,7 +412,7 @@ public actor RefiningTranscriber {
         do {
             return try await library.transcriber(engine)
         } catch {
-            transcriptionLog.info("\(self.engine.rawValue, privacy: .public) unavailable; using Apple text: \(error.localizedDescription, privacy: .public)")
+            transcriptionLog.info("\(self.engine.rawValue, privacy: .public) unavailable; using preview text: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }

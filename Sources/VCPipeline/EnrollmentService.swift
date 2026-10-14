@@ -74,15 +74,17 @@ public final class EnrollmentService {
     /// Records the person reading `passage(name:region:)` and enrolls them as `name`. `voice` seeds a new
     /// profile's settings (its accent region personalises the passage). Passing `replacing` re-enrolls that
     /// profile (same identity, colour and voice settings, new voice samples and calibration).
+    /// `deepgramModels`: the Deepgram models compared when Deepgram's key works (first = the user's choice).
     @discardableResult
     public func enroll(
         name: String, seconds: TimeInterval = defaultRecordingSeconds, deviceUID: String? = nil,
-        replacing: SpeakerProfile? = nil, voice: VoiceSettings? = nil
+        replacing: SpeakerProfile? = nil, voice: VoiceSettings? = nil,
+        deepgramModels: [String] = [Deepgram.defaultModel]
     ) async throws -> Outcome {
         guard !isBusy else { throw EnrollmentServiceError.busy }
         let settings = replacing?.voice ?? voice ?? .default
         let text = Self.passage(name: name, region: Self.region(of: settings))
-        let engines = loadCalibrationEngines()
+        let engines = loadCalibrationEngines(deepgramModels: deepgramModels)
         return try await run {
             let samples = try await self.record(seconds: seconds, deviceUID: deviceUID)
             self.state = .analyzing
@@ -92,16 +94,18 @@ public final class EnrollmentService {
         }
     }
 
-    /// Records the person reading their passage again and re-scores the engines, keeping their voice samples.
+    /// Records the person reading their passage again and re-scores the engines (Deepgram once per model in
+    /// `deepgramModels`), keeping their voice samples.
     @discardableResult
     public func recalibrate(
-        profileID: UUID, seconds: TimeInterval = defaultRecordingSeconds, deviceUID: String? = nil
+        profileID: UUID, seconds: TimeInterval = defaultRecordingSeconds, deviceUID: String? = nil,
+        deepgramModels: [String] = [Deepgram.defaultModel]
     ) async throws -> Outcome {
         guard !isBusy else { throw EnrollmentServiceError.busy }
         guard let profile = await store.all().first(where: { $0.id == profileID }) else {
             throw EnrollmentServiceError.unknownProfile
         }
-        let engines = loadCalibrationEngines()
+        let engines = loadCalibrationEngines(deepgramModels: deepgramModels)
         return try await run {
             let samples = try await self.record(seconds: seconds, deviceUID: deviceUID)
             self.state = .analyzing
@@ -112,9 +116,9 @@ public final class EnrollmentService {
     }
 
     /// Loads the engines while the person reads, so scoring can start as soon as recording ends.
-    private func loadCalibrationEngines() -> Task<[any AccurateTranscriber], Never> {
+    private func loadCalibrationEngines(deepgramModels: [String]) -> Task<[any AccurateTranscriber], Never> {
         let library = self.library
-        return Task.detached { await Self.calibrationTranscribers(library: library) }
+        return Task.detached { await Self.calibrationTranscribers(deepgramModels: deepgramModels, library: library) }
     }
 
     /// Stops an in-progress recording early; what was captured so far is used.
@@ -251,7 +255,8 @@ public final class EnrollmentService {
     }
 
     /// The person's settings after a calibration. Their engine follows the best result when it's new, unset,
-    /// or still the previous calibration's pick; a different manual choice is kept. Empty results change nothing.
+    /// or still the previous calibration's pick; a different manual choice is kept. Their Deepgram model follows
+    /// the best-scoring Deepgram model the same way. Empty results change nothing.
     public nonisolated static func applying(
         _ calibration: VoiceCalibration, to voice: VoiceSettings, isNewProfile: Bool
     ) -> VoiceSettings {
@@ -259,6 +264,11 @@ public final class EnrollmentService {
         var voice = voice
         if isNewProfile || voice.preferredEngine == nil || voice.preferredEngine == voice.calibration?.best?.engine {
             voice.preferredEngine = best.engine
+        }
+        if let model = calibration.bestDeepgramModel,
+            isNewProfile || voice.deepgramModel == nil || voice.deepgramModel == voice.calibration?.bestDeepgramModel
+        {
+            voice.deepgramModel = model
         }
         voice.calibration = calibration
         return voice
@@ -271,10 +281,12 @@ public final class EnrollmentService {
                 + AccentRegions.vocabulary(for: profile.voice))
     }
 
-    /// Apple plus every downloaded voice model that supports `languageCode`, loaded and ready.
+    /// Apple plus every downloaded voice model that supports `languageCode`, loaded and ready; Deepgram (when
+    /// its key resolves) once per model in `deepgramModels` that transcribes the language in recordings.
     /// Models that fail to load are skipped.
     public nonisolated static func calibrationTranscribers(
-        languageCode: String = "en", library: SpeechModelLibrary = .shared
+        languageCode: String = "en", deepgramModels: [String] = [Deepgram.defaultModel],
+        library: SpeechModelLibrary = .shared
     ) async -> [any AccurateTranscriber] {
         var statuses: [SpeechEngineKind: ModelStatus] = [:]
         for kind in SpeechEngineKind.allCases { statuses[kind] = await library.status(kind) }
@@ -282,7 +294,16 @@ public final class EnrollmentService {
         var transcribers: [any AccurateTranscriber] = []
         for kind in SpeechEngineKind.allCases
         where available.contains(kind) && SpeechModelLibrary.info(kind).languageCodes.contains(languageCode) {
-            if let t = try? await library.transcriber(kind) { transcribers.append(t) }
+            guard kind == .deepgram else {
+                if let t = try? await library.transcriber(kind) { transcribers.append(t) }
+                continue
+            }
+            for model in deepgramModels.isEmpty ? [Deepgram.defaultModel] : deepgramModels {
+                // A model that would fall back to Nova-3 adds nothing to compare.
+                let choice = await library.deepgramModelChoice(model, languageCode: languageCode, live: false)
+                guard choice.fallbackReason == nil, choice.language != nil else { continue }
+                if let t = try? await library.transcriber(.deepgram, deepgramModel: model) { transcribers.append(t) }
+            }
         }
         return transcribers
     }

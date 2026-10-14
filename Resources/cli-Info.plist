@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.voiccenger.cli</string>
+	<key>CFBundleName</key>
+	<string>voiccenger-cli</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>voiccenger-cli records the microphone to transcribe meetings and enroll voices.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>voiccenger-cli transcribes audio with Apple's speech recognition.</string>
+</dict>
+</plist>

@@ -147,4 +147,28 @@ struct EnrollmentCalibrationTests {
         #expect(voice.preferredEngine == .whisper)
         #expect(voice.calibration == calibration)
     }
+
+    @Test("The best Deepgram model follows calibration unless the person chose another")
+    func deepgramModelFollowsCalibration() {
+        let first = VoiceCalibration(scores: [
+            EngineScore(engine: .deepgram, wordErrorRate: 0.02, transcript: "", model: "nova-2-meeting"),
+            EngineScore(engine: .cohere, wordErrorRate: 0.03, transcript: ""),
+            EngineScore(engine: .deepgram, wordErrorRate: 0.04, transcript: "", model: "nova-3"),
+        ])
+        let calibrated = EnrollmentService.applying(first, to: VoiceSettings(), isNewProfile: true)
+        #expect(calibrated.deepgramModel == "nova-2-meeting" && calibrated.preferredEngine == .deepgram)
+
+        let second = VoiceCalibration(scores: [
+            EngineScore(engine: .cohere, wordErrorRate: 0.01, transcript: ""),
+            EngineScore(engine: .deepgram, wordErrorRate: 0.02, transcript: "", model: "nova-3"),
+            EngineScore(engine: .deepgram, wordErrorRate: 0.03, transcript: "", model: "nova-2-meeting"),
+        ])
+        #expect(EnrollmentService.applying(second, to: calibrated, isNewProfile: false).deepgramModel == "nova-3")
+        var chosen = calibrated
+        chosen.deepgramModel = "whisper-large"
+        #expect(EnrollmentService.applying(second, to: chosen, isNewProfile: false).deepgramModel == "whisper-large")
+        // A calibration that scored one Deepgram model leaves the model alone.
+        let single = VoiceCalibration(scores: [EngineScore(engine: .deepgram, wordErrorRate: 0.02, transcript: "", model: "nova-3")])
+        #expect(EnrollmentService.applying(single, to: VoiceSettings(), isNewProfile: true).deepgramModel == nil)
+    }
 }

@@ -1,5 +1,4 @@
 import Foundation
-import Synchronization
 import Testing
 import VCModels
 @testable import VCIntelligence
@@ -262,6 +261,18 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
                 "corrected": "Wednesday the fifteenth", "lines": [5],
             ]],
             "participantSummaries": [["name": "Karen", "keyPoints": [["text": "Needs three weeks of notice.", "lines": [4]]]]],
+            "outline": [
+                ["heading": "Engineering and marketing status", "points": [
+                    ["speaker": "Rishi", "text": "Engineering on track, payment integration finished last week", "lines": [3]],
+                    ["speaker": "Karen", "text": "Marketing needs three weeks of notice before a launch", "lines": [4]],
+                ]],
+                ["heading": "Launch plan", "points": [
+                    ["speaker": "Daniel", "text": "Targets the launch for Wednesday the fifteenth", "lines": [5]],
+                    // Rishi only promised to send it.
+                    ["speaker": "Rishi", "text": "Sent the updated budget to everyone", "lines": [7]],
+                    ["speaker": "Samantha", "text": "Will share the press kit on Monday", "lines": [9]],
+                ]],
+            ],
         ]
         let engine = engine(key, replies: [Self.toolReply("record_meeting_report", input: input)])
 
@@ -277,6 +288,12 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
         #expect(report.participantSummaries == [ParticipantSummary(name: "Karen", keyPoints: ["Needs three weeks of notice."])])
         #expect(report.corrections.map(\.corrected) == ["Wednesday the fifteenth"])
         #expect(report.corrections.map(\.reason) == ["Daniel corrected themselves"])
+        // A 48-second meeting gets one segment, headed by the one with the most of the model's points.
+        #expect(report.outline.map(\.heading) == ["Engineering and marketing status"])
+        // Samantha's point copies her line, so it is shown as a quote.
+        #expect(report.outline.flatMap(\.points).map(\.speaker) == ["Rishi", "Karen", "Daniel", "Samantha"])
+        #expect(report.outline.flatMap(\.points).map(\.isQuote) == [false, false, false, true])
+        #expect(report.outline.first?.start == transcript.first?.time)
         let body = try #require(StubProtocol.script(key: key)?.bodies.first)
         let prompt = try #require((body["messages"] as? [[String: Any]])?.first?["content"] as? String)
         for (index, line) in transcript.enumerated() {
@@ -289,6 +306,9 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {  // URLProtocol sta
             let items = try #require((properties[key] as? [String: Any])?["items"] as? [String: Any])
             #expect((items["required"] as? [String])?.contains("lines") == true, "\(key) lacks lines")
         }
+        let segment = try #require((properties["outline"] as? [String: Any])?["items"] as? [String: Any])
+        let point = try #require((segment["properties"] as? [String: Any])?["points"] as? [String: Any])
+        #expect(((point["items"] as? [String: Any])?["required"] as? [String]) == ["speaker", "text", "lines"])
     }
 
     @Test func oversizedTranscriptIsRejectedBeforeAnyRequest() async throws {

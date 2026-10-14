@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import VCModels
+import VCTranscription
 
 @testable import VCPipeline
 
@@ -64,5 +65,35 @@ struct AppSettingsTests {
 
         settings.recordingConsentAcknowledged = true
         #expect(AppSettings(defaults: defaults).recordingConsentAcknowledged)
+    }
+
+    @Test("The Deepgram model, calibration extras and fetched model list persist")
+    func deepgramModelPreferencesPersist() throws {
+        let suite = "vc-settings-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fresh = AppSettings(defaults: defaults)
+        #expect(fresh.deepgramModel == "nova-3" && fresh.deepgramModelCatalog == nil)
+        #expect(fresh.calibrationDeepgramModels == ["nova-3"])
+
+        let catalog = DeepgramModelCatalog(
+            models: [
+                DeepgramModel(name: "nova-2-meeting", architecture: "nova-2", version: "2024-02-07.1", streamingLanguages: ["en"], batchLanguages: ["en"])
+            ],
+            fetchedAt: Date(timeIntervalSince1970: 1_000), source: .project)
+        fresh.deepgramModel = "nova-2-meeting"
+        // Duplicates of the chosen model are dropped and at most two extras are compared.
+        fresh.deepgramCalibrationModels = ["NOVA-2-MEETING", "nova-3", "whisper-large", "enhanced-meeting"]
+        fresh.deepgramModelCatalog = catalog
+
+        let reloaded = AppSettings(defaults: defaults)
+        #expect(reloaded.deepgramModel == "nova-2-meeting")
+        #expect(reloaded.calibrationDeepgramModels == ["nova-2-meeting", "nova-3", "whisper-large"])
+        #expect(reloaded.deepgramModelCatalog == catalog)
+        #expect(reloaded.sessionConfig(kind: .inPerson, detected: nil, meetingsDirectory: FileManager.default.temporaryDirectory).deepgramModel == "nova-2-meeting")
+
+        reloaded.deepgramModelCatalog = nil
+        #expect(AppSettings(defaults: defaults).deepgramModelCatalog == nil)
     }
 }

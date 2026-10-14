@@ -32,16 +32,29 @@ public enum IntelligencePrompts {
         spoken, if any; never invent one.
         """
 
-    /// Rules shared by the single-pass report and the per-part notes.
+    /// Rules shared by every report request.
     private static let evidenceRules = """
-        Write every item briefly in your own words; never copy a transcript line. Every decision, action item, \
-        note, open question and correction cites in lines the numbers of the transcript lines that say it (7 \
-        for L7); check that each cited line really says it. Empty lists are normal and expected, especially \
-        for short or chatty meetings. Never create items for greetings, thanks, introductions or meeting \
-        logistics.
+        Write every item in your own words; never copy a transcript line. Every decision, action item, \
+        note, open question, correction and outline point cites in lines the numbers of the transcript lines \
+        that say it (7 for L7); check that each cited line really says it. Empty lists are normal and expected, \
+        especially for short or chatty meetings. Never create items for greetings, thanks, introductions or \
+        meeting logistics.
         """
 
-    /// List rules shared by the single-pass report and the per-part notes.
+    /// Overview, topic and participant rules for a whole meeting.
+    private static let summaryRules = """
+        - overview: when the meeting has substance, a detailed summary in two to four short paragraphs \
+        separated by blank lines: what the meeting was for, what was discussed, the positions people took (by \
+        name), numbers and dates mentioned, and how it ended. For a short or chatty meeting, one or two \
+        sentences.
+        - topics: the subjects actually discussed, in order, with the speakers involved. Each summary is three \
+        to five sentences: what was said and by whom, the positions taken, numbers and dates, and the outcome. \
+        A promise or plan stays a promise ("Rishi will send the budget"), never something done.
+        - participantSummaries: for each speaker, key points from their own lines, each citing those lines; a \
+        promise or plan stays a promise ("will send the budget"), never something done; no small talk.
+        """
+
+    /// List rules shared by every report request.
     private static let listRules = """
         - decisions: only what the participants explicitly agreed or decided; the corrected version when \
         someone corrected themselves.
@@ -56,41 +69,72 @@ public enum IntelligencePrompts {
         - corrections: kind selfCorrection (a speaker repaired their own words), contradiction (a line \
         contradicts an earlier one; cite both) or mishearing (a word clearly misrecognised); speaker, original \
         wording, corrected wording. Fillers, repetitions and hesitations are not corrections.
-        - participantSummaries: for each speaker, key points from their own lines, each citing those lines; a \
-        promise or plan stays a promise ("will send the budget"), never something done; no small talk.
         """
 
-    /// System instructions for building the whole report in one pass.
+    /// Rules for the conversation outline.
+    private static let outlineRules = """
+        - outline: the conversation in order, as segments that together cover every line with substance. \
+        Start a new segment where the subject changes. Each segment has a heading of a few words and two to six \
+        points. A point is one specific thing one speaker said, asked, proposed or objected to: speaker is \
+        their name; text says it in your own words without repeating the name, keeping names, numbers, dates \
+        and reasons ("billing bug affects about 40 customers"); lines cites that speaker's own lines. A promise \
+        or plan stays a promise. Skip greetings, thanks and small talk.
+        """
+
+    private static let transcriptFormat = """
+        Lines look like "L3 [mm:ss] Speaker: text", where L3 is the line number.
+        """
+
+    /// System instructions for the whole report, outline included, in one request (Claude).
     public static let reportInstructions = """
-        You write the post-meeting report from a speech-recognition transcript. Lines look like \
-        "L3 [mm:ss] Speaker: text", where L3 is the line number. Be faithful: include only what the transcript \
-        says, and read past obvious recognition errors.
+        You write the post-meeting report from a speech-recognition transcript. \(transcriptFormat) Be \
+        faithful: include only what the transcript says, and read past obvious recognition errors.
         \(evidenceRules)
         - title: a short meeting title (keep the given title when there is one).
-        - overview: one to three sentences about what was actually said.
-        - topics: the subjects actually discussed, in order, each with a short summary and the speakers involved.
+        \(summaryRules)
         \(listRules)
+        \(outlineRules)
         """
 
-    /// Map step: notes for one part of a meeting too long for a single request.
-    public static let partNotesInstructions = """
-        You take notes on one part of a longer meeting, from a speech-recognition transcript. Lines look like \
-        "L3 [mm:ss] Speaker: text", where L3 is the line number. Be faithful: include only what this part says.
+    /// Apple Intelligence's notes come in two requests over the same transcript (or part of it), each small enough
+    /// for its 4,096-token window with a detailed answer: the summary (title, overview, topics, participants)…
+    public static let summaryInstructions = """
+        You summarise a meeting (or one part of it, when the prompt says so) from a speech-recognition \
+        transcript. \(transcriptFormat) Be faithful: include only what the transcript says, and read past \
+        obvious recognition errors. Write in your own words; never copy a transcript line. Key points cite in \
+        lines the numbers of the speaker's lines that say them (7 for L7). Never summarise greetings, thanks or \
+        meeting logistics.
+        - title: a short meeting title (keep the given title when there is one).
+        \(summaryRules)
+        """
+
+    /// …and the lists (decisions, action items, notes, missed opportunities, open questions, corrections).
+    public static let listsInstructions = """
+        You list the outcomes of a meeting (or one part of it, when the prompt says so) from a \
+        speech-recognition transcript. \(transcriptFormat) Be faithful: include only what the transcript says, \
+        and read past obvious recognition errors.
         \(evidenceRules)
-        - title: a short title for this part. overview: one or two sentences.
-        - topics with short summaries and speakers.
         \(listRules)
         """
 
-    /// Reduce step: merge notes from consecutive parts into one set.
-    public static let mergeNotesInstructions = """
-        You merge notes taken on consecutive parts of one meeting into a single set of notes for the \
-        whole meeting. Items carry the transcript line numbers that support them, like (L3, L7): keep them on \
-        every merged item, combining the numbers of merged duplicates, and never add new ones. Remove \
-        duplicates. When a later decision supersedes an earlier one, keep only the later one. Keep every \
-        distinct action item with its owner and due date. Drop open questions that a later part answered. \
-        Combine each participant's key points. Write a title and a one to three sentence overview for \
-        everything covered. Do not add anything the notes do not support; empty lists are fine.
+    /// Reduce step: merge the summaries of consecutive parts into the meeting's. The parts' lists are joined
+    /// without a model: merging them made the on-device model drop most action items.
+    public static let mergeSummaryInstructions = """
+        You merge the summaries of consecutive parts of one meeting into the summary of the whole meeting. \
+        Write a title. topics: the subjects in order; merge a topic that continues across parts into one; each \
+        summary is three to five sentences keeping who said what, numbers, dates and outcomes. overview: two to \
+        four paragraphs covering the whole meeting: what it was for, what was discussed, who took which \
+        position, and how it ended. A promise or plan stays a promise. Do not add anything the summaries do not \
+        say.
+        """
+
+    /// Map step of the outline: the outline of one part of the transcript (Apple Intelligence).
+    public static let outlineInstructions = """
+        You outline what was discussed in (part of) a meeting, from a speech-recognition transcript. \
+        \(transcriptFormat) Be faithful: include only what these lines say, and read past obvious recognition \
+        errors. Write every point in your own words; never copy a transcript line. Each point cites in lines \
+        the numbers of that speaker's lines that say it (7 for L7); check that each cited line really says it.
+        \(outlineRules)
         """
 
     /// User turn for live analysis. Context lines are numbered from L1 so a contradiction can cite one.
@@ -116,8 +160,9 @@ public enum IntelligencePrompts {
             prompt += "This is part \(part.index + 1) of \(part.count).\n"
         } else if ReportShape(Grounding.substance(lines)).isThin {
             prompt += """
-                This meeting is short and has little substance: write a one or two sentence overview and at most \
-                one topic, and leave the other lists empty unless a line clearly supports an item.
+                This meeting is short and has little substance: write a one or two sentence overview, at most \
+                one topic and at most one short outline segment, and leave the other lists empty unless a line \
+                clearly supports an item.
 
                 """
         }
@@ -125,11 +170,11 @@ public enum IntelligencePrompts {
         return prompt
     }
 
-    /// User turn for merging rendered part notes.
+    /// User turn for merging rendered part summaries.
     public static func mergePrompt(renderedNotes: [String], participants: [String], meetingTitle: String?) -> String {
         var prompt = header(participants: participants, meetingTitle: meetingTitle, transcript: [])
         for (index, notes) in renderedNotes.enumerated() {
-            prompt += "\nNotes for part \(index + 1):\n" + notes + "\n"
+            prompt += "\nSummary of part \(index + 1):\n" + notes + "\n"
         }
         return prompt
     }

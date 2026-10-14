@@ -8,7 +8,15 @@ struct AppleOfflineTranscriber: AccurateTranscriber {
     let kind = SpeechEngineKind.apple
 
     func transcribe(samples16k: [Float], languageCode: String, prompt: [String]) async throws -> EngineTranscript {
-        guard SpeechTranscriber.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
+        guard #available(macOS 26.0, *), SpeechTranscriber.isAvailable else {
+            // Before macOS 26 and on Intel: the classic recognizer.
+            guard ClassicSpeech.isAvailable else { throw TranscriptionError.speechTranscriberUnavailable }
+            guard !samples16k.isEmpty else {
+                return EngineTranscript(text: "", words: [], engine: .apple, languageCode: baseLanguageCode(languageCode))
+            }
+            return try await ClassicSpeech.transcribe(
+                samples16k: samples16k, localeID: Self.localeID(for: languageCode), prompt: prompt)
+        }
         let localeID = Self.localeID(for: languageCode)
         try await SpeechAssets.ensureInstalled(localeIDs: [localeID])
         let locale = try await SpeechAssets.resolveInstalledLocale(localeID)

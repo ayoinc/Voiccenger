@@ -57,6 +57,7 @@ import VCModels
         #expect(abs((words.last?.range.end ?? -10) - truth[truth.count - 1].end) < 1.0)
     }
 
+    @available(macOS 26.0, *)
     @Test(.enabled { await RecognitionTests.englishReady() })
     func liveTranscriptionUsesTheSessionClockAndFinishesTheStream() async throws {
         let (samples, rate) = try Fixtures.samples("meeting.wav")
@@ -89,6 +90,7 @@ import VCModels
         await #expect(throws: TranscriptionError.notRunning) { try await transcriber.start() }
     }
 
+    @available(macOS 26.0, *)
     @Test(.enabled { await RecognitionTests.englishReady() })
     func gapInAudioKeepsLaterWordsOnTheSessionClock() async throws {
         let (samples, rate) = try Fixtures.samples("meeting.wav")
@@ -115,6 +117,7 @@ import VCModels
         #expect(late.allSatisfy { $0.range.end <= resume + Double(secondTurn.count) / rate + 0.3 })
     }
 
+    @available(macOS 26.0, *)
     @Test(.enabled { await RecognitionTests.switchReady() })
     func explicitLocaleChangeLosesNoSpeechAndTagsResults() async throws {
         let (samples, rate) = try Fixtures.samples("meeting.wav")
@@ -173,6 +176,7 @@ import VCModels
         }
     }
 
+    @available(macOS 26.0, *)
     @Test(.enabled { await RecognitionTests.frenchReady() })
     func liveTranscriberSwitchesToTheSpokenLanguageAutomatically() async throws {
         let (french, rate) = try Fixtures.samples("french.wav")

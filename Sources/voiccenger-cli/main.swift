@@ -96,6 +96,8 @@ let usage = """
       voiccenger-cli <command> [arguments] [options]
 
     COMMANDS
+      capabilities [--json]            What this Mac can run (OS, chip, voice models, Apple Speech, Apple
+                                       Intelligence) and the defaults that follow.
       devices                          List audio input devices and apps using the microphone.
       detect [--watch]                 Show conferencing apps using the microphone; --watch streams
                                        debounced meeting start/end events until interrupted.
@@ -110,25 +112,36 @@ let usage = """
       models                           List voice models: status, size, languages, measured accuracy
                                        (checks a Deepgram key with Deepgram).
       models download <engine>         Download a voice model (cohere, whisper).
+      models deepgram [--language code] [--refresh]
+                                       List the Deepgram models your key can use: languages, and whether each
+                                       streams live or only transcribes recordings (--language: only those
+                                       transcribing it).
       models delete <engine>           Delete a downloaded voice model.
-      transcribe <file> [--engine cohere|whisper|apple|deepgram] [--language en]
-                                       Transcribe an audio file with timestamps (default engine: cohere).
-                                       deepgram sends the audio to Deepgram (key: Keychain, DEEPGRAM_API_KEY
-                                       or ~/.deepgram_secret).
+      transcribe <file> [--engine cohere|whisper|apple|deepgram] [--language en] [--deepgram-model name]
+                                       Transcribe an audio file with timestamps (default engine: cohere on
+                                       Apple silicon, whisper on Intel). deepgram sends the audio to Deepgram
+                                       (key: Keychain, DEEPGRAM_API_KEY or ~/.deepgram_secret) using
+                                       --deepgram-model (default: nova-3).
+          --truth file                 Print the word error rate against this reference: plain text, or a
+                                       JSON array of {"text"} lines (e.g. .fixtures/meeting.truth.json)
+          --max-wer 0.2                Exit 1 when the word error rate is higher (needs --truth)
       calibrate <wav> [options]        Score every downloaded voice model on a reading of a known text.
           --standard                   The recording reads the Speech Accent Archive passage
           --text file                  The recording reads this text
           --name N [--region id]       Without --standard/--text: the recording reads the enrollment
                                        passage (standard + a sentence with N and a place in the region)
           --engines cohere,whisper     Engines to score (default: Apple plus every downloaded model)
+          --deepgram-model a,b         Deepgram models to score, up to 3 (default: nova-3)
           --language code              Language of the reading (default: en)
           --regions                    List accent/residence region ids and exit
       process <file> [options]         Run a recording through the full meeting pipeline
                                        (transcription, speaker identification, analysis, report).
           --profiles dir               Enrolled voices (default: the app's library)
-          --engine cohere|whisper|apple|deepgram Voice model (default: cohere; downloaded if missing;
+          --engine cohere|whisper|apple|deepgram Voice model (default: cohere on Apple silicon, whisper on Intel;
                                        deepgram streams the audio to Deepgram)
-          --intelligence apple|claude  Intelligence engine (default: apple; falls back to the other)
+          --deepgram-model name        Deepgram model (default: nova-3; Nova-3 when it can't stream)
+          --intelligence apple|claude|outline Intelligence engine (default: apple; falls back to the other,
+                                       then to outline: a transcript outline without AI)
           --locale id                  Apple preview locale and meeting language (default: system locale)
           --spelling british|american  Spelling for speakers without their own preference
           --title text                 Meeting title (default: proposed by the report, else the file name)
@@ -141,6 +154,9 @@ let usage = """
       system-audio [--seconds 5] [--pids 123,456] [--out capture.wav]
                                        Capture system audio through a Core Audio process tap (all apps, or
                                        only --pids), report its level, optionally record it.
+      report <transcript.json> [--intelligence apple|claude|outline] [--title text] [--out report.md]
+                                       Write the report for a transcript: a JSON array of lines
+                                       {"speaker", "start", "end"?, "text"} (as in .fixtures/meeting.truth.json).
       doa --preset name --angle deg [--snr dB] [--reverb gain] [--source file.wav]
                                        Simulate a source around a microphone array and estimate its
                                        direction with GCC-PHAT. Presets: \(ArrayPresetIDs.all.map(\.id).joined(separator: ", "))
@@ -238,7 +254,7 @@ func profiles(_ a: inout Arguments) async throws {
     if all.isEmpty { print("No enrolled voices.") }
     for p in all {
         let v = p.voice
-        let engine = v.preferredEngine?.rawValue ?? "default"
+        let engine = (v.preferredEngine?.rawValue ?? "default") + (v.deepgramModel.map { "/\($0)" } ?? "")
         let wer = v.calibration?.best.map { " (WER \(percent($0.wordErrorRate)))" } ?? ""
         print(
             "\(pad(p.name, 20)) accent \(pad(v.accentRegionID ?? "—", 3)) lives \(pad(v.residenceRegionID ?? "—", 3)) language \(pad(v.languageCode, 3)) engine \(pad(engine + wer, 22)) samples \(p.embeddings.count)  \(p.id.uuidString)"
@@ -281,19 +297,51 @@ func models(_ a: inout Arguments) async throws {
         guard !SpeechModelLibrary.info(kind).isCloud else { throw UsageError(cloudKeyHint) }
         try await library.delete(kind)
         print("Deleted \(SpeechModelLibrary.info(kind).displayName).")
+    case "deepgram":
+        let language = a.option("language")
+        let refresh = a.flag("refresh")
+        try a.checkUnused()
+        try await listDeepgramModels(language: language, refresh: refresh)
     case let action?:
-        throw UsageError("unknown models action “\(action)” (use download or delete)")
+        throw UsageError("unknown models action “\(action)” (use download, delete or deepgram)")
+    }
+}
+
+/// `models deepgram`: one line per model, newest families first.
+func listDeepgramModels(language: String?, refresh: Bool) async throws {
+    eprint("Fetching the Deepgram models your key can use…")
+    let catalog = try await SpeechModelLibrary.shared.deepgramModels(refresh: refresh)
+    let models = language.map { catalog.models(transcribing: $0) } ?? catalog.models
+    let source = catalog.source == .project ? "your project" : "Deepgram's public list (the key can't read its project's models)"
+    print("\(models.count) speech-to-text model(s) from \(source):")
+    for model in models {
+        let modes = model.canStream ? (model.batchLanguages.isEmpty ? "live only" : "live + files") : "files only"
+        var line = "\(pad(model.name, 26)) \(pad(model.displayName, 30)) \(pad(model.architecture, 8)) \(pad(model.version, 18)) \(pad(modes, 12))"
+        line += " \(model.languageCodes.count) language(s)"
+        if let language {
+            let live = model.transcribes(language, live: true)
+            line += live ? "  \(language): live + files" : "  \(language): files only"
+        }
+        print(line)
+        print("    \(model.languageCodes.joined(separator: " "))")
     }
 }
 
 func transcribe(_ a: inout Arguments) async throws {
     let url = try fileURL(try a.positional(0, "<file>"))
-    let kind = try a.option("engine").map(engine) ?? .cohere
+    let kind = try a.option("engine").map(engine) ?? PlatformCapabilities.current().defaultSpeechEngine
+    let truth = try a.option("truth").map(fileURL)
+    let maximumWER = try a.option("max-wer").map { raw in
+        guard let value = Double(raw) else { throw UsageError("--max-wer must be a number, got “\(raw)”") }
+        return value
+    }
+    if maximumWER != nil, truth == nil { throw UsageError("--max-wer needs --truth") }
     let language = a.option("language") ?? SessionVoices.languageCode(ofLocale: AppSettings.systemLocaleID)
+    let deepgramModel = a.option("deepgram-model")
     try a.checkUnused()
     let started = ContinuousClock.now
     let updates: [TranscriptUpdate]
-    if kind == .apple {
+    if kind == .apple, AppleSpeech.isAvailable {
         // Apple's recognizer needs a locale: the system's region when it speaks this language.
         let system = AppSettings.systemLocaleID
         let locale = SessionVoices.languageCode(ofLocale: system) == language ? system : language
@@ -305,14 +353,87 @@ func transcribe(_ a: inout Arguments) async throws {
         eprint(cloud ? "Checking the Deepgram API key…" : "Loading \(SpeechModelLibrary.info(kind).displayName)…")
         try await SpeechModelLibrary.shared.prewarm(kind)
         eprint("\(cloud ? "Checked" : "Loaded") in \(seconds(since: started)).")
+        if kind == .deepgram {
+            let choice = await SpeechModelLibrary.shared.deepgramModelChoice(deepgramModel, languageCode: language, live: false)
+            eprint("Deepgram model: \(choice.model)\(choice.fallbackReason.map { " (\($0))" } ?? "")")
+        }
         updates = try await FileTranscriber.transcribe(
-            url: url, engine: kind, languageCode: language, prompt: [], customization: nil)
+            url: url, engine: kind, languageCode: language, prompt: [], customization: nil, deepgramModel: deepgramModel)
     }
     for u in updates {
         let conf = u.confidence.map { String(format: " (%.2f)", $0) } ?? ""
         print("[\(ReportRenderer.timestamp(u.range.start))–\(ReportRenderer.timestamp(u.range.end))]\(conf) \(u.text)")
     }
     eprint("\(updates.count) line(s) by \(engineSummary(updates.map(\.engine))) in \(seconds(since: started)).")
+    if let truth {
+        let wer = WordErrorRate.compute(reference: try referenceText(truth), hypothesis: updates.map(\.text).joined(separator: " "))
+        print("WER \(percent(wer))")
+        if let maximumWER, wer > maximumWER {
+            eprint("error: word error rate \(percent(wer)) is above --max-wer \(percent(maximumWER))")
+            exit(1)
+        }
+    }
+}
+
+/// Reference transcript: a JSON array of objects with "text" (lines joined), else the file's text.
+func referenceText(_ url: URL) throws -> String {
+    struct Line: Decodable { let text: String }
+    let data = try Data(contentsOf: url)
+    if let lines = try? JSONDecoder().decode([Line].self, from: data) { return lines.map(\.text).joined(separator: " ") }
+    return String(decoding: data, as: UTF8.self)
+}
+
+func capabilities(_ a: inout Arguments) throws {
+    let json = a.flag("json")
+    try a.checkUnused()
+    let caps = PlatformCapabilities.current()
+    let library = SpeechModelLibrary.shared
+    struct Engine: Encodable {
+        let engine: SpeechEngineKind
+        let supported: Bool
+        let reason: String?
+        let downloaded: Bool
+    }
+    struct Report: Encodable {
+        let summary: String
+        let tier: String
+        let minimumMacOS: String
+        let machine: MachineInfo
+        let hasNeuralEngine: Bool
+        let appleSpeechAvailable: Bool
+        let appleIntelligence: AppleIntelligenceStatus
+        let appleIntelligenceReason: String?
+        let hasClaudeKey: Bool
+        let defaultSpeechEngine: SpeechEngineKind
+        let defaultIntelligence: IntelligenceEngineKind
+        let speechEngines: [Engine]
+        let features: [PlatformCapabilities.Feature]
+    }
+    let engines = SpeechEngineKind.allCases.map { kind in
+        let reason = caps.speechUnavailableReason(kind)
+        return Engine(engine: kind, supported: reason == nil, reason: reason, downloaded: library.isDownloaded(kind))
+    }
+    if json {
+        let report = Report(
+            summary: caps.summary, tier: caps.tierName, minimumMacOS: PlatformCapabilities.minimumMacOS,
+            machine: caps.machine, hasNeuralEngine: caps.machine.hasNeuralEngine,
+            appleSpeechAvailable: caps.appleSpeechAvailable, appleIntelligence: caps.appleIntelligence,
+            appleIntelligenceReason: caps.appleIntelligence.reason, hasClaudeKey: caps.hasClaudeKey,
+            defaultSpeechEngine: caps.defaultSpeechEngine, defaultIntelligence: caps.defaultIntelligence,
+            speechEngines: engines, features: caps.features)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        print(String(decoding: try encoder.encode(report), as: UTF8.self))
+        return
+    }
+    print(caps.summary)
+    print("CPU: \(caps.machine.cpuName) (\(caps.machine.modelIdentifier)), process \(caps.machine.processArchitecture)")
+    print("Tier: \(caps.tierName)")
+    print("Default voice model: \(caps.defaultSpeechEngine.rawValue); intelligence: \(caps.defaultIntelligence.rawValue)")
+    print("")
+    for feature in caps.features {
+        print("\(feature.isAvailable ? "✓" : "–") \(feature.name)\(feature.reason.map { " — \($0)" } ?? "")")
+    }
 }
 
 func calibrate(_ a: inout Arguments) async throws {
@@ -330,6 +451,10 @@ func calibrate(_ a: inout Arguments) async throws {
     let engineList = try a.option("engines").map { list in
         try list.split(separator: ",").map { try engine($0.trimmingCharacters(in: .whitespaces)) }
     }
+    let deepgramModels = a.option("deepgram-model").map { list in
+        list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    } ?? [Deepgram.defaultModel]
+    guard (1...3).contains(deepgramModels.count) else { throw UsageError("--deepgram-model takes one to three models") }
     guard let expected = try readingText(&a, name: name, region: area, required: true) else { return }
     try a.checkUnused()
 
@@ -341,13 +466,15 @@ func calibrate(_ a: inout Arguments) async throws {
         var loaded: [any AccurateTranscriber] = []
         for kind in engineList {
             try await ensureDownloaded(kind)
-            loaded.append(try await SpeechModelLibrary.shared.transcriber(kind))
+            for model in kind == .deepgram ? deepgramModels.map(Optional.some) : [nil] {
+                loaded.append(try await SpeechModelLibrary.shared.transcriber(kind, deepgramModel: model))
+            }
         }
         transcribers = loaded
     } else {
-        transcribers = await EnrollmentService.calibrationTranscribers(languageCode: language)
+        transcribers = await EnrollmentService.calibrationTranscribers(languageCode: language, deepgramModels: deepgramModels)
     }
-    eprint("Loaded \(transcribers.map(\.kind.rawValue).joined(separator: ", ")) in \(seconds(since: loadStarted)); transcribing…")
+    eprint("Loaded \(transcribers.map { $0.model.map { "deepgram/\($0)" } ?? $0.kind.rawValue }.joined(separator: ", ")) in \(seconds(since: loadStarted)); transcribing…")
     let profile = SpeakerProfile(name: name ?? "", embeddings: [], voice: VoiceSettings(accentRegionID: area?.id))
     let started = ContinuousClock.now
     let result = await EnrollmentService.calibrate(
@@ -377,13 +504,19 @@ func printCalibration(_ calibration: VoiceCalibration, suggestions: [TextReplace
     }
     print("Calibration (word error rate, best first):")
     for (i, s) in calibration.scores.enumerated() {
-        print("  \(i + 1). \(pad(SpeechModelLibrary.info(s.engine).displayName, 24)) \(pad(percent(s.wordErrorRate), 6))  “\(s.transcript)”")
+        print("  \(i + 1). \(pad(scoreName(s), 24)) \(pad(percent(s.wordErrorRate), 6))  “\(s.transcript)”")
     }
-    print("Best: \(SpeechModelLibrary.info(best.engine).displayName)")
+    print("Best: \(scoreName(best))")
     if !suggestions.isEmpty {
         print("Suggested corrections:")
         for r in suggestions { print("  heard “\(r.heard)” → “\(r.meant)”") }
     }
+}
+
+/// "Cohere Transcribe", "Deepgram Nova-2 Meeting".
+func scoreName(_ score: EngineScore) -> String {
+    guard score.engine == .deepgram, let model = score.model else { return SpeechModelLibrary.info(score.engine).displayName }
+    return "Deepgram \(Deepgram.modelDisplayName(model))"
 }
 
 func engine(_ raw: String) throws -> SpeechEngineKind {
@@ -458,11 +591,9 @@ func download(_ kind: SpeechEngineKind) async throws {
 func process(_ a: inout Arguments) async throws {
     let url = try fileURL(try a.positional(0, "<file>"))
     let profileStore = SpeakerProfileStore(directory: directoryURL(a.option("profiles"), default: AppPaths.default.profiles))
-    let speechEngine = try a.option("engine").map(engine) ?? .cohere
-    let intelligenceName = a.option("intelligence") ?? IntelligenceEngineKind.apple.rawValue
-    guard let intelligence = IntelligenceEngineKind(rawValue: intelligenceName) else {
-        throw UsageError("--intelligence must be apple or claude")
-    }
+    let speechEngine = try a.option("engine").map(engine) ?? PlatformCapabilities.current().defaultSpeechEngine
+    let deepgramModel = a.option("deepgram-model") ?? Deepgram.defaultModel
+    let intelligence = try intelligenceKind(a.option("intelligence"))
     let spelling = try a.option("spelling").map { raw in
         guard let s = SpellingVariant(rawValue: raw.lowercased()) else {
             throw UsageError("--spelling must be british, american or unchanged")
@@ -486,7 +617,8 @@ func process(_ a: inout Arguments) async throws {
     eprint("Processing \(url.lastPathComponent) with \(SpeechModelLibrary.info(speechEngine).displayName) and \(profiles.count) enrolled voice(s)…")
     let config = MeetingSession.Config(
         title: title, kind: .inPerson, localeID: locale, autoLanguage: autoLanguage, engineKind: intelligence,
-        speechEngine: speechEngine, spelling: spelling, recordAudio: false, meetingsDirectory: meetingsDir,
+        speechEngine: speechEngine, deepgramModel: deepgramModel, spelling: spelling, recordAudio: false,
+        meetingsDirectory: meetingsDir,
         liveAnalysis: analysis)
     let started = ContinuousClock.now
     let meeting = try await MeetingSession.processFile(url: url, config: config, profiles: profiles)
@@ -494,7 +626,7 @@ func process(_ a: inout Arguments) async throws {
         "Done in \(seconds(since: started)): \(meeting.segments.count) lines, \(meeting.participants.count) participant(s); saved to \(meetingsDir.appending(path: meeting.id.uuidString).path)"
     )
     eprint("Lines by engine: \(engineSummary(meeting.segments.map(\.engine)))")
-    if meeting.report == nil { eprint("No report was written (no intelligence engine available or it failed).") }
+    if meeting.report == nil { eprint("No report was written (the intelligence engine failed).") }
 
     let markdown = ReportRenderer.markdown(meeting)
     if let out {
@@ -508,6 +640,64 @@ func process(_ a: inout Arguments) async throws {
         eprint("Meeting JSON written to \(json)")
     }
     if let truth { try scoreSpeakers(meeting, truth: truth) }
+}
+
+/// `apple`, `claude` or `outline` (the transcript outline without AI); nil is `apple`.
+func intelligenceKind(_ raw: String?) throws -> IntelligenceEngineKind {
+    switch raw?.lowercased() {
+    case nil, "apple": .apple
+    case "claude": .claude
+    case "outline", "transcriptoutline", "none": .transcriptOutline
+    default: throw UsageError("--intelligence must be apple, claude or outline")
+    }
+}
+
+/// Writes the report for a transcript file, timing it.
+@MainActor
+func report(_ a: inout Arguments) async throws {
+    struct Line: Decodable {
+        var speaker: String
+        var start: Double
+        var end: Double?
+        var text: String
+    }
+    let url = try fileURL(try a.positional(0, "<transcript.json>"))
+    let kind = try intelligenceKind(a.option("intelligence"))
+    let title = a.option("title")
+    let out = a.option("out")
+    try a.checkUnused()
+
+    let lines = try JSONDecoder().decode([Line].self, from: Data(contentsOf: url))
+    var participants: [Participant] = []
+    for (i, name) in lines.map(\.speaker).enumerated() where !participants.contains(where: { $0.id == name }) {
+        participants.append(Participant(id: name, displayName: name, channel: .microphone, colorIndex: i))
+    }
+    for i in participants.indices {
+        participants[i].speakingTime = lines.filter { $0.speaker == participants[i].id }.reduce(0) { $0 + max(0, ($1.end ?? $1.start) - $1.start) }
+    }
+    let segments = lines.map { line in
+        TranscriptSegment(
+            channel: .microphone, speakerKey: line.speaker, range: TimeRange(start: line.start, end: line.end ?? line.start),
+            text: line.text, confidence: nil, localeID: "en")
+    }
+    let start = Date()
+    var meeting = Meeting(
+        title: title ?? url.deletingPathExtension().lastPathComponent, kind: .inPerson, startedAt: start,
+        endedAt: start.addingTimeInterval(lines.map { $0.end ?? $0.start }.max() ?? 0), participants: participants,
+        segments: segments, localeIDs: ["en"])
+    let choice = ReportWriter.engine(preferring: kind)
+    if choice.isFallback { eprint("The requested engine is unavailable; using \(choice.engine.engineName).") }
+    eprint("Writing the report for \(lines.count) lines with \(choice.engine.engineName)…")
+    let started = ContinuousClock.now
+    meeting.report = try await ReportWriter.report(for: meeting, engine: choice.engine, title: title)
+    eprint("Report written in \(seconds(since: started)).")
+    let markdown = ReportRenderer.markdown(meeting)
+    if let out {
+        try markdown.write(to: URL(fileURLWithPath: (out as NSString).expandingTildeInPath), atomically: true, encoding: .utf8)
+        eprint("Report written to \(out)")
+    } else {
+        print(markdown)
+    }
 }
 
 /// One ground-truth turn from `MakeFixtures.swift`.
@@ -667,6 +857,8 @@ let commandFlags: [String: Set<String>] = [
     "enroll": ["standard"],
     "calibrate": ["standard", "regions"],
     "process": ["no-analysis", "no-auto-language"],
+    "models": ["refresh"],
+    "capabilities": ["json"],
 ]
 
 let argv = CommandLine.arguments.dropFirst()
@@ -682,6 +874,7 @@ do {
         exit(0)
     }
     switch command {
+    case "capabilities": try capabilities(&args)
     case "devices": try devices(&args)
     case "detect": try await detect(&args)
     case "enroll": try await enroll(&args)
@@ -690,6 +883,7 @@ do {
     case "transcribe": try await transcribe(&args)
     case "calibrate": try await calibrate(&args)
     case "process": try await process(&args)
+    case "report": try await report(&args)
     case "doa": try doa(&args)
     case "system-audio": try await systemAudio(&args)
     default: throw UsageError("unknown command “\(command)”")

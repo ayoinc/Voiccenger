@@ -1,6 +1,5 @@
 import AVFAudio
 import Foundation
-import Synchronization
 import VCModels
 
 /// Plays a file into the pipeline. realtime=false emits as fast as consumed (tests/CLI). Multichannel files populate channelSamples.

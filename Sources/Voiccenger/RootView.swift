@@ -4,6 +4,7 @@ import VCPipeline
 struct RootView: View {
     @Environment(MeetingCoordinator.self) private var coordinator
     @Environment(NavigationModel.self) private var navigation
+    @Environment(AppSettings.self) private var settings
 
     var body: some View {
         @Bindable var navigation = navigation
@@ -44,6 +45,9 @@ struct RootView: View {
             item: Binding(get: { coordinator.pendingRecording }, set: { if $0 == nil { coordinator.cancelPendingRecording() } })
         ) { _ in
             RecordingConsentSheet()
+        }
+        .sheet(isPresented: Binding(get: { !settings.capabilitiesReviewed }, set: { if !$0 { settings.capabilitiesReviewed = true } })) {
+            CapabilitiesView(isFirstRun: true) { settings.capabilitiesReviewed = true }
         }
         .alert(
             "Something went wrong",

@@ -174,8 +174,21 @@ jobs:
           else
             NOTE="Ad-hoc signed: on first launch, right-click the app and choose Open."
           fi
-          gh release create "v$VERSION" "${FLAGS[@]}" \
-            --notes "**Install:** open the DMG and drag Voiccenger to Applications. $NOTE Installed copies update themselves via **Voiccenger › Check for Updates…**." \
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          **Install:** open the DMG and drag Voiccenger to Applications. $NOTE Installed copies update themselves via **Voiccenger › Check for Updates…**.
+
+          **Requirements:** macOS 14.4 or later, Apple silicon or Intel (one universal app). Macs on macOS 14.3 or earlier can't open it.
+
+          | Your Mac | What you get |
+          |---|---|
+          | macOS 26, Apple silicon, Apple Intelligence on | Everything: Cohere/Whisper on the Neural Engine, Apple Speech's instant live text, Apple Intelligence summaries and live insights |
+          | macOS 26, Apple silicon, Apple Intelligence off or unsupported | As above; reports from Claude (your key) or the transcript outline (no AI) |
+          | macOS 14.4 – 15, Apple silicon | Cohere or Whisper refining Apple Speech (classic) live text, shown every couple of seconds; reports from Claude or the transcript outline |
+          | Intel, macOS 14.4 or later | Apple Speech (classic, built in; less accurate) or Deepgram with your key — Cohere and Whisper need Apple silicon; reports from Claude or the transcript outline |
+
+          The first launch shows **What this Mac can do** (also in Settings › General).
+          EOF
+          gh release create "v$VERSION" "${FLAGS[@]}" --notes-file "$RUNNER_TEMP/notes.md" \
             "dist/Voiccenger-$VERSION.dmg" "dist/Voiccenger-$VERSION.dmg.sha256" dist/appcast.xml
           echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$VERSION" >>"$GITHUB_STEP_SUMMARY"
 

@@ -4,6 +4,8 @@ import VCModels
 public enum IntelligenceEngineKind: String, Codable, Sendable, CaseIterable {
     case apple
     case claude
+    /// No language model: an outline extracted from the transcript. Runs on every Mac.
+    case transcriptOutline
 }
 
 public enum IntelligenceFactory {
@@ -14,9 +16,11 @@ public enum IntelligenceFactory {
     public static func make(kind: IntelligenceEngineKind) -> (any MeetingIntelligence)? {
         switch kind {
         case .apple:
-            AppleIntelligenceEngine.isAvailable ? AppleIntelligenceEngine() : nil
+            if #available(macOS 26.0, *), AppleIntelligenceStatus.current.isAvailable { AppleIntelligenceEngine() } else { nil }
         case .claude:
             anthropicAPIKey().map { ClaudeEngine(apiKey: $0) }
+        case .transcriptOutline:
+            TranscriptOutlineEngine()
         }
     }
 

@@ -1,6 +1,5 @@
 import Accelerate
 import Foundation
-import Synchronization
 import VCModels
 
 /// Frame-energy voice activity detector with an adaptive noise floor. Pure value type.

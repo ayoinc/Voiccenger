@@ -8,11 +8,20 @@ import VCModels
 /// The model's context window is small (4,096 tokens on macOS 26), so reports over long transcripts are
 /// built map-reduce: notes per transcript chunk, then merges of those notes until one set remains.
 /// Whenever the model reports that a request overflowed its window, the request is shrunk and retried.
+@available(macOS 26.0, *)
 public final class AppleIntelligenceEngine: MeetingIntelligence {
-    /// Upper bound for transcript tokens (estimated by `TokenEstimator`) in one report request.
+    /// Upper bound for transcript tokens in one notes request (summary or lists).
     static let maximumTranscriptBudget = 2_000
-    /// Tokens kept free for the answer of a report or merge request.
-    static let reportResponseReserve = 1_200
+    /// Tokens kept free for the answer of a summary request (detailed overview, topics, participants).
+    static let summaryResponseReserve = 1_300
+    /// Tokens kept free for the answer of a lists request.
+    static let listsResponseReserve = 1_100
+    /// Tokens kept free for the answer of a merge request (title, up to eight topics, a multi-paragraph overview).
+    static let mergeResponseReserve = 1_400
+    /// Upper bound for transcript tokens in one outline request: its answer restates every chunk in detail.
+    static let maximumOutlineBudget = 1_500
+    /// Tokens kept free for the answer of an outline request (four segments of six points).
+    static let outlineResponseReserve = 1_500
     /// Upper bound for recent-context tokens in one live-analysis request.
     static let maximumContextBudget = 1_200
     /// Below this, a report request cannot carry enough transcript to be worth sending.
@@ -32,22 +41,9 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
         transcriptBudgetOverride = transcriptTokenBudget
     }
 
-    public static var isAvailable: Bool { SystemLanguageModel.default.isAvailable }
+    public static var isAvailable: Bool { AppleIntelligenceStatus.current.isAvailable }
 
-    public static var unavailableReason: String? {
-        switch SystemLanguageModel.default.availability {
-        case .available:
-            nil
-        case .unavailable(.deviceNotEligible):
-            "This Mac does not support Apple Intelligence."
-        case .unavailable(.appleIntelligenceNotEnabled):
-            "Apple Intelligence is turned off. Turn it on in System Settings › Apple Intelligence & Siri."
-        case .unavailable(.modelNotReady):
-            "The Apple Intelligence model is still downloading or preparing. Try again later."
-        case .unavailable:
-            "Apple Intelligence is not available right now."
-        }
-    }
+    public static var unavailableReason: String? { AppleIntelligenceStatus.current.reason }
 
     private static var generationOptions: GenerationOptions {
         // The macOS 27 SDK (Swift 6.4) renamed `sampling:` to `samplingMode:`.
@@ -79,41 +75,91 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
 
     // MARK: Report
 
+    /// The report in three kinds of requests over the transcript, run side by side: the summary (title, overview,
+    /// topics, participants) and the lists (decisions, action items and the rest) — one request each, or per chunk
+    /// and then merged — and the conversation outline, one request per chunk, every chunk's outline kept as written.
     public func report(transcript: [ContextLine], participants: [String], meetingTitle: String?) async throws -> MeetingReport {
         try Self.requireAvailable()
         let participants = TranscriptFormatter.speakingParticipants(participants, transcript: transcript)
-        let notes: RawReport
+        var notes: RawReport
         if transcript.isEmpty {
             notes = RawReport(overview: "No speech was transcribed.")
         } else {
             let budget = await transcriptBudget()
-            notes = try await reportNotes(
+            let mergeBudget = await mergeBudget()
+            let outlineTokens = await outlineBudget()
+            async let written = reportNotes(
                 transcript: transcript, participants: participants, meetingTitle: meetingTitle,
-                budget: budget, mergeBudget: await windowBudget())
+                budget: budget, mergeBudget: mergeBudget)
+            async let outlined = outline(
+                NumberedLine.numbering(transcript), participants: participants, meetingTitle: meetingTitle, budget: outlineTokens)
+            notes = try await written
+            notes.outline = try await outlined
         }
         return ResultAssembler.report(
             from: notes, transcript: transcript, participants: participants, meetingTitle: meetingTitle, generatedBy: engineName)
     }
 
-    /// One pass when the whole transcript fits `budget`, map-reduce otherwise. Lines are numbered over the whole
-    /// meeting so every request cites the same `L` numbers. `mergeBudget` bounds the notes sent to one merge
-    /// request; it comes from the context window, not from the transcript budget.
+    /// Notes in one pass when the whole transcript fits `budget`, map-reduce otherwise: notes per chunk, then the
+    /// parts' summaries (title, overview, topics) merged by the model while their lists and participant points are
+    /// joined as they are. Lines are numbered over the whole meeting so every request cites the same `L` numbers.
+    /// `mergeBudget` bounds the summaries sent to one merge request; it comes from the context window, not from
+    /// the transcript budget.
     func reportNotes(
         transcript: [ContextLine], participants: [String], meetingTitle: String?, budget initialBudget: Int, mergeBudget: Int
     ) async throws -> RawReport {
         var budget = initialBudget
         let numbered = NumberedLine.numbering(transcript)
         let lines = TranscriptChunker.splitLongLines(numbered, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))
-        if lines.reduce(0, { $0 + TranscriptChunker.defaultCost($1) }) <= budget {
-            let prompt = IntelligencePrompts.reportPrompt(transcript: lines, participants: participants, meetingTitle: meetingTitle)
+        if await Self.fits(lines, budget: budget) {
             do {
-                return try await Self.generate(GenNotes.self, instructions: IntelligencePrompts.reportInstructions, prompt: prompt).raw
+                return try await notes(lines, participants: participants, meetingTitle: meetingTitle, part: nil)
             } catch let error where Self.isContextOverflow(error) {
                 budget = try Self.shrunk(budget)
             }
         }
         let parts = try await partNotes(numbered, participants: participants, meetingTitle: meetingTitle, budget: budget)
-        return try await merged(parts, participants: participants, meetingTitle: meetingTitle, budget: max(mergeBudget, budget))
+        let summary = try await merged(parts.map(ReportNotes.summary), participants: participants, meetingTitle: meetingTitle, budget: mergeBudget)
+        return ReportNotes.joined(parts, summary: summary)
+    }
+
+    /// Notes on `lines` (the meeting, or `part` of it) from a summary request and a lists request, run side by side.
+    /// The overview has two to four paragraphs for a whole meeting with substance, one or two for a part (the merge
+    /// writes the meeting's), and one for a thin meeting.
+    func notes(_ lines: [NumberedLine], participants: [String], meetingTitle: String?, part: (index: Int, count: Int)?) async throws -> RawReport {
+        let prompt = IntelligencePrompts.reportPrompt(transcript: lines, participants: participants, meetingTitle: meetingTitle, part: part)
+        let paragraphs: ClosedRange<Int> =
+            (part?.count ?? 1) > 1 ? 1...2 : ReportShape(Grounding.substance(lines.map(\.line))).isThin ? 1...1 : 2...4
+        async let summary = Self.generate(
+            GenSummary.self, schema: GenSummary.schema(paragraphs: paragraphs), instructions: IntelligencePrompts.summaryInstructions, prompt: prompt)
+        async let lists = Self.generate(GenLists.self, instructions: IntelligencePrompts.listsInstructions, prompt: prompt)
+        let (written, listed) = try await (summary, lists)
+        return listed.notes(with: written)
+    }
+
+    /// Outline map step: the outline of each consecutive chunk, concatenated in order and never merged or
+    /// compacted, so a long meeting keeps all its detail. A chunk that overflows is retried smaller.
+    func outline(_ transcript: [NumberedLine], participants: [String], meetingTitle: String?, budget initialBudget: Int) async throws -> [RawOutlineSegment] {
+        var budget = initialBudget
+        var remaining = TranscriptChunker.splitLongLines(transcript, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
+        var segments: [RawOutlineSegment] = []
+        var done = 0
+        while !remaining.isEmpty {
+            let chunks = await Self.fits(Array(remaining), budget: budget)
+                ? [Array(remaining)] : TranscriptChunker.balancedChunk(Array(remaining), tokenBudget: budget)
+            let chunk = chunks[0]
+            let prompt = IntelligencePrompts.reportPrompt(
+                transcript: chunk, participants: participants, meetingTitle: meetingTitle, part: (index: done, count: done + chunks.count))
+            do {
+                segments += try await Self.generate(GenOutline.self, instructions: IntelligencePrompts.outlineInstructions, prompt: prompt).raw
+                done += 1
+                remaining = remaining.dropFirst(chunk.count)
+            } catch let error where Self.isContextOverflow(error) {
+                budget = try Self.shrunk(budget)
+                remaining = TranscriptChunker.splitLongLines(Array(remaining), maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
+            }
+        }
+        return segments
     }
 
     /// Map step: notes for consecutive chunks. A chunk that overflows is retried smaller; finished parts are kept.
@@ -122,13 +168,11 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
         var remaining = TranscriptChunker.splitLongLines(transcript, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
         var parts: [RawReport] = []
         while !remaining.isEmpty {
-            let chunks = TranscriptChunker.chunk(Array(remaining), tokenBudget: budget)
+            let chunks = TranscriptChunker.balancedChunk(Array(remaining), tokenBudget: budget)
             let chunk = chunks[0]
-            let prompt = IntelligencePrompts.reportPrompt(
-                transcript: chunk, participants: participants, meetingTitle: meetingTitle,
-                part: (index: parts.count, count: parts.count + chunks.count))
             do {
-                parts.append(try await Self.generate(GenNotes.self, instructions: IntelligencePrompts.partNotesInstructions, prompt: prompt).raw)
+                parts.append(try await notes(
+                    chunk, participants: participants, meetingTitle: meetingTitle, part: (index: parts.count, count: parts.count + chunks.count)))
                 remaining = remaining.dropFirst(chunk.count)
             } catch let error where Self.isContextOverflow(error) {
                 budget = try Self.shrunk(budget)
@@ -138,8 +182,18 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
         return parts
     }
 
-    /// Reduce step: merges notes in groups that fit `budget` until a single set remains. Notes too large to
-    /// share a request are compacted first; a merge that overflows is retried on compacted notes.
+    /// Whether `lines` fit `budget` transcript tokens: by the estimate, or else (macOS 26.4 and later) by the
+    /// model's own count, since the estimate runs about 20% high and the budget itself comes from exact counts.
+    static func fits(_ lines: [NumberedLine], budget: Int) async -> Bool {
+        if lines.reduce(0, { $0 + TranscriptChunker.defaultCost($1) }) <= budget { return true }
+        if #available(macOS 26.4, *), let exact = try? await SystemLanguageModel.default.tokenCount(for: TranscriptFormatter.format(lines)) {
+            return exact <= budget
+        }
+        return false
+    }
+
+    /// Reduce step: merges part summaries in groups that fit `budget` until one remains. Summaries too large to
+    /// share a request are compacted first; a merge that overflows is retried on compacted summaries.
     func merged(_ parts: [RawReport], participants: [String], meetingTitle: String?, budget: Int) async throws -> RawReport {
         var level = parts
         while level.count > 1 {
@@ -173,7 +227,9 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
             let prompt = IntelligencePrompts.mergePrompt(
                 renderedNotes: group.map(ReportNotes.render), participants: participants, meetingTitle: meetingTitle)
             do {
-                return try await Self.generate(GenNotes.self, instructions: IntelligencePrompts.mergeNotesInstructions, prompt: prompt).raw
+                return try await Self.generate(
+                    GenSummary.self, schema: GenSummary.mergeSchema, instructions: IntelligencePrompts.mergeSummaryInstructions, prompt: prompt
+                ).raw
             } catch let error where Self.isContextOverflow(error) {
                 let smaller = group.map { ReportNotes.compacted($0) }
                 guard smaller.contains(where: { $0 != nil }) else { throw IntelligenceError.contextWindowExceeded }
@@ -184,25 +240,51 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
 
     // MARK: Budgets
 
-    /// Transcript tokens per report request: the window-derived budget unless an override forces smaller requests.
+    /// Transcript tokens per notes request: the window-derived budget unless an override forces smaller requests.
     func transcriptBudget() async -> Int {
         if let transcriptBudgetOverride { return transcriptBudgetOverride }
         return await windowBudget()
     }
 
-    /// Input tokens one report or merge request can carry: what the window leaves after instructions, schema and answer.
+    /// Transcript tokens a summary request and a lists request can both carry: what the window leaves after each
+    /// one's instructions, schema and answer.
     func windowBudget() async -> Int {
-        let model = SystemLanguageModel.default
-        var overhead = TokenEstimator.estimate(IntelligencePrompts.reportInstructions) + 900
+        let summary = await Self.overhead(IntelligencePrompts.summaryInstructions, GenSummary.generationSchema, estimatedSchema: 470)
+            + Self.summaryResponseReserve
+        let lists = await Self.overhead(IntelligencePrompts.listsInstructions, GenLists.generationSchema, estimatedSchema: 740)
+            + Self.listsResponseReserve
+        let available = SystemLanguageModel.default.contextSize - max(summary, lists)
+        return min(Self.maximumTranscriptBudget, max(Self.minimumTranscriptBudget, available))
+    }
+
+    /// Rendered part summaries one merge request can carry.
+    func mergeBudget() async -> Int {
+        let overhead = await Self.overhead(IntelligencePrompts.mergeSummaryInstructions, GenSummary.mergeSchema, estimatedSchema: 350)
+        let available = SystemLanguageModel.default.contextSize - overhead - Self.mergeResponseReserve
+        return min(Self.maximumTranscriptBudget, max(Self.minimumTranscriptBudget, available))
+    }
+
+    /// Transcript tokens per outline request: what the window leaves after the outline instructions, schema and
+    /// answer, at most `maximumOutlineBudget` (and at most a forced transcript budget).
+    func outlineBudget() async -> Int {
+        let overhead = await Self.overhead(IntelligencePrompts.outlineInstructions, GenOutline.generationSchema, estimatedSchema: 350)
+        let available = SystemLanguageModel.default.contextSize - overhead - Self.outlineResponseReserve
+        let budget = min(Self.maximumOutlineBudget, max(Self.minimumTranscriptBudget, available))
+        return transcriptBudgetOverride.map { min($0, budget) } ?? budget
+    }
+
+    /// Tokens of a request's instructions and schema plus the prompt header: counted by the model on macOS 26.4 and
+    /// later, else estimated (`estimatedSchema` is the schema's count measured on macOS 26.4).
+    static func overhead(_ instructions: String, _ schema: GenerationSchema, estimatedSchema: Int) async -> Int {
         if #available(macOS 26.4, *) {
-            if let instructions = try? await model.tokenCount(for: Instructions(IntelligencePrompts.partNotesInstructions)),
-                let schema = try? await model.tokenCount(for: GenNotes.generationSchema)
+            let model = SystemLanguageModel.default
+            if let instructionTokens = try? await model.tokenCount(for: Instructions(instructions)),
+                let schemaTokens = try? await model.tokenCount(for: schema)
             {
-                overhead = instructions + schema + 100
+                return instructionTokens + schemaTokens + 100
             }
         }
-        let available = model.contextSize - overhead - Self.reportResponseReserve
-        return min(Self.maximumTranscriptBudget, max(Self.minimumTranscriptBudget, available))
+        return TokenEstimator.estimate(instructions) + estimatedSchema + 100
     }
 
     private static func shrunk(_ budget: Int) throws -> Int {
@@ -230,10 +312,14 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
         if let reason = unavailableReason { throw IntelligenceError.unavailable(reason) }
     }
 
-    private static func generate<Content: Generable>(_ type: Content.Type, instructions: String, prompt: String) async throws -> Content {
+    /// One request in a fresh session, answered in `schema` (by default `Content`'s own).
+    private static func generate<Content: Generable>(
+        _ type: Content.Type, schema: GenerationSchema = Content.generationSchema, instructions: String, prompt: String
+    ) async throws -> Content {
         let session = LanguageModelSession(instructions: instructions)
         do {
-            return try await session.respond(to: prompt, generating: type, includeSchemaInPrompt: true, options: generationOptions).content
+            let content = try await session.respond(to: prompt, schema: schema, includeSchemaInPrompt: true, options: generationOptions).content
+            return try Content(content)
         } catch {
             throw mapped(error)
         }

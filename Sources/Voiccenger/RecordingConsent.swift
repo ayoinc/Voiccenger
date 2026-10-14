@@ -48,14 +48,19 @@ struct RecordingConsentSheet: View {
     }
 
     private var privacyNote: String {
+        // Classic Apple Speech makes the live text before macOS 26 and on Intel; for some languages it runs on
+        // Apple's servers.
+        let apple = AppleSpeech.usesClassic && !ClassicSpeech.isOnDevice(localeID: coordinator.settings.localeID)
+            ? "Audio is sent to Apple's servers for live transcription, because this Mac can't recognise \(Format.localeName(coordinator.settings.localeID)) on the device. "
+            : ""
         let claude = coordinator.settings.engine == .claude
         if coordinator.sendsAudioToDeepgram {
             let analysis = claude ? " Transcript text is sent to Anthropic for analysis because Claude is selected in Settings › Intelligence." : ""
-            return "Audio is sent to Deepgram for transcription, because Deepgram is the voice model for this meeting or for someone in it. Recordings and transcripts are saved on this Mac.\(analysis)"
+            return apple + "Audio is sent to Deepgram for transcription, because Deepgram is the voice model for this meeting or for someone in it. Recordings and transcripts are saved on this Mac.\(analysis)"
         }
         if claude {
-            return "Audio and transcripts are saved on this Mac. Transcript text is sent to Anthropic for analysis because Claude is selected in Settings › Intelligence."
+            return apple + "Audio and transcripts are saved on this Mac. Transcript text is sent to Anthropic for analysis because Claude is selected in Settings › Intelligence."
         }
-        return "Audio and transcripts stay on this Mac."
+        return apple.isEmpty ? "Audio and transcripts stay on this Mac." : apple + "Recordings and transcripts are saved on this Mac."
     }
 }

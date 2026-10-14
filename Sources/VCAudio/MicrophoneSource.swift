@@ -2,7 +2,6 @@ import AVFAudio
 import AudioToolbox
 import CoreAudio
 import Foundation
-import Synchronization
 import VCModels
 
 /// AVAudioEngine input. When `arrayGeometry` is set, chunks carry `channelSamples` (raw de-interleaved, device channel order) for DOA.

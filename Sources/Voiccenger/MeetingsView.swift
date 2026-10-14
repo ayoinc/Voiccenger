@@ -134,6 +134,8 @@ private struct MeetingDetailView: View {
     @ViewState private var renamingTitle = false
     @ViewState private var newTitle = ""
     @ViewState private var confirmingDelete = false
+    /// Session time to scroll the transcript to, set by a timestamp in the report.
+    @ViewState private var transcriptTarget: TimeInterval?
 
     private var meeting: Meeting? { coordinator.meetings.first { $0.id == meetingID } }
 
@@ -172,8 +174,12 @@ private struct MeetingDetailView: View {
     @ViewBuilder
     private func content(_ meeting: Meeting) -> some View {
         switch tab {
-        case .report: ReportView(meeting: meeting)
-        case .transcript: SavedTranscriptView(meeting: meeting)
+        case .report:
+            ReportView(meeting: meeting) { time in
+                transcriptTarget = time
+                tab = .transcript
+            }
+        case .transcript: SavedTranscriptView(meeting: meeting, target: $transcriptTarget)
         case .participants: ParticipantsTable(meeting: meeting)
         }
     }
@@ -243,6 +249,8 @@ private struct MeetingDetailView: View {
 private struct ReportView: View {
     @Environment(MeetingCoordinator.self) private var coordinator
     let meeting: Meeting
+    /// Shows the transcript at a session time (a timestamp in the report was clicked).
+    let showInTranscript: (TimeInterval) -> Void
 
     var body: some View {
         if let report = meeting.report {
@@ -253,80 +261,30 @@ private struct ReportView: View {
                         Text("Written by \(report.generatedBy) · \(report.generatedAt.formatted(date: .abbreviated, time: .shortened))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if report.kind == .transcriptOutline {
+                            Label {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Not written by AI").font(.headline)
+                                    Text(ReportRenderer.transcriptOutlineNote).foregroundStyle(.secondary)
+                                }
+                            } icon: {
+                                Image(systemName: "text.quote")
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                            .padding(.vertical, 6)
+                        }
                         if !report.overview.isEmpty {
                             Text(report.overview).font(.title3)
                         }
                     }
-                    if !report.topics.isEmpty {
-                        ReportSection("Topics", symbol: "text.bubble") {
-                            ForEach(Array(report.topics.enumerated()), id: \.offset) { _, topic in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(topic.title).font(.headline)
-                                    Text(topic.summary)
-                                    if !topic.speakers.isEmpty {
-                                        Text(topic.speakers.formatted(.list(type: .and)))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    BulletSection("Decisions", symbol: "checkmark.seal", items: report.decisions)
-                    if !report.actionItems.isEmpty {
-                        ReportSection("Action Items", symbol: "checklist") {
-                            ForEach(report.actionItems) { item in
-                                Label {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.task)
-                                        let meta = [item.owner, item.due].compactMap { $0?.trimmedNonEmpty }
-                                        if !meta.isEmpty {
-                                            Text(meta.joined(separator: " · "))
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                } icon: {
-                                    Image(systemName: "circle")
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                    BulletSection("Notes to Remember", symbol: "pin", items: report.notesToRemember)
-                    BulletSection("Could Have Been Said", symbol: "lightbulb", items: report.missedOpportunities)
-                    BulletSection("Open Questions", symbol: "questionmark.bubble", items: report.openQuestions)
-                    if !report.corrections.isEmpty {
-                        ReportSection("Corrections", symbol: "pencil.and.scribble") {
-                            ForEach(Array(report.corrections.enumerated()), id: \.offset) { _, c in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("\(c.speaker): “\(c.original)”")
-                                        .foregroundStyle(.secondary)
-                                        .strikethrough()
-                                    Text("“\(c.corrected)”")
-                                    if !c.reason.isEmpty {
-                                        Text(c.reason).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !report.participantSummaries.isEmpty {
-                        ReportSection("Participants", symbol: "person.2") {
-                            ForEach(Array(report.participantSummaries.enumerated()), id: \.offset) { _, summary in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack(spacing: 6) {
-                                        if let p = meeting.participants.first(where: { $0.displayName == summary.name }) {
-                                            ParticipantDot(colorIndex: p.colorIndex)
-                                        }
-                                        Text(summary.name).font(.headline)
-                                    }
-                                    ForEach(summary.keyPoints, id: \.self) { point in
-                                        Text("• \(point)")
-                                    }
-                                }
-                            }
-                        }
+                    if report.kind == .transcriptOutline {
+                        OutlineSection("Transcript Outline (no AI)", segments: report.outline, meeting: meeting, showInTranscript: showInTranscript)
+                        BulletSection("Questions Asked", symbol: "questionmark.bubble", items: report.openQuestions)
+                        ActionItemsSection("Possible Action Items", items: report.actionItems)
+                    } else {
+                        languageModelSections(report)
                     }
                 }
                 .frame(maxWidth: 760, alignment: .leading)
@@ -351,6 +309,179 @@ private struct ReportView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func languageModelSections(_ report: MeetingReport) -> some View {
+        if !report.topics.isEmpty {
+            ReportSection("Topics", symbol: "text.bubble") {
+                ForEach(Array(report.topics.enumerated()), id: \.offset) { _, topic in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(topic.title).font(.headline)
+                        Text(topic.summary)
+                        if !topic.speakers.isEmpty {
+                            Text(topic.speakers.formatted(.list(type: .and)))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        BulletSection("Decisions", symbol: "checkmark.seal", items: report.decisions)
+        ActionItemsSection("Action Items", items: report.actionItems)
+        BulletSection("Notes to Remember", symbol: "pin", items: report.notesToRemember)
+        BulletSection("Could Have Been Said", symbol: "lightbulb", items: report.missedOpportunities)
+        BulletSection("Open Questions", symbol: "questionmark.bubble", items: report.openQuestions)
+        if !report.corrections.isEmpty {
+            ReportSection("Corrections", symbol: "pencil.and.scribble") {
+                ForEach(Array(report.corrections.enumerated()), id: \.offset) { _, c in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(c.speaker): “\(c.original)”")
+                            .foregroundStyle(.secondary)
+                            .strikethrough()
+                        Text("“\(c.corrected)”")
+                        if !c.reason.isEmpty {
+                            Text(c.reason).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        if !report.participantSummaries.isEmpty {
+            ReportSection("Participants", symbol: "person.2") {
+                ForEach(Array(report.participantSummaries.enumerated()), id: \.offset) { _, summary in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            if let p = meeting.participants.first(where: { $0.displayName == summary.name }) {
+                                ParticipantDot(colorIndex: p.colorIndex)
+                            }
+                            Text(summary.name).font(.headline)
+                        }
+                        ForEach(summary.keyPoints, id: \.self) { point in
+                            Text("• \(point)")
+                        }
+                    }
+                }
+            }
+        }
+        OutlineSection("Conversation Outline", segments: report.outline, meeting: meeting, showInTranscript: showInTranscript)
+    }
+}
+
+private struct ActionItemsSection: View {
+    let title: String
+    let items: [ActionItem]
+
+    init(_ title: String, items: [ActionItem]) {
+        self.title = title
+        self.items = items
+    }
+
+    var body: some View {
+        if !items.isEmpty {
+            ReportSection(title, symbol: "checklist") {
+                ForEach(items) { item in
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.task)
+                            let meta = [item.owner, item.due].compactMap { $0?.trimmedNonEmpty }
+                            if !meta.isEmpty {
+                                Text(meta.joined(separator: " · "))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    } icon: {
+                        Image(systemName: "circle")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The conversation outline: one disclosure group per segment (open at first unless the outline is long), headed by
+/// its time range and heading; each point shows its speaker and when it was said. Timestamps show that moment in
+/// the transcript.
+private struct OutlineSection: View {
+    let title: String
+    let segments: [OutlineSegment]
+    let meeting: Meeting
+    let showInTranscript: (TimeInterval) -> Void
+    @ViewState private var collapsed: Set<Int>
+
+    /// Up to this many segments start open; a longer outline starts as a list of headings.
+    private static let openSegments = 8
+
+    init(_ title: String, segments: [OutlineSegment], meeting: Meeting, showInTranscript: @escaping (TimeInterval) -> Void) {
+        self.title = title
+        self.segments = segments
+        self.meeting = meeting
+        self.showInTranscript = showInTranscript
+        _collapsed = ViewState(initialValue: segments.count > Self.openSegments ? Set(segments.indices) : [])
+    }
+
+    var body: some View {
+        if !segments.isEmpty {
+            ReportSection(title, symbol: "list.bullet.indent") {
+                Button(collapsed.isEmpty ? "Collapse All" : "Expand All") {
+                    collapsed = collapsed.isEmpty ? Set(segments.indices) : []
+                }
+                .buttonStyle(.link)
+                .font(.callout)
+                ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+                    DisclosureGroup(isExpanded: expanded(index)) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if segment.isExtracted, meeting.report?.kind == .languageModel {
+                                Text(ReportRenderer.extractedSegmentNote)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(Array(segment.points.enumerated()), id: \.offset) { _, point in
+                                pointRow(point)
+                            }
+                        }
+                        .padding(.top, 4)
+                        .padding(.leading, 4)
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            timestampButton(ReportRenderer.timeRange(segment.start, segment.end), time: segment.start)
+                            Text(segment.heading).font(.headline)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func expanded(_ index: Int) -> Binding<Bool> {
+        Binding(
+            get: { !collapsed.contains(index) },
+            set: { open in
+                if open { collapsed.remove(index) } else { collapsed.insert(index) }
+            })
+    }
+
+    private func pointRow(_ point: OutlinePoint) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if let p = meeting.participants.first(where: { $0.displayName == point.speaker }) {
+                ParticipantDot(colorIndex: p.colorIndex, size: 8)
+            }
+            Text("\(Text(point.speaker).bold()): \(point.isQuote ? "“\(point.text)”" : point.text)")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            timestampButton(ReportRenderer.timestamp(point.time), time: point.time)
+                .font(.caption)
+        }
+    }
+
+    private func timestampButton(_ label: String, time: TimeInterval) -> some View {
+        Button(label) { showInTranscript(time) }
+            .buttonStyle(.link)
+            .monospacedDigit()
+            .help("Show in the transcript")
+            .accessibilityLabel("Show \(label) in the transcript")
     }
 }
 
@@ -399,9 +530,12 @@ private struct BulletSection: View {
 
 // MARK: - Transcript tab
 
+/// The saved transcript, searchable. `target` scrolls to the line said at that session time and highlights it.
 private struct SavedTranscriptView: View {
     let meeting: Meeting
+    @Binding var target: TimeInterval?
     @ViewState private var search = ""
+    @ViewState private var highlighted: UUID?
 
     private var segments: [TranscriptSegment] {
         let sorted = meeting.segments.sorted { $0.range.start < $1.range.start }
@@ -419,14 +553,33 @@ private struct SavedTranscriptView: View {
             } else if segments.isEmpty {
                 ContentUnavailableView.search(text: search)
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(segments) { segment in
-                            TranscriptRow(segment: segment, participant: meeting.participant(segment.speakerKey))
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(segments) { segment in
+                                TranscriptRow(segment: segment, participant: meeting.participant(segment.speakerKey))
+                                    .padding(4)
+                                    .background(
+                                        highlighted == segment.id ? Color.accentColor.opacity(0.15) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 6))
+                                    .id(segment.id)
+                            }
+                        }
+                        .padding()
+                        .textSelection(.enabled)
+                    }
+                    .onChange(of: target, initial: true) { _, time in
+                        guard let time else { return }
+                        target = nil
+                        // The line being said at `time`: the last one starting by then.
+                        let sorted = segments
+                        guard let line = sorted.last(where: { $0.range.start <= time + 0.5 }) ?? sorted.first else { return }
+                        highlighted = line.id
+                        // After the rows exist: the transcript tab may have just appeared.
+                        DispatchQueue.main.async {
+                            withAnimation { proxy.scrollTo(line.id, anchor: .center) }
                         }
                     }
-                    .padding()
-                    .textSelection(.enabled)
                 }
             }
         }

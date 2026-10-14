@@ -21,6 +21,14 @@ extension SpeechEngineKind {
     }
 }
 
+extension EngineScore {
+    /// The engine, with the Deepgram model when calibration compared several ("Deepgram Nova-2 Meeting").
+    var displayName: String {
+        guard engine == .deepgram, let model else { return engine.displayName }
+        return "Deepgram \(Deepgram.modelDisplayName(model))"
+    }
+}
+
 extension ModelStatus {
     /// Files are on disk (or built in) so the engine can be used without a download.
     var isAvailable: Bool {
@@ -333,7 +341,7 @@ struct CalibrationResultsView: View {
                 ForEach(Array(calibration.scores.enumerated()), id: \.offset) { index, score in
                     GridRow {
                         HStack(spacing: 6) {
-                            Text(score.engine.displayName)
+                            Text(score.displayName)
                                 .fontWeight(index == 0 ? .semibold : .regular)
                             if index == 0 {
                                 Text("Best")
@@ -346,7 +354,7 @@ struct CalibrationResultsView: View {
                         }
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel(
-                            "\(score.engine.displayName)\(index == 0 ? ", best" : ""): \(Format.wordErrorRate(score.wordErrorRate)) word errors")
+                            "\(score.displayName)\(index == 0 ? ", best" : ""): \(Format.wordErrorRate(score.wordErrorRate)) word errors")
                         Text(Format.wordErrorRate(score.wordErrorRate))
                             .monospacedDigit()
                             .accessibilityHidden(true)
@@ -365,7 +373,7 @@ struct CalibrationResultsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(Array(calibration.scores.enumerated()), id: \.offset) { _, score in
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(score.engine.displayName)
+                            Text(score.displayName)
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                             Text(score.transcript.trimmedNonEmpty ?? "(nothing recognised)")

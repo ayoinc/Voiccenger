@@ -5,23 +5,24 @@ import VCModels
 /// Engine selection and report generation shared by live sessions and saved meetings.
 public enum ReportWriter {
     public enum ReportWriterError: LocalizedError {
-        case noEngine
         case emptyTranscript
 
         public var errorDescription: String? {
             switch self {
-            case .noEngine: "No intelligence engine is available to write the report."
             case .emptyTranscript: "Nothing was transcribed, so there is no report."
             }
         }
     }
 
-    /// The preferred engine, else the other one. `isFallback` is true when the preferred one was unavailable.
-    public static func engine(preferring kind: IntelligenceEngineKind) -> (engine: any MeetingIntelligence, isFallback: Bool)? {
+    /// The preferred engine; else the other language model; else the transcript outline, which runs on every Mac.
+    /// `isFallback` is true when the preferred one was unavailable.
+    public static func engine(preferring kind: IntelligenceEngineKind) -> (engine: any MeetingIntelligence, isFallback: Bool) {
         if let e = IntelligenceFactory.make(kind: kind) { return (e, false) }
-        let fallback: IntelligenceEngineKind = kind == .apple ? .claude : .apple
-        if let e = IntelligenceFactory.make(kind: fallback) { return (e, true) }
-        return nil
+        let order: [IntelligenceEngineKind] = kind == .claude ? [.apple] : [.claude, .apple]
+        for fallback in order where fallback != kind {
+            if let e = IntelligenceFactory.make(kind: fallback) { return (e, true) }
+        }
+        return (TranscriptOutlineEngine(), true)
     }
 
     /// The meeting's transcript in time order, with display names, as given to the language model.
@@ -29,7 +30,7 @@ public enum ReportWriter {
         m.segments.sorted { $0.range.start < $1.range.start }.map {
             ContextLine(
                 segmentID: $0.id, speaker: ReportRenderer.displayName(for: $0.speakerKey, in: m), time: $0.range.start,
-                text: $0.text)
+                text: $0.text, end: $0.range.end)
         }
     }
 

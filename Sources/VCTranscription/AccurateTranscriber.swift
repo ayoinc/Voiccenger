@@ -9,20 +9,35 @@ public struct EngineTranscript: Sendable, Hashable {
     public var engine: SpeechEngineKind
     /// ISO 639-1 language the text is in.
     public var languageCode: String
+    /// The engine's model that wrote the text when it offers several (the Deepgram model); nil otherwise.
+    public var model: String?
+    /// Why the requested model wasn't used, e.g. "Nova-2 Meeting doesn't transcribe Swahili, so Nova-3 is used instead".
+    public var modelFallbackReason: String?
 
-    public init(text: String, words: [TimedWord]?, engine: SpeechEngineKind, languageCode: String) {
+    public init(
+        text: String, words: [TimedWord]?, engine: SpeechEngineKind, languageCode: String, model: String? = nil,
+        modelFallbackReason: String? = nil
+    ) {
         self.text = text
         self.words = words
         self.engine = engine
         self.languageCode = languageCode
+        self.model = model
+        self.modelFallbackReason = modelFallbackReason
     }
 }
 
 /// A loaded speech-to-text engine that transcribes complete utterances.
 public protocol AccurateTranscriber: Sendable {
     var kind: SpeechEngineKind { get }
+    /// The model requested from an engine that offers several (Deepgram); nil for single-model engines.
+    var model: String? { get }
     /// samples: 16 kHz mono Float32, any length (long input chunked internally). prompt: names/terms to bias toward (Whisper uses it; Cohere ignores).
     func transcribe(samples16k: [Float], languageCode: String, prompt: [String]) async throws -> EngineTranscript
+}
+
+extension AccurateTranscriber {
+    public var model: String? { nil }
 }
 
 /// FIFO mutual exclusion across suspension points: engines run one inference at a time, in call order,

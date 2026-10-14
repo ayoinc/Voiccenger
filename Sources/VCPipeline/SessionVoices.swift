@@ -7,10 +7,13 @@ import VCTranscription
 public struct EngineRoute: Sendable, Hashable {
     public var engine: SpeechEngineKind
     public var languageCode: String
+    /// The speaker's Deepgram model when `engine` is Deepgram; nil = the meeting's.
+    public var deepgramModel: String?
 
-    public init(engine: SpeechEngineKind, languageCode: String) {
+    public init(engine: SpeechEngineKind, languageCode: String, deepgramModel: String? = nil) {
         self.engine = engine
         self.languageCode = languageCode
+        self.deepgramModel = deepgramModel
     }
 }
 
@@ -72,12 +75,14 @@ public struct SessionVoices: Sendable {
     /// The engine and language an enrolled speaker's line should be re-transcribed with, or nil to keep it.
     ///
     /// The speaker's engine is their manual choice, else their calibration's best. A line is re-transcribed
-    /// when that engine differs from the one that produced it, or when the speaker talks in another language
-    /// than the line was recognized in. Only engines in `available` that support the language are used;
-    /// for a language change the line's own engine, then Whisper, Cohere and Apple are tried in turn.
+    /// when that engine differs from the one that produced it, when the speaker talks in another language
+    /// than the line was recognized in, or when both are Deepgram but the speaker has their own Deepgram model
+    /// (theirs, else their calibration's best) other than the meeting's `sessionDeepgramModel`. Only engines
+    /// in `available` that support the language are used; for a language change the line's own engine, then
+    /// Whisper, Cohere and Apple are tried in turn.
     public func route(
         speakerKey: String, segmentEngine: SpeechEngineKind?, segmentLanguage: String,
-        available: Set<SpeechEngineKind>
+        available: Set<SpeechEngineKind>, sessionDeepgramModel: String? = nil
     ) -> EngineRoute? {
         guard let profile = profile(forSpeakerKey: speakerKey) else { return nil }
         let voice = profile.voice
@@ -85,7 +90,11 @@ public struct SessionVoices: Sendable {
         let language = voice.languageCode.isEmpty ? segmentLanguage : voice.languageCode
         let languageDiffers = language != segmentLanguage
         let wanted = voice.preferredEngine ?? voice.calibration?.best?.engine
-        guard languageDiffers || (wanted != nil && wanted != current) else { return nil }
+        let personModel = voice.effectiveDeepgramModel
+        let deepgramModelDiffers =
+            wanted == .deepgram && current == .deepgram && personModel != nil
+            && !Deepgram.sameModel(personModel, sessionDeepgramModel)
+        guard languageDiffers || (wanted != nil && wanted != current) || deepgramModelDiffers else { return nil }
 
         var candidates: [SpeechEngineKind] = wanted.map { [$0] } ?? []
         if languageDiffers { candidates += [current, .whisper, .cohere, .apple] }
@@ -94,21 +103,22 @@ public struct SessionVoices: Sendable {
                 available.contains($0) && SpeechModelLibrary.info($0).languageCodes.contains(language)
             })
         else { return nil }
-        return EngineRoute(engine: engine, languageCode: language)
+        return EngineRoute(engine: engine, languageCode: language, deepgramModel: engine == .deepgram ? personModel : nil)
     }
 
-    /// Whether any enrolled speaker could have lines re-transcribed: they have an engine of their own (manual
-    /// or calibrated) or speak another language than the meeting's.
+    /// Whether any enrolled speaker could have lines re-transcribed: they have an engine or Deepgram model of
+    /// their own (manual or calibrated) or speak another language than the meeting's.
     public func mayReroute(sessionLanguage: String) -> Bool {
         profiles.values.contains { p in
-            p.voice.preferredEngine != nil || p.voice.calibration?.best != nil
+            p.voice.preferredEngine != nil || p.voice.calibration?.best != nil || p.voice.effectiveDeepgramModel != nil
                 || (!p.voice.languageCode.isEmpty && p.voice.languageCode != sessionLanguage)
         }
     }
 
-    /// Engines that can transcribe now or after loading: Apple always, others once downloaded.
+    /// Engines that can transcribe now or after loading: Apple wherever either Apple recognizer runs, others
+    /// once downloaded.
     public static func availableEngines(_ statuses: [SpeechEngineKind: ModelStatus]) -> Set<SpeechEngineKind> {
-        var available: Set<SpeechEngineKind> = [.apple]
+        var available: Set<SpeechEngineKind> = AppleSpeech.engineAvailable ? [.apple] : []
         for (kind, status) in statuses {
             switch status {
             case .downloaded, .loading, .ready: available.insert(kind)

@@ -272,10 +272,10 @@ public final class ClaudeEngine: MeetingIntelligence {
     static func reportSchema() -> [String: Any] {
         object([
             ("title", string("Short meeting title.")),
-            ("overview", string("One to three sentences.")),
+            ("overview", string("Detailed summary in two to four paragraphs separated by blank lines; one or two sentences for a short or chatty meeting.")),
             ("topics", array(of: object([
                 ("title", string("Topic title.")),
-                ("summary", string("Short summary.")),
+                ("summary", string("Three to five sentences: what was said and by whom, positions, numbers, outcome.")),
                 ("speakers", stringArray("Speakers involved.")),
             ]), "Main topics in order.")),
             ("decisions", array(of: citedItem(), "Decisions explicitly agreed; often empty.")),
@@ -294,6 +294,14 @@ public final class ClaudeEngine: MeetingIntelligence {
                 ("name", string("Participant name.")),
                 ("keyPoints", array(of: citedItem(), "What they said, each citing their own lines; promises stay promises.")),
             ]), "Key points per participant who spoke.")),
+            ("outline", array(of: object([
+                ("heading", string("A few words naming what this stretch is about.")),
+                ("points", array(of: object([
+                    ("speaker", string("Name of the speaker.")),
+                    ("text", string("One specific thing they said, in your own words, without repeating their name.")),
+                    ("lines", lineNumbers("Numbers of that speaker's own lines that say it.")),
+                ]), "Two to six points.")),
+            ]), "The conversation in order, as segments covering every line with substance.")),
         ])
     }
 

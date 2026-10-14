@@ -1,6 +1,5 @@
 import CoreAudio
 import Foundation
-import Synchronization
 import VCModels
 
 /// Debounces snapshots of "which meeting apps are using the microphone" into start/end events.

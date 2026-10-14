@@ -84,7 +84,9 @@ struct CalibrationSheet: View {
         let deviceUID = coordinator.settings.inputDeviceUID
         Task {
             // Failures are shown through `enrollment.state`.
-            _ = try? await enrollment.recalibrate(profileID: profile.id, deviceUID: deviceUID)
+            _ = try? await enrollment.recalibrate(
+                profileID: profile.id, deviceUID: deviceUID,
+                deepgramModels: coordinator.settings.calibrationDeepgramModels)
             await coordinator.reloadProfiles()
         }
     }
@@ -216,12 +218,13 @@ struct CalibrationFailedView: View {
     }
 }
 
-/// Which voice models a calibration will compare, and which are missing.
+/// Which voice models a calibration will compare (with the Deepgram models), and which are missing.
 struct EngineComparisonNote: View {
+    @Environment(AppSettings.self) private var settings
     let models: ModelStatusTracker
 
     var body: some View {
-        let available = SpeechEngineKind.allCases.filter { $0 == .apple || models.isAvailable($0) }
+        let available = SpeechEngineKind.allCases.filter { ($0 == .apple && AppleSpeech.engineAvailable) || models.isAvailable($0) }
         let missing = SpeechEngineKind.allCases.filter { $0 != .apple && !$0.info.isCloud && !models.isAvailable($0) }
         VStack(alignment: .leading, spacing: 4) {
             Label("Compares \(Format.list(available.map(\.displayName))).", systemImage: "chart.bar.xaxis")
@@ -233,8 +236,11 @@ struct EngineComparisonNote: View {
                 .foregroundStyle(.secondary)
             }
             if available.contains(.deepgram) {
-                Label("The reading is also sent to Deepgram, because a Deepgram API key is set up.", systemImage: "icloud.and.arrow.up")
-                    .foregroundStyle(.secondary)
+                Label(
+                    "The reading is also sent to Deepgram, because a Deepgram API key is set up. Deepgram models compared: \(Format.list(settings.calibrationDeepgramModels.map(Deepgram.modelDisplayName))).",
+                    systemImage: "icloud.and.arrow.up"
+                )
+                .foregroundStyle(.secondary)
             }
         }
         .font(.callout)
@@ -244,6 +250,7 @@ struct EngineComparisonNote: View {
 
 /// Calibration scores, the engine Voiccenger will use, and suggested corrections with checkboxes.
 struct CalibrationOutcomeView: View {
+    @Environment(AppSettings.self) private var settings
     let outcome: EnrollmentService.Outcome
     @Binding var accepted: Set<UUID>
 
@@ -251,7 +258,7 @@ struct CalibrationOutcomeView: View {
         VStack(alignment: .leading, spacing: 14) {
             if let best = outcome.calibration.best {
                 Label {
-                    Text("\(best.engine.displayName) understood \(outcome.profile.name) best, with \(Format.wordErrorRate(best.wordErrorRate)) word errors.")
+                    Text("\(best.displayName) understood \(outcome.profile.name) best, with \(Format.wordErrorRate(best.wordErrorRate)) word errors.")
                 } icon: {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 }
@@ -261,7 +268,7 @@ struct CalibrationOutcomeView: View {
                     CalibrationResultsView(calibration: outcome.calibration)
                         .padding(6)
                 }
-                Text(engineNote(best: best.engine))
+                Text(engineNote(best: best))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -287,11 +294,15 @@ struct CalibrationOutcomeView: View {
         }
     }
 
-    private func engineNote(best: SpeechEngineKind) -> String {
+    private func engineNote(best: EngineScore) -> String {
         let voice = outcome.profile.voice
-        if let chosen = voice.preferredEngine, chosen != best {
+        if let chosen = voice.preferredEngine, chosen != best.engine {
             return "\(outcome.profile.name) stays on \(chosen.displayName), which you chose. Switch the voice model to Automatic in Voice & Accent to use the best one."
         }
-        return "Voiccenger will transcribe \(outcome.profile.name) with \(best.displayName)."
+        guard best.engine == .deepgram else {
+            return "Voiccenger will transcribe \(outcome.profile.name) with \(best.displayName)."
+        }
+        let model = voice.effectiveDeepgramModel ?? settings.deepgramModel
+        return "Voiccenger will transcribe \(outcome.profile.name) with Deepgram \(Deepgram.modelDisplayName(model))."
     }
 }

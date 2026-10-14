@@ -1,7 +1,6 @@
 import AudioToolbox
 import CoreAudio
 import Foundation
-import Synchronization
 import VCModels
 
 /// Core Audio process tap (AudioHardwareCreateProcessTap + private aggregate device). processIDs nil/empty = all system output except this process.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds the Mac App Store variant (sandboxed, no Sparkle) and packages it for App Store Connect.
+# Builds the Mac App Store variant (sandboxed, no Sparkle, universal: Apple silicon + Intel, macOS 14.4+)
+# and packages it for App Store Connect.
 # Usage: scripts/make-mas-pkg.sh dist/Voiccenger-<version>.pkg
 #
 # Environment:
@@ -22,6 +23,12 @@ codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.security.a
     || { echo "error: $APP is not sandboxed" >&2; exit 1; }
 [[ ! -d "$APP/Contents/Frameworks/Sparkle.framework" ]] \
     || { echo "error: App Store build must not contain Sparkle" >&2; exit 1; }
+for arch in arm64 x86_64; do
+    lipo "$APP/Contents/MacOS/Voiccenger" -verify_arch "$arch" \
+        || { echo "error: App Store build lacks $arch" >&2; exit 1; }
+done
+[[ "$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist")" == "14.4" ]] \
+    || { echo "error: App Store build must declare LSMinimumSystemVersion 14.4" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"

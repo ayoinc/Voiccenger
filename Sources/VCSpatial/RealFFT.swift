@@ -1,5 +1,5 @@
 import Accelerate
-import Synchronization
+import VCModels
 
 /// Half-spectrum of a real signal in vDSP's packed layout.
 ///

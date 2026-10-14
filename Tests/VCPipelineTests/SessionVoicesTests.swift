@@ -135,6 +135,40 @@ struct SessionVoicesTests {
                 == EngineRoute(engine: .cohere, languageCode: "fr"), "the line's own engine first when it speaks the language")
     }
 
+    @Test("A speaker's own Deepgram model re-transcribes Deepgram lines streamed with another model")
+    func routesToSpeakersDeepgramModel() {
+        var ada = Self.profile("Ada", engine: .deepgram)
+        ada.voice.deepgramModel = "nova-2-meeting"
+        let plain = Self.profile("Bo", engine: .deepgram)
+        let voices = SessionVoices(profiles: [ada, plain], contextualStrings: [], sessionSpelling: .unchanged)
+        let available: Set<SpeechEngineKind> = [.apple, .deepgram]
+
+        #expect(
+            voices.route(
+                speakerKey: Self.key(ada), segmentEngine: .deepgram, segmentLanguage: "en", available: available,
+                sessionDeepgramModel: "nova-3")
+                == EngineRoute(engine: .deepgram, languageCode: "en", deepgramModel: "nova-2-meeting"))
+        #expect(
+            voices.route(
+                speakerKey: Self.key(ada), segmentEngine: .deepgram, segmentLanguage: "en", available: available,
+                sessionDeepgramModel: "NOVA-2-MEETING") == nil, "already their model")
+        #expect(
+            voices.route(
+                speakerKey: Self.key(plain), segmentEngine: .deepgram, segmentLanguage: "en", available: available,
+                sessionDeepgramModel: "nova-2-meeting") == nil, "no model of their own: the meeting's")
+        // Lines from another engine go to Deepgram with the speaker's model; without one, the meeting's (nil).
+        #expect(
+            voices.route(speakerKey: Self.key(ada), segmentEngine: .apple, segmentLanguage: "en", available: available)
+                == EngineRoute(engine: .deepgram, languageCode: "en", deepgramModel: "nova-2-meeting"))
+        #expect(
+            voices.route(speakerKey: Self.key(plain), segmentEngine: .apple, segmentLanguage: "en", available: available)
+                == EngineRoute(engine: .deepgram, languageCode: "en"))
+
+        var modelOnly = Self.profile("Cy")
+        modelOnly.voice.deepgramModel = "whisper-large"
+        #expect(SessionVoices(profiles: [modelOnly], contextualStrings: [], sessionSpelling: .unchanged).mayReroute(sessionLanguage: "en"))
+    }
+
     @Test("Downloaded, loading and ready models are available; Apple always is")
     func availability() {
         let statuses: [SpeechEngineKind: ModelStatus] = [

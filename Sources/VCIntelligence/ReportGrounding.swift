@@ -44,13 +44,13 @@ extension ResultAssembler {
             let summary = unoverstated(sentences(topic.summary ?? ""), evidence: evidence).joined(separator: " ")
             return TopicSummary(title: title, summary: summary, speakers: deduplicated(topic.speakers.compactMap(evidence.speaker)))
         }
-        // Sentences claiming as done what was only promised go; the first sentence always stays.
-        var overview = sentences(raw.overview ?? "")
-        overview = Array(overview.prefix(1)) + unoverstated(Array(overview.dropFirst()), evidence: evidence)
+        // Sentences claiming as done what was only promised go; the first sentence always stays. Paragraphs are
+        // kept; a thin meeting gets at most two sentences.
+        let overview = groundedOverview(raw.overview ?? "", evidence: evidence, isThin: shape.isThin)
 
         return MeetingReport(
             title: title,
-            overview: (shape.isThin ? Array(overview.prefix(2)) : overview).joined(separator: " "),
+            overview: overview,
             topics: Array(topics.prefix(shape.topics)),
             decisions: decisions,
             actionItems: actionItems,
@@ -60,8 +60,23 @@ extension ResultAssembler {
             corrections: Array(groundedCorrections(raw.corrections, evidence: evidence).prefix(shape.corrections)),
             participantSummaries: shape.keyPoints == 0
                 ? [] : participantSummaries(raw.participantSummaries, participants: participants, evidence: evidence, limit: shape.keyPoints),
+            outline: outline(raw.outline, evidence: evidence, shape: shape),
             generatedBy: generatedBy,
             generatedAt: generatedAt)
+    }
+
+    /// The overview's paragraphs without sentences that call promises done; the first sentence always stays.
+    /// A thin meeting keeps its first two sentences, as one paragraph.
+    static func groundedOverview(_ text: String, evidence: Evidence, isThin: Bool) -> String {
+        let paragraphs = text.components(separatedBy: "\n").map(sentences).filter { !$0.isEmpty }
+        guard let first = paragraphs.first else { return "" }
+        if isThin {
+            let all = Array(paragraphs.joined())
+            return ([all[0]] + unoverstated(Array(all.dropFirst()), evidence: evidence)).prefix(2).joined(separator: " ")
+        }
+        let kept = [[first[0]] + unoverstated(Array(first.dropFirst()), evidence: evidence)]
+            + paragraphs.dropFirst().map { unoverstated($0, evidence: evidence) }
+        return kept.filter { !$0.isEmpty }.map { $0.joined(separator: " ") }.joined(separator: "\n\n")
     }
 
     /// Items whose text shares content words with the lines they cite, when `supports` accepts the item's text
@@ -204,7 +219,7 @@ extension ResultAssembler {
         }
         let order = deduplicated(participants.compactMap(evidence.speaker) + evidence.speakers)
         return order.compactMap { name in
-            let keyPoints = deduplicated((points[name.lowercased()] ?? []).compactMap { groundedPoint($0, by: name, evidence: evidence) })
+            let keyPoints = deduplicated((points[name.lowercased()] ?? []).compactMap { groundedPoint($0, by: name, evidence: evidence)?.text })
             guard !keyPoints.isEmpty else { return nil }
             return ParticipantSummary(name: name, keyPoints: Array(keyPoints.prefix(limit)))
         }
@@ -213,8 +228,9 @@ extension ResultAssembler {
     /// A key point of `name`'s, kept when it cites at least one of their own lines that is not small talk, shares
     /// content words with those lines (two when the point has four or more), does not call a promise done, and
     /// names nothing those lines do not. A cited line that refers back ("Sure, I'll book them this week") also
-    /// lends the words of the line just before it ("Priya, could you book the tickets?").
-    static func groundedPoint(_ point: RawItem, by name: String, evidence: Evidence) -> String? {
+    /// lends the words of the line just before it ("Priya, could you book the tickets?"). Returns the text and
+    /// the 1-based numbers of `name`'s cited lines.
+    static func groundedPoint(_ point: RawItem, by name: String, evidence: Evidence) -> (text: String, lines: [Int])? {
         guard let (text, numbers) = point.text.map({ Evidence.citation(in: $0) }), !comparable(text).isEmpty else { return nil }
         let cited = evidence.numbers(point.lines + numbers).filter {
             evidence.transcript[$0 - 1].speaker.caseInsensitiveCompare(name) == .orderedSame
@@ -228,16 +244,31 @@ extension ResultAssembler {
             !Grounding.overstatesCompletion(text, lines: own.map(\.text)),
             Grounding.namesOnlyWhatWasSaid(text, evidence: said, names: evidence.speakers)
         else { return nil }
-        return text
+        return (text, cited)
     }
 
-    /// `sentences` without the ones claiming as done what the lines about them only promise or ask for. The lines
-    /// about a sentence are those sharing at least two content words with it.
+    /// `sentences` without the ones claiming as done what the lines about them only promise or ask for. Each clause
+    /// is checked on its own ("Priya booked the passes, and Leo needs the slides reviewed" claims the booking done
+    /// even though its second clause states a need). The lines about a clause are those sharing at least two
+    /// content words with it.
     static func unoverstated(_ sentences: [String], evidence: Evidence) -> [String] {
         sentences.filter { sentence in
-            let about = evidence.transcript.filter { Grounding.sharedContent(sentence, with: $0.text) >= 2 }.map(\.text)
-            return about.isEmpty || !Grounding.overstatesCompletion(sentence, lines: about)
+            clauses(sentence).allSatisfy { clause in
+                let about = evidence.transcript.filter { Grounding.sharedContent(clause, with: $0.text) >= 2 }.map(\.text)
+                return about.isEmpty || !Grounding.overstatesCompletion(clause, lines: about)
+            }
         }
+    }
+
+    /// The clauses of `sentence`: split at commas, semicolons, colons, dashes and "and"/"but"/"while"/"whereas".
+    static func clauses(_ sentence: String) -> [String] {
+        sentence.components(separatedBy: CharacterSet(charactersIn: ",;:—–"))
+            .flatMap { $0.components(separatedBy: " and ") }
+            .flatMap { $0.components(separatedBy: " but ") }
+            .flatMap { $0.components(separatedBy: " while ") }
+            .flatMap { $0.components(separatedBy: " whereas ") }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !Grounding.contentStems($0).isEmpty }
     }
 
     /// The sentences of `text`, trimmed.
@@ -321,6 +352,10 @@ struct ReportShape: Equatable {
     var corrections: Int
     /// Key points per participant; 0 drops participant summaries.
     var keyPoints: Int
+    /// Outline segments and points per segment. A thin meeting gets one short segment, and stretches the model
+    /// left out are not filled in.
+    var outlineSegments: Int
+    var outlinePoints: Int
 
     /// Thin below either threshold. Measured with `Grounding.substance`: the user's failed one-minute meeting has
     /// 4 content words on 1 substantive line; the 10-line fixture meeting has 54 on 10 (about 5 per line), and
@@ -334,17 +369,23 @@ struct ReportShape: Equatable {
         let n = substance.substantiveLines
         if isThin {
             (topics, decisions, actionItems, notes, missedOpportunities, openQuestions, corrections, keyPoints) = (1, 2, 2, 0, 0, 1, 1, 0)
+            (outlineSegments, outlinePoints) = (1, 2)
         } else {
-            // About one decision per four substantive lines, one task per three, and so on; the caps match the
-            // on-device schema maximums.
-            topics = min(5, 1 + n / 6)
-            decisions = min(6, max(2, n / 4))
-            actionItems = min(8, max(3, n / 3))
-            notes = min(6, max(2, n / 5))
+            // About one decision per four substantive lines, one task per three, and so on. Up to about 50
+            // substantive lines (one on-device request) the caps are the on-device schema maximums; longer meetings,
+            // whose parts' lists are joined, get more, up to a ceiling that keeps the report readable.
+            let parts = max(1, (n + 49) / 50)
+            topics = min(5 + 3 * (parts - 1), 8, 1 + n / 6)
+            decisions = min(6 * parts, 12, max(2, n / 4))
+            actionItems = min(8 * parts, 20, max(3, n / 3))
+            notes = min(6 * parts, 12, max(2, n / 5))
             missedOpportunities = min(3, max(1, n / 10))
-            openQuestions = min(4, max(1, n / 8))
-            corrections = min(3, max(1, n / 10))
-            keyPoints = min(4, max(2, n / 8))
+            openQuestions = min(4 * parts, 8, max(1, n / 8))
+            corrections = min(3 * parts, 5, max(1, n / 10))
+            keyPoints = min(4 + 2 * (parts - 1), 6, max(2, n / 8))
+            // A segment needs a few substantive lines to say anything; six points keep each one readable.
+            outlineSegments = max(1, n / 2)
+            outlinePoints = 6
         }
     }
 }

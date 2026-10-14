@@ -412,7 +412,8 @@ private struct EngineStatusChip: View {
         case .ready: return "\(engine.shortName) · ready"
         case .loading, .downloaded: return "\(engine.shortName) · warming up"
         case .downloading(let fraction): return "\(engine.shortName) · downloading \(Format.percent(fraction))"
-        case .notDownloaded, .failed: return "Apple preview"
+        case .notDownloaded: return AppleSpeech.isAvailable ? "Apple preview" : "\(engine.shortName) · not downloaded"
+        case .failed: return AppleSpeech.isAvailable ? "Apple preview" : "\(engine.shortName) · failed"
         }
     }
 
@@ -450,16 +451,27 @@ private struct EngineStatusChip: View {
         case .loading where engine == .deepgram, .downloaded where engine == .deepgram:
             return "Connecting to Deepgram."
         case .ready, nil:
-            return "Apple Speech previews words as they're spoken; \(name) writes each finished line."
+            return AppleSpeech.isAvailable
+                ? "Apple Speech previews words as they're spoken; \(name) writes each finished line."
+                : "\(name) shows live text every couple of seconds and writes each finished line. Apple Speech's instant preview needs macOS 26."
         case .loading, .downloaded:
-            return "\(name) is loading. Until it's ready, lines are written by Apple Speech."
+            return "\(name) is loading. Until it's ready, \(fallbackPhrase)."
         case .downloading:
-            return "\(name) is downloading. Until it's ready, lines are written by Apple Speech."
+            return "\(name) is downloading. Until it's ready, \(fallbackPhrase)."
         case .notDownloaded:
-            return "\(name) isn't downloaded, so Apple Speech writes the transcript. Download it in Settings › Voice Models."
+            return AppleSpeech.isAvailable
+                ? "\(name) isn't downloaded, so Apple Speech writes the transcript. Download it in Settings › Voice Models."
+                : "\(name) isn't downloaded. Download it in Settings › Voice Models; another downloaded voice model is used meanwhile if there is one."
         case .failed(let message):
-            return "\(name) couldn't start (\(message)), so Apple Speech writes the transcript."
+            return AppleSpeech.isAvailable
+                ? "\(name) couldn't start (\(message)), so Apple Speech writes the transcript."
+                : "\(name) couldn't start (\(message))."
         }
+    }
+
+    /// What writes lines while the model isn't ready: Apple Speech on macOS 26, else they wait for the model.
+    private var fallbackPhrase: String {
+        AppleSpeech.isAvailable ? "lines are written by Apple Speech" : "lines are held and appear once it is"
     }
 }
 

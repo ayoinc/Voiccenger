@@ -54,6 +54,28 @@ enum ReportNotes {
         lines.append(contentsOf: items.map { "- \($0)" })
     }
 
+    /// Only what a merge request rewrites: title, overview and topics.
+    static func summary(_ notes: RawReport) -> RawReport {
+        RawReport(title: notes.title, overview: notes.overview, topics: notes.topics)
+    }
+
+    /// Every part's lists and participant points joined in order, under `summary`'s title, overview and topics.
+    /// Every item keeps the transcript lines it cites (numbered over the whole meeting), so the report's grounding
+    /// removes duplicates and anything unsupported, as for a single pass.
+    static func joined(_ parts: [RawReport], summary: RawReport) -> RawReport {
+        var notes = RawReport(title: summary.title, overview: summary.overview, topics: summary.topics)
+        for part in parts {
+            notes.decisions += part.decisions
+            notes.actionItems += part.actionItems
+            notes.notesToRemember += part.notesToRemember
+            notes.missedOpportunities += part.missedOpportunities
+            notes.openQuestions += part.openQuestions
+            notes.corrections += part.corrections
+            notes.participantSummaries += part.participantSummaries
+        }
+        return notes
+    }
+
     /// Roughly halves the notes: every list keeps its first ⌈n/2⌉ items and the overview keeps its first
     /// sentence. Returns nil when nothing can shrink any further.
     static func compacted(_ notes: RawReport) -> RawReport? {

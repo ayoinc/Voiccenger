@@ -1,6 +1,5 @@
 import AVFAudio
 import Foundation
-import Synchronization
 import VCModels
 
 /// Writes chunks of one channel to a 16-bit CAF/WAV file. Thread-safe.
@@ -54,7 +53,7 @@ public final class AudioRecorder: Sendable {
             do {
                 try current.write(from: buffer)
             } catch {
-                current.close()
+                Self.close(current)
                 file = nil
             }
         }
@@ -63,8 +62,13 @@ public final class AudioRecorder: Sendable {
     /// Finalizes the file header. Further appends are ignored.
     public func close() {
         file.withLock { file in
-            file?.close()
+            if let current = file { Self.close(current) }
             file = nil
         }
+    }
+
+    /// `AVAudioFile.close()` is macOS 15+; before it, releasing the last reference (`file = nil`) finalizes the file.
+    private static func close(_ file: AVAudioFile) {
+        if #available(macOS 15.0, *) { file.close() }
     }
 }
