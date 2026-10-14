@@ -56,6 +56,12 @@ public actor SpeakerIdentifier {
     private var clusterVotes: [String: [UUID: Double]] = [:]
     /// FluidAudio speaker ids that are seeded enrolled profiles.
     private var seededSpeakerIDs: Set<String> = []
+    /// Times another channel carried speech that this channel may hear as bleed (sorted, merged).
+    private var excluded: [TimeRange] = []
+    /// A segment whose time is more than this share excluded is not matched to enrolled people.
+    static let excludedShareLimit = 0.5
+    /// Excluded ranges older than this behind the newest audio are forgotten.
+    static let exclusionHistory: TimeInterval = 120
 
     public init(channel: AudioChannel, config: SpeakerIDConfig = .init()) {
         self.channel = channel
@@ -82,6 +88,30 @@ public actor SpeakerIdentifier {
             clusterVotes[cluster] = clusterVotes[cluster]?.filter { ids.contains($0.key) }
         }
         seedDiarizer()
+    }
+
+    /// Speech heard on another channel during `ranges`. On the microphone that is the computer's audio, which the
+    /// mic also picks up from the speakers: segments that are mostly inside these ranges are kept as unknown voices
+    /// rather than matched to (or voting for) enrolled people, so a remote voice never lends its audio to someone
+    /// in the room.
+    public func excludeFromMatching(_ ranges: [TimeRange]) {
+        guard !ranges.isEmpty else { return }
+        var merged: [TimeRange] = []
+        for range in (excluded + ranges).sorted(by: { $0.start < $1.start }) where range.duration > 0 {
+            if let last = merged.last, range.start <= last.end {
+                merged[merged.count - 1].end = max(last.end, range.end)
+            } else {
+                merged.append(range)
+            }
+        }
+        let horizon = (merged.last?.end ?? 0) - Self.exclusionHistory
+        excluded = merged.filter { $0.end >= horizon }
+    }
+
+    /// Share of `range` inside excluded ranges.
+    func excludedShare(of range: TimeRange) -> Double {
+        guard range.duration > 0 else { return 0 }
+        return excluded.reduce(0) { $0 + $1.overlap(with: range) } / range.duration
     }
 
     /// Buffers `chunk` and returns turns for every window it completes.
@@ -165,6 +195,11 @@ public actor SpeakerIdentifier {
         let range = TimeRange(start: start, end: end)
         let cluster = segment.speakerId
 
+        if excludedShare(of: range) > Self.excludedShareLimit {
+            return SpeakerTurn(
+                channel: channel, range: range, speakerKey: unknownKey(for: cluster), profileID: nil,
+                confidence: Double(min(1, max(0, segment.qualityScore))), isAmbiguous: false)
+        }
         let ranked = SpeakerMatcher.scores(for: segment.embedding, in: profiles)
         let match = SpeakerMatcher.match(ranked: ranked, threshold: config.matchThreshold, margin: config.ambiguityMargin)
         if let match, !match.isAmbiguous {

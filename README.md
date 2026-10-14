@@ -117,7 +117,7 @@ NOTARY_KEYCHAIN_PROFILE=voiccenger-notary scripts/notarize.sh dist/Voiccenger-$V
 |---|---|
 | Online meeting detection | Core Audio process list: a known conferencing app/browser using the mic for ≥2 s starts, ≥5 s absent ends (`VCAudio.MeetingDetector`) |
 | In-person detection | Energy VAD, ~30 s speech in 60 s (`ConversationDetector`), opt-in |
-| Capture | Mic via AVAudioEngine; remote voices via Core Audio process tap on the meeting app — separate channels |
+| Capture | Mic via AVAudioEngine; the computer's audio via Core Audio process taps (the meeting app's whole process family, else everything the Mac plays) — separate channels, in every meeting; see [Capturing every party](#capturing-every-party) |
 | Transcription | Apple `SpeechAnalyzer` streams a preview; utterances (joined across pauses < 3 s, ≤ 30 s) are re-transcribed by Cohere Transcribe or Whisper; Apple's word timings are transferred to the final text. Or Deepgram Nova-3 streams over a WebSocket per channel, with its word times mapped back to the session clock across gaps and reconnects |
 | Language/accent | Per-person calibration picks the best model; accent region seeds vocabulary; language switching (e.g. English ↔ French) on low confidence |
 | Speakers | FluidAudio diarization + WeSpeaker embeddings; enrolled people matched by cosine with multi-sample profiles, ambiguity margin and per-cluster voting |
@@ -126,6 +126,33 @@ NOTARY_KEYCHAIN_PROFILE=voiccenger-notary scripts/notarize.sh dist/Voiccenger-$V
 | Report | A detailed overview (paragraphs for meetings with substance), topic summaries (who said what, numbers, outcomes), decisions, action items (owner/due), notes, things that could have been said, open questions, corrections, per-person points, and a **conversation outline**: the whole meeting in order as segments (`[mm:ss–mm:ss]`, heading, points each attributed to a speaker, with timestamps that jump to the transcript in the app); Markdown export with the voice model used. Every item and outline point cites numbered transcript lines and is kept only when those lines support it (shared content words, a commitment/request/decision/question cue, the owner as the committer or the person asked, outline points only from the speaker's own lines); promises are never reported as done; only people with transcript lines appear; meetings with little substance get a brief report. Every substantive line must lie within two lines of a cited one: stretches the model skipped are filled with the speakers' most informative sentences, quoted, inside the surrounding segment (a segment of their own only from six substantive lines). Segments with fewer than three substantive lines, or only quotes, then merge into the neighbour sharing more words, and neighbours merge (most shared words, penalised by size) down to about one segment per three minutes, at most 12. Apple Intelligence (4,096-token window) writes the summary, the lists and the outline in separate requests sized with exact token counts; long meetings are outlined chunk by chunk with every chunk's outline kept as written, and only summary and lists are merged. Without Apple Intelligence or a Claude key, the **Transcript outline (no AI)** splits the transcript at pauses, transition phrases and changes of vocabulary, merges segments the same way and quotes each speaker's most informative sentences (2–6 per segment), with questions asked and *possible* action items found by phrases like “I'll” and “can you”, labelled as not written by AI |
 
 Data: `~/Library/Application Support/Voiccenger/`. Claude and Deepgram keys stored in the Keychain.
+
+## Capturing every party
+Every recording has two channels: the **microphone** (you and anyone in the room) and the **computer's audio** (whatever the Mac plays: the other side of a call). In-person recordings capture the computer's audio too (Settings › Audio › *Record computer audio during in-person meetings*, on by default): with headphones on, a call's remote party never reaches the microphone, so a call recorded as an in-person meeting would otherwise lose them.
+
+- **Which audio.** For a native meeting app (Zoom, Teams, Webex, FaceTime, Slack…) the tap covers the app's whole process family: every process whose bundle ID belongs to the app, helpers and companion daemons included, not only the one holding the microphone. Core Audio's process list and each process's output state are watched; when a new family process starts playing, the tap is rebuilt and the timeline continues (the moment of the switch is silence, so the recording stays in sync). For a browser, or with no meeting app, the tap records everything the Mac plays except Voiccenger. If the app's processes stay silent while other audio on the Mac carries speech for over 10 s, Voiccenger switches to all computer audio and says why.
+- **Calls that start mid-recording.** When a meeting app starts using the microphone during an in-person recording, the meeting becomes an online meeting in that app and the computer-audio channel narrows to its processes, without restarting the recording.
+- **Levels.** Computer audio is normalised before transcription and speaker identification (a slow automatic gain control with a limiter, aiming at about −20 dBFS speech); the recording keeps the raw audio. Voice detection still finds speech at −41 dBFS.
+- **Speakers instead of headphones.** The microphone then hears the remote party too, so their words would appear twice. A microphone line is dropped when computer-audio lines cover more than half of its time and contain at least 60% of its words in order; someone in the room talking over the call says different words and is kept. (On the two Teams meetings recorded on the development Mac, 118 of the 144 mic lines that system lines overlapped passed that test; of 320 pairs of different speech, 3 did.) Times when the computer's audio carries speech are also left out when matching microphone voices to enrolled people and when collecting a voice to enroll.
+- **Warnings.** The Live view shows, and the meeting keeps, a warning when a meeting app is active but its audio has been silent for more than 20 s, when the microphone sends only digital silence, or when macOS has muted the input or set its volume to 0.
+
+Measured on an M-series Mac with macOS 26 (global process tap, `voiccenger-cli system-audio`):
+
+| Condition | Computer-audio capture |
+|---|---|
+| Normal volume, built-in speakers | RMS −19.1 dBFS, peak −1.3 dBFS |
+| Mac output volume 0 | identical (−19.1 / −1.3) |
+| Mac output muted | identical (−19.1 / −1.3) |
+| Default output switched mid-capture (as when headphones connect) | capture continued, no gap |
+| Started while the output was an LG monitor over HDMI | captured, about 20 dB quieter (RMS −41, peak −20); normalised to about −20 dBFS for transcription |
+
+Taps capture what apps play before the Mac's volume and mute, whatever the output device, so headphones, volume 0 and mute don't stop the recording.
+
+End to end: an in-person `MeetingSession` (Cohere) recording while `say -v Daniel` spoke two sentences with the Mac's output volume at 0 transcribed both, word for word but one ("in" for "and"), as computer-audio lines; `system.wav` held them at −19.2 dBFS RMS. `voiccenger-cli record --seconds N [--kind in-person] [--out report.md]` runs the same check.
+
+**What can't be captured.** If the meeting app itself plays silence (its own speaker volume at 0, "mute incoming audio", or it routes nothing), there is no audio to record. Voiccenger warns "*App* is playing no sound…": turn up the app's own speaker volume (the Mac's volume can stay at 0). Where that isn't possible, use the platform's own captions or transcripts (Zoom, Microsoft Teams and Google Meet each offer them).
+
+**Muted in the meeting app.** Voiccenger reads the microphone device directly, so muting yourself in Zoom, Teams or Meet doesn't stop it: it still records and transcribes your voice while you're muted on the call. Only macOS input mute or volume 0 (or a hardware mute switch) silences it, and Voiccenger warns when that happens. Keep this in mind for side conversations while muted; the recording reminder covers telling people they're being recorded, and you can stop the recording at any time.
 
 ## Measured
 - Accented English (89 real speakers, see above): 5.1% word error rate with Cohere Transcribe vs 10.2% with Apple; 4.3% vs 10.1% for African speakers.
@@ -144,7 +171,7 @@ Data: `~/Library/Application Support/Voiccenger/`. Claude and Deepgram keys stor
 - Speaker labels lag ~10 s behind live text (diarization windows).
 - Seat direction needs a multi-channel array; the built-in Mac mic can't localize.
 - Deepgram streams at about real time, so `process --engine deepgram` takes roughly as long as the recording. New names enrolled mid-meeting reach Deepgram's keyterms on its next connection.
-- If system-audio permission is denied the tap yields silence, not an error.
+- If system-audio permission is denied the tap yields silence, not an error; with a meeting app active, the Live view then warns that the app is playing no sound.
 - Report grounding is lexical: an item that shares words with its cited lines and has the right cue can still misread them. Overview and topic sentences are only checked, clause by clause, for promises reported as done ("agreed on a budget freeze" for a feature freeze survives there).
 - The on-device model mostly copies transcript lines into the outline instead of paraphrasing; copies are shown as quotes. For long meetings the parts' lists are joined without a model, so a decision superseded later in the meeting, or a question answered in a later part, can still appear.
 - With CLT only, SwiftUI's `@State` macro is unavailable; views use a `ViewState = SwiftUI.State` alias.

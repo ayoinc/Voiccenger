@@ -19,6 +19,7 @@ public final class AppSettings {
         static let inputDeviceUID = "inputDeviceUID"
         static let arrayPresetName = "micArrayPreset"
         static let recordAudio = "recordAudio"
+        static let recordComputerAudioInPerson = "recordComputerAudioInPerson"
         static let speechEngine = "speechEngine"
         static let spelling = "spelling"
         static let downloadModelsAutomatically = "downloadModelsAutomatically"
@@ -48,6 +49,11 @@ public final class AppSettings {
     public var arrayPresetName: String? { didSet { defaults.set(arrayPresetName, forKey: Key.arrayPresetName) } }
     /// Keep audio recordings next to each meeting's transcript.
     public var recordAudio: Bool { didSet { defaults.set(recordAudio, forKey: Key.recordAudio) } }
+    /// Record the computer's audio in in-person meetings too (online meetings always do), so a remote party
+    /// heard through headphones isn't lost when a call was started as an in-person recording.
+    public var recordComputerAudioInPerson: Bool {
+        didSet { defaults.set(recordComputerAudioInPerson, forKey: Key.recordComputerAudioInPerson) }
+    }
     /// Voice model that transcribes meetings (Apple only previews live text until it's ready).
     public var speechEngine: SpeechEngineKind { didSet { defaults.set(speechEngine.rawValue, forKey: Key.speechEngine) } }
     /// Spelling for speakers without their own preference.
@@ -88,6 +94,7 @@ public final class AppSettings {
             Key.inPersonDetection: false,
             Key.autoLanguage: true,
             Key.recordAudio: true,
+            Key.recordComputerAudioInPerson: true,
             Key.downloadModelsAutomatically: true,
         ])
         autoDetectMeetings = defaults.bool(forKey: Key.autoDetectMeetings)
@@ -106,6 +113,7 @@ public final class AppSettings {
         inputDeviceUID = defaults.string(forKey: Key.inputDeviceUID)
         arrayPresetName = defaults.string(forKey: Key.arrayPresetName)
         recordAudio = defaults.bool(forKey: Key.recordAudio)
+        recordComputerAudioInPerson = defaults.bool(forKey: Key.recordComputerAudioInPerson)
         speechEngine = capabilities.usableSpeechEngine(
             defaults.string(forKey: Key.speechEngine).flatMap(SpeechEngineKind.init(rawValue:)) ?? capabilities.defaultSpeechEngine)
         spelling = defaults.string(forKey: Key.spelling).flatMap(SpellingVariant.init(rawValue:)) ?? .unchanged
@@ -154,6 +162,6 @@ public final class AppSettings {
             localeID: localeID, autoLanguage: autoLanguage, engineKind: engine, speechEngine: speechEngine,
             deepgramModel: deepgramModel,
             spelling: spelling, contextualStrings: customVocabulary, recordAudio: recordAudio,
-            meetingsDirectory: meetingsDirectory)
+            recordComputerAudio: recordComputerAudioInPerson, meetingsDirectory: meetingsDirectory)
     }
 }

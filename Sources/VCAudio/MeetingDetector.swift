@@ -1,4 +1,3 @@
-import CoreAudio
 import Foundation
 import VCModels
 
@@ -181,28 +180,9 @@ public final class MeetingDetector: Sendable {
 
     /// Processes (other than this one) currently capturing audio input, with their bundle IDs.
     public static func processesUsingMicrophone() -> [(bundleID: String, pid: Int32)] {
-        let objects = (try? CoreAudioProperty.array(
-            AudioObjectID.self, object: AudioObjectID(kAudioObjectSystemObject),
-            address: CoreAudioProperty.address(kAudioHardwarePropertyProcessObjectList),
-            operation: "list audio processes")) ?? []
         let own = getpid()
-        return objects.compactMap { object in
-            guard
-                let running = try? CoreAudioProperty.scalar(
-                    UInt32.self, object: object,
-                    address: CoreAudioProperty.address(kAudioProcessPropertyIsRunningInput),
-                    operation: "read process input state"),
-                running != 0,
-                let pid = try? CoreAudioProperty.scalar(
-                    pid_t.self, object: object, address: CoreAudioProperty.address(kAudioProcessPropertyPID),
-                    operation: "read process pid"),
-                pid != own,
-                let bundleID = try? CoreAudioProperty.string(
-                    object: object, address: CoreAudioProperty.address(kAudioProcessPropertyBundleID),
-                    operation: "read process bundle ID"),
-                !bundleID.isEmpty
-            else { return nil }
-            return (bundleID, pid)
-        }
+        return AudioProcesses.current()
+            .filter { $0.isRunningInput && $0.pid != own && !$0.bundleID.isEmpty }
+            .map { ($0.bundleID, $0.pid) }
     }
 }

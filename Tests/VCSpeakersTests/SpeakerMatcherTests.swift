@@ -90,3 +90,17 @@ struct SpeakerMatcherTests {
         #expect(n == [0.6, 0.8])
     }
 }
+
+@Suite("Computer-audio exclusion")
+struct SpeakerExclusionTests {
+    @Test("Excluded ranges merge, and a segment's excluded share decides whether it may match enrolled people")
+    func excludedShare() async {
+        let identifier = SpeakerIdentifier(channel: .microphone)
+        await identifier.excludeFromMatching([TimeRange(start: 10, end: 12), TimeRange(start: 11, end: 13)])
+        await identifier.excludeFromMatching([TimeRange(start: 20, end: 21)])
+        #expect(await identifier.excludedShare(of: TimeRange(start: 10, end: 14)) == 0.75)
+        #expect(await identifier.excludedShare(of: TimeRange(start: 14, end: 20)) == 0)
+        #expect(await identifier.excludedShare(of: TimeRange(start: 19, end: 23)) == 0.25)
+        #expect(SpeakerIdentifier.excludedShareLimit == 0.5)
+    }
+}

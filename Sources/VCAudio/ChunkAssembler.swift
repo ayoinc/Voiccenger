@@ -20,12 +20,15 @@ struct ChunkAssembler: Sendable {
     private(set) var origin: TimeInterval?
     /// The anchored origin is never earlier than this (keeps the timeline monotonic across restarts).
     private let minimumOrigin: TimeInterval
+    /// When set, the timeline continues exactly here: the gap up to the first buffer is filled with silence.
+    private let continuation: TimeInterval?
     private(set) var framesEmitted = 0
     private var pending: [[Float]]
 
     init(
         channel: AudioChannel, sampleRate: Double, chunkDuration: TimeInterval, channelCount: Int,
-        mixIndices: [Int]? = nil, keepChannels: Bool, minimumOrigin: TimeInterval = -.infinity
+        mixIndices: [Int]? = nil, keepChannels: Bool, minimumOrigin: TimeInterval = -.infinity,
+        continuing continuation: TimeInterval? = nil
     ) {
         precondition(sampleRate > 0 && channelCount > 0)
         self.channel = channel
@@ -36,6 +39,7 @@ struct ChunkAssembler: Sendable {
         self.mixIndices = mix.isEmpty ? Array(0..<channelCount) : mix
         self.keepChannels = keepChannels
         self.minimumOrigin = minimumOrigin
+        self.continuation = continuation
         self.pending = Array(repeating: [], count: channelCount)
         for i in pending.indices { pending[i].reserveCapacity(chunkFrames * 2) }
     }
@@ -52,7 +56,16 @@ struct ChunkAssembler: Sendable {
     ) -> [AudioChunk] {
         guard frames > 0 else { return [] }
         if origin == nil {
-            origin = max(minimumOrigin, arrivalTime - Double(frames) / sampleRate)
+            let start = arrivalTime - Double(frames) / sampleRate
+            if let continuation {
+                origin = continuation
+                let gap = Int(((start - continuation) * sampleRate).rounded())
+                if gap > 0 {
+                    for c in 0..<channelCount { pending[c].append(contentsOf: repeatElement(0, count: gap)) }
+                }
+            } else {
+                origin = max(minimumOrigin, start)
+            }
         }
         for c in 0..<channelCount {
             pending[c].append(contentsOf: UnsafeBufferPointer(rebasing: samples(c)[0..<frames]))

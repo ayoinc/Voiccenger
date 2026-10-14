@@ -367,6 +367,12 @@ private struct AudioSettings: View {
                 Text("With a microphone array, Voiccenger estimates where each person sits (GCC-PHAT) and shows it in the Live and Spatial views. Changes apply to the next recording.")
                     .settingsFootnote()
             }
+            Section {
+                Toggle("Record computer audio during in-person meetings", isOn: $settings.recordComputerAudioInPerson)
+            } footer: {
+                Text("Records what your Mac plays alongside the microphone, as online meetings always do. With headphones on, the other side of a call never reaches the microphone, so a call recorded as an in-person meeting would otherwise lose them. Voiccenger captures apps' sound before your Mac's volume and mute, so it works at any volume.")
+                    .settingsFootnote()
+            }
         }
         .formStyle(.grouped)
         .task { devices = AudioDevices.inputDevices() }

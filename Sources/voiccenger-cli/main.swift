@@ -151,9 +151,19 @@ let usage = """
           --truth truth.json           Score per-turn speaker accuracy against ground truth
           --no-analysis                Skip live per-line analysis (the report is still written)
           --no-auto-language           Keep the Apple preview on --locale
-      system-audio [--seconds 5] [--pids 123,456] [--out capture.wav]
+      record [--seconds 30] [--kind in-person|online] [--out report.md] [options]
+                                       Record a live meeting: the microphone plus the computer's audio
+                                       (Core Audio process tap, independent of output volume and mute),
+                                       then print each channel's transcript and write the report.
+          --app bundle-id              The meeting runs in this app (tap its whole process family)
+          --detect                     Become an online meeting when a meeting app starts using the mic
+          --no-computer-audio          In person: record the microphone only
+          --engine, --intelligence, --locale, --title, --json, --meetings, --profiles, --no-analysis
+                                       As for `process`; the meeting and its audio are kept in --meetings
+                                       (default: a temporary directory)
+      system-audio [--seconds 5] [--app bundle-id] [--out capture.wav]
                                        Capture system audio through a Core Audio process tap (all apps, or
-                                       only --pids), report its level, optionally record it.
+                                       one meeting app's processes), report its level, optionally record it.
       report <transcript.json> [--intelligence apple|claude|outline] [--title text] [--out report.md]
                                        Write the report for a transcript: a JSON array of lines
                                        {"speaker", "start", "end"?, "text"} (as in .fixtures/meeting.truth.json).
@@ -740,18 +750,33 @@ enum ArrayPresetIDs {
 
 func systemAudio(_ a: inout Arguments) async throws {
     let seconds = try a.double("seconds", default: 5)
-    let pids = try a.option("pids").map { list in
-        try list.split(separator: ",").map { item -> Int32 in
-            guard let pid = Int32(item.trimmingCharacters(in: .whitespaces)) else { throw UsageError("--pids must be numbers") }
-            return pid
+    let app = try a.option("app").map { id in
+        guard let app = MeetingAppCatalog.app(forBundleID: id) else {
+            throw UsageError("“\(id)” isn't a known meeting app (e.g. us.zoom.xos, com.microsoft.teams2)")
         }
+        return app
     }
     let out = a.option("out")
     try a.checkUnused()
 
-    let source = SystemAudioSource(processIDs: pids, clock: SessionClock())
+    let target = SystemAudioTarget(meetingApp: app)
+    if case .app(let app) = target {
+        let family = AudioProcesses.family(of: app, in: AudioProcesses.current())
+        eprint("\(app.displayName) processes: \(family.map { "\($0.bundleID) (\($0.pid))" }.joined(separator: ", "))")
+    }
+    let source = SystemAudioSource(target: target, clock: SessionClock())
+    let events = Task {
+        for await event in source.events {
+            switch event {
+            case .tapping(let target, let pids):
+                eprint("Tapping \(target)\(pids.isEmpty ? "" : " (pids \(pids.map(String.init).joined(separator: ",")))")")
+            case .fellBackToGlobal(let app, let reason): eprint("Recording all computer audio instead of \(app.displayName): \(reason)")
+            case .failed(let reason): eprint("Capture failed: \(reason)")
+            }
+        }
+    }
     let stream = try await source.start()
-    eprint("Capturing \(pids.map { "pids \($0.map(String.init).joined(separator: ","))" } ?? "all system audio") for \(seconds) s…")
+    eprint("Capturing \(target) for \(seconds) s…")
     let stopper = Task {
         try? await Task.sleep(for: .seconds(seconds))
         await source.stop()
@@ -774,6 +799,7 @@ func systemAudio(_ a: inout Arguments) async throws {
         }
     }
     stopper.cancel()
+    await events.value
     recorder?.close()
     let rms = frames > 0 ? (sumSquares / Double(frames)).squareRoot() : 0
     print("Chunks: \(chunks), frames: \(frames) at \(sampleRate) Hz (\(String(format: "%.2f", sampleRate > 0 ? Double(frames) / sampleRate : 0)) s)")
@@ -782,6 +808,92 @@ func systemAudio(_ a: inout Arguments) async throws {
         print("All samples were silent: nothing was playing, or this app lacks “Screen & System Audio Recording” permission.")
     }
     if let out, recorder != nil { print("Recorded to \(out)") }
+}
+
+/// `record`: a live meeting through the full pipeline (microphone + computer audio), then its transcript per
+/// channel and the report.
+@MainActor
+func record(_ a: inout Arguments) async throws {
+    let seconds = try a.double("seconds", default: 30)
+    let kind: MeetingKind =
+        switch a.option("kind")?.lowercased() {
+        case nil, "in-person", "inperson": .inPerson
+        case "online": .online
+        case let other?: throw UsageError("--kind must be in-person or online, got “\(other)”")
+        }
+    let app = try a.option("app").map { id in
+        guard let app = MeetingAppCatalog.app(forBundleID: id) else { throw UsageError("“\(id)” isn't a known meeting app") }
+        return app
+    }
+    let profileStore = SpeakerProfileStore(directory: directoryURL(a.option("profiles"), default: AppPaths.default.profiles))
+    let speechEngine = try a.option("engine").map(engine) ?? PlatformCapabilities.current().defaultSpeechEngine
+    let intelligence = try intelligenceKind(a.option("intelligence"))
+    let locale = a.option("locale") ?? AppSettings.systemLocaleID
+    let title = a.option("title")
+    let out = a.option("out")
+    let json = a.option("json")
+    let meetingsDir = directoryURL(
+        a.option("meetings"),
+        default: FileManager.default.temporaryDirectory.appending(path: "voiccenger-cli", directoryHint: .isDirectory))
+    let computerAudio = !a.flag("no-computer-audio")
+    let detect = a.flag("detect")
+    let analysis = !a.flag("no-analysis")
+    try a.checkUnused()
+
+    try await ensureDownloaded(speechEngine)
+    let profiles = await profileStore.all()
+    let detected = app.map { app in
+        DetectedMeeting(
+            app: app, processIDs: AudioProcesses.family(of: app, in: AudioProcesses.current()).map(\.pid), startedAt: Date())
+    }
+    let config = MeetingSession.Config(
+        title: title, kind: detected == nil ? kind : .online, detectedMeeting: detected, localeID: locale,
+        engineKind: intelligence, speechEngine: speechEngine, recordComputerAudio: computerAudio,
+        meetingsDirectory: meetingsDir, liveAnalysis: analysis)
+    let session = MeetingSession(config: config, profiles: profiles)
+    try await session.start()
+    let channels = config.kind == .online || computerAudio ? "microphone + computer audio" : "microphone"
+    eprint("Recording a\(config.kind == .online ? "n online" : "n in-person") meeting for \(seconds) s (\(channels))…")
+    let detector = detect ? MeetingDetector() : nil
+    let upgrades = Task { @MainActor in
+        guard let detector else { return }
+        for await event in detector.events() {
+            guard case .meetingStarted(let meeting) = event, session.detectedMeeting == nil else { continue }
+            eprint("\(meeting.app.displayName) started using the microphone: the meeting is now online.")
+            await session.upgradeToOnline(meeting)
+        }
+    }
+    try await Task.sleep(for: .seconds(seconds))
+    detector?.stop()
+    upgrades.cancel()
+    eprint("Finishing…")
+    let meeting = try await session.stop()
+
+    for channel in AudioChannel.allCases {
+        let lines = meeting.segments.filter { $0.channel == channel }.sorted { $0.range.start < $1.range.start }
+        print("\n\(channel == .microphone ? "Microphone" : "Computer audio") (\(lines.count) line\(lines.count == 1 ? "" : "s")):")
+        for line in lines {
+            let speaker = meeting.participant(line.speakerKey)?.displayName ?? line.speakerKey
+            print(String(format: "  [%6.1f–%6.1f] ", line.range.start, line.range.end) + "\(speaker): \(line.text)")
+        }
+    }
+    print("\nType: \(meeting.kind == .online ? "online" + (meeting.appName.map { " (\($0))" } ?? "") : "in person")")
+    print("Audio files: \(meeting.audioFiles.joined(separator: ", ")) in \(meetingsDir.appending(path: meeting.id.uuidString).path)")
+    if session.bleedLinesRemoved > 0 {
+        print("Microphone lines removed as speaker bleed: \(session.bleedLinesRemoved)")
+    }
+    for warning in meeting.captureWarnings { print(String(format: "Capture warning at %.0f s: ", warning.time) + warning.message) }
+    for warning in session.warnings { print("Warning: \(warning)") }
+
+    if let out {
+        try ReportRenderer.markdown(meeting)
+            .write(to: URL(fileURLWithPath: (out as NSString).expandingTildeInPath), atomically: true, encoding: .utf8)
+        eprint("Report written to \(out)")
+    }
+    if let json {
+        try MeetingStore.encoder.encode(meeting).write(to: URL(fileURLWithPath: (json as NSString).expandingTildeInPath))
+        eprint("Meeting JSON written to \(json)")
+    }
 }
 
 func doa(_ a: inout Arguments) throws {
@@ -857,6 +969,7 @@ let commandFlags: [String: Set<String>] = [
     "enroll": ["standard"],
     "calibrate": ["standard", "regions"],
     "process": ["no-analysis", "no-auto-language"],
+    "record": ["no-computer-audio", "detect", "no-analysis"],
     "models": ["refresh"],
     "capabilities": ["json"],
 ]
@@ -884,6 +997,7 @@ do {
     case "calibrate": try await calibrate(&args)
     case "process": try await process(&args)
     case "report": try await report(&args)
+    case "record": try await record(&args)
     case "doa": try doa(&args)
     case "system-audio": try await systemAudio(&args)
     default: throw UsageError("unknown command “\(command)”")

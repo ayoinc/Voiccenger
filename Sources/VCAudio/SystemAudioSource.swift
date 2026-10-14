@@ -1,321 +1,388 @@
-import AudioToolbox
 import CoreAudio
 import Foundation
 import VCModels
+import os
 
-/// Core Audio process tap (AudioHardwareCreateProcessTap + private aggregate device). processIDs nil/empty = all system output except this process.
-///
-/// The tap is a stereo mixdown of the selected processes' output; chunks carry its mono mixdown. The HAL
-/// IO block only copies samples into a lock-protected accumulator; a separate task re-blocks them into
-/// chunks, so no allocation-heavy work or stream delivery happens on the realtime IO thread.
-public final class SystemAudioSource: AudioSource {
-    public let channel: AudioChannel = .system
-    public let processIDs: [Int32]?
-    private let clock: SessionClock
-    private let chunkDuration: TimeInterval
-    private let state = Mutex(State())
-    private let accumulator = SampleAccumulator()
+/// What the system-audio channel records.
+public enum SystemAudioTarget: Sendable, Hashable, CustomStringConvertible {
+    /// Everything the Mac plays except Voiccenger itself.
+    case global
+    /// Every process of a native meeting app: helpers and companion daemons included, not only the processes
+    /// holding the microphone (`AudioProcesses.family`).
+    case app(MeetingApp)
 
-    /// UID prefix of the private aggregate devices this type creates (hidden from `AudioDevices`).
-    static let aggregateUIDPrefix = "com.voiccenger.systemtap."
-
-    private struct State {
-        var running = false
-        var tapID = AudioObjectID(kAudioObjectUnknown)
-        var aggregateID = AudioObjectID(kAudioObjectUnknown)
-        var ioProcID: AudioDeviceIOProcID?
-        var continuation: AsyncStream<AudioChunk>.Continuation?
-        var assembler: ChunkAssembler?
-        var pump: Task<Void, Never>?
-        var session: UInt64 = 0
-    }
-
-    /// Samples copied out of the IO block, waiting to be chunked.
-    private struct Accumulator {
-        var samples: [Float] = []
-        /// Session time at which the newest sample was captured.
-        var lastArrival: TimeInterval = 0
-        /// Upper bound so a stalled pump can't grow memory without limit (oldest samples are dropped).
-        var capacity = 0
-    }
-
-    /// Reference wrapper so the HAL IO block can capture the (noncopyable) lock.
-    private final class SampleAccumulator: Sendable {
-        private let lock = Mutex(Accumulator())
-
-        func withLock<R>(_ body: (inout Accumulator) -> R) -> R {
-            lock.withLock { body(&$0) }
+    /// The family tap for a native meeting app; the global tap for a browser (its meeting tab plays through
+    /// processes shared with every other tab) or when no meeting app is known.
+    public init(meetingApp: MeetingApp?) {
+        if let meetingApp, meetingApp.kind == .native {
+            self = .app(meetingApp)
+        } else {
+            self = .global
         }
     }
 
-    public init(processIDs: [Int32]?, clock: SessionClock, chunkDuration: TimeInterval = 0.1) {
-        self.processIDs = processIDs
+    public var description: String {
+        switch self {
+        case .global: "all computer audio"
+        case .app(let app): "\(app.displayName)'s audio"
+        }
+    }
+}
+
+/// Something the system-audio source did on its own that the session may want to log or show.
+public enum SystemAudioEvent: Sendable, Hashable {
+    /// A tap is running for `target` covering these pids (empty for the global tap).
+    case tapping(SystemAudioTarget, pids: [Int32])
+    /// The app's family tap was replaced by the global tap; `reason` says why.
+    case fellBackToGlobal(app: MeetingApp, reason: String)
+    /// No tap could be (re)built; the channel records silence until the next rebuild succeeds.
+    case failed(String)
+}
+
+let systemAudioLog = Logger(subsystem: "com.voiccenger.app", category: "system-audio")
+
+/// Records what the Mac plays through Core Audio process taps (`ProcessTapBackend`), independent of the output
+/// device, its volume and mute.
+///
+/// A meeting app's tap covers its whole process family and is rebuilt, without ending the stream, when a new
+/// family process starts using audio (the process list and each process's IsRunningOutput are watched). The
+/// timeline is continuous across rebuilds: the gap while the new tap starts is filled with silence, so the
+/// recording stays aligned with the session clock. While a family tap runs, a global probe tap measures the rest
+/// of the Mac's output: if the family stays silent while other audio carries speech for over 10 s (the meeting's
+/// sound is coming from a process the catalog doesn't know), the source switches to the global tap and says why.
+///
+/// All tap work (creation, rebuilds, draining) is serialized on one dispatch queue; the realtime IO callbacks only
+/// write to their tap's `TapSink`.
+public final class SystemAudioSource: AudioSource {
+    public let channel: AudioChannel = .system
+    /// What this source does on its own (taps built, fallbacks, failures). Finishes when the source stops.
+    public let events: AsyncStream<SystemAudioEvent>
+    private let eventSink: AsyncStream<SystemAudioEvent>.Continuation
+    private let clock: SessionClock
+    private let chunkDuration: TimeInterval
+    private let backend: any ProcessTapBackend
+    private let queue = DispatchQueue(label: "VCAudio.SystemAudioSource", qos: .userInitiated)
+    private let state: Mutex<State>
+
+    /// Delay that coalesces bursts of process-list changes (an app launching several helpers) into one rebuild.
+    static let rebuildDebounce: TimeInterval = 0.3
+
+    private struct Tap {
+        var tap: any ProcessTap
+        var sink: TapSink
+    }
+
+    private struct State {
+        var target: SystemAudioTarget
+        var running = false
+        var session: UInt64 = 0
+        var tap: Tap?
+        /// Process objects the current tap covers (empty for a global tap).
+        var tapped: Set<AudioObjectID> = []
+        var isGlobal = false
+        /// Global tap measuring the rest of the Mac's output while a family tap runs.
+        var probe: Tap?
+        var probeVAD = VoiceActivityDetector()
+        var fallback = SilentTapFallback()
+        var assembler: ChunkAssembler?
+        /// End of the last emitted chunk; the next tap continues the timeline from here.
+        var timelineEnd: TimeInterval?
+        var continuation: AsyncStream<AudioChunk>.Continuation?
+        var timer: DispatchSourceTimer?
+        var watch: (any ProcessWatch)?
+        var refreshScheduled = false
+    }
+
+    public convenience init(target: SystemAudioTarget, clock: SessionClock, chunkDuration: TimeInterval = 0.1) {
+        self.init(target: target, clock: clock, chunkDuration: chunkDuration, backend: CoreAudioTapBackend())
+    }
+
+    init(target: SystemAudioTarget, clock: SessionClock, chunkDuration: TimeInterval, backend: any ProcessTapBackend) {
         self.clock = clock
         self.chunkDuration = max(0.01, chunkDuration)
+        self.backend = backend
+        self.state = Mutex(State(target: target))
+        (events, eventSink) = AsyncStream.makeStream(of: SystemAudioEvent.self, bufferingPolicy: .unbounded)
     }
 
     deinit {
-        let s = state.withLock { s -> State in
-            let copy = s
-            s = State()
-            return copy
-        }
-        s.pump?.cancel()
-        Self.teardown(tapID: s.tapID, aggregateID: s.aggregateID, ioProcID: s.ioProcID)
-        s.continuation?.finish()
+        // Nothing else holds the source any more, so no queue hop is needed (and deinit may run on `queue`).
+        shutDown(session: nil)?.finish()
+        eventSink.finish()
     }
 
+    /// The target currently recorded (it changes when the source falls back to the global tap).
+    public var target: SystemAudioTarget { state.withLock { $0.target } }
+
     public func start() async throws -> AsyncStream<AudioChunk> {
-        let session: UInt64 = try state.withLock { s in
-            guard !s.running else { throw AudioCaptureError.alreadyRunning }
-            s.running = true
-            s.session &+= 1
-            return s.session
-        }
-        var tapID = AudioObjectID(kAudioObjectUnknown)
-        var aggregateID = AudioObjectID(kAudioObjectUnknown)
-        var ioProcID: AudioDeviceIOProcID?
-        do {
-            let description = try makeTapDescription()
-            var status = AudioHardwareCreateProcessTap(description, &tapID)
-            guard status == noErr else { throw Self.tapError(status) }
-
-            let format = try CoreAudioProperty.scalar(
-                AudioStreamBasicDescription.self, object: tapID,
-                address: CoreAudioProperty.address(kAudioTapPropertyFormat), operation: "read the tap format")
-            guard format.mFormatID == kAudioFormatLinearPCM,
-                format.mFormatFlags & kAudioFormatFlagIsFloat != 0, format.mBitsPerChannel == 32,
-                format.mChannelsPerFrame > 0, format.mSampleRate > 0
-            else { throw AudioCaptureError.unsupportedFormat("process tap delivers \(Self.describe(format))") }
-
-            aggregateID = try Self.createAggregateDevice(tapUID: description.uuid.uuidString)
-
-            let channels = Int(format.mChannelsPerFrame)
-            let interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-            let sampleRate = format.mSampleRate
-            state.withLock {
-                $0.assembler = ChunkAssembler(
-                    channel: .system, sampleRate: sampleRate, chunkDuration: chunkDuration, channelCount: 1,
-                    keepChannels: false)
-            }
-            accumulator.withLock {
-                $0 = Accumulator()
-                $0.capacity = Int(sampleRate * 30)
-                $0.samples.reserveCapacity(Int(sampleRate * chunkDuration * 4))
-            }
-
-            let block = Self.makeIOBlock(
-                accumulator: accumulator, clock: clock, channels: channels, interleaved: interleaved)
-            status = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, nil, block)
-            guard status == noErr, let ioProcID else {
-                throw AudioCaptureError.coreAudio(operation: "create the system audio IO callback", status: status)
-            }
-            status = AudioDeviceStart(aggregateID, ioProcID)
-            guard status == noErr else { throw Self.tapError(status) }
-        } catch {
-            Self.teardown(tapID: tapID, aggregateID: aggregateID, ioProcID: ioProcID)
-            state.withLock { $0 = State(session: $0.session) }
-            throw error
-        }
-
         let (stream, continuation) = AsyncStream.makeStream(
-            of: AudioChunk.self,
-            bufferingPolicy: .bufferingNewest(MicrophoneSource.bufferCapacity(chunkDuration)))
-        let pumpInterval = chunkDuration / 2
-        let pump = Task.detached { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(pumpInterval))
-                self?.drain()
+            of: AudioChunk.self, bufferingPolicy: .bufferingNewest(MicrophoneSource.bufferCapacity(chunkDuration)))
+        let session: UInt64 = try queue.sync {
+            let session = try state.withLock { s -> UInt64 in
+                guard !s.running else { throw AudioCaptureError.alreadyRunning }
+                s.running = true
+                s.session &+= 1
+                s.continuation = continuation
+                s.timelineEnd = nil
+                return s.session
             }
-        }
-        state.withLock {
-            $0.tapID = tapID
-            $0.aggregateID = aggregateID
-            $0.ioProcID = ioProcID
-            $0.continuation = continuation
-            $0.pump = pump
+            do {
+                try build(state.withLock { $0.target })
+            } catch {
+                shutDown(session: session)?.finish()
+                throw error
+            }
+            startTimer()
+            let watch = backend.watchProcesses { [weak self] in self?.processesChanged() }
+            state.withLock { $0.watch = watch }
+            return session
         }
         continuation.onTermination = { [weak self] _ in
-            self?.stop(session: session)
+            // Never on `queue` synchronously: termination can be triggered from inside it.
+            self?.queue.async { [weak self] in
+                self?.shutDown(session: session)?.finish()
+            }
         }
         return stream
     }
 
     public func stop() async {
-        stop(session: nil)
+        let continuation = queue.sync { shutDown(session: nil) }
+        continuation?.finish()
+        eventSink.finish()
     }
 
-    private func stop(session: UInt64?) {
-        let taken = state.withLock { s -> State? in
-            guard s.running, session == nil || session == s.session else { return nil }
-            let copy = s
-            s.running = false
-            s.tapID = AudioObjectID(kAudioObjectUnknown)
-            s.aggregateID = AudioObjectID(kAudioObjectUnknown)
-            s.ioProcID = nil
-            s.pump = nil
-            return copy
+    /// Switches what is recorded without ending the stream (a meeting app was detected mid-recording).
+    public func retarget(_ target: SystemAudioTarget) {
+        queue.async { [weak self] in
+            guard let self, state.withLock({ $0.running && $0.target != target }) else { return }
+            state.withLock {
+                $0.target = target
+                $0.fallback = SilentTapFallback()
+            }
+            rebuild()
         }
-        guard let taken else { return }
-        taken.pump?.cancel()
-        Self.teardown(tapID: taken.tapID, aggregateID: taken.aggregateID, ioProcID: taken.ioProcID)
+    }
+
+    // MARK: - Taps (on `queue`)
+
+    /// Builds the tap for `target`. A family with no process using audio falls back to the global tap.
+    private func build(_ target: SystemAudioTarget) throws {
+        var objects: [AudioProcessInfo]?
+        if case .app(let app) = target {
+            let own = getpid()
+            let family = AudioProcesses.family(of: app, in: backend.processes()).filter { $0.pid != own }
+            if family.isEmpty {
+                fallBack(from: app, reason: "no \(app.displayName) process is using audio")
+                return try build(.global)
+            }
+            objects = family
+        }
+        let reserve = chunkDuration * 4
+        let sink = TapSink()
+        let tap = try backend.startTap(
+            processObjects: objects?.map(\.objectID), clock: clock, sink: sink, reserve: reserve)
+        var probe: Tap?
+        if objects != nil {
+            let probeSink = TapSink()
+            if let probeTap = try? backend.startTap(processObjects: nil, clock: clock, sink: probeSink, reserve: reserve) {
+                probe = Tap(tap: probeTap, sink: probeSink)
+            }
+        }
+        state.withLock { s in
+            s.tap = Tap(tap: tap, sink: sink)
+            s.tapped = Set(objects?.map(\.objectID) ?? [])
+            s.isGlobal = objects == nil
+            s.probe = probe
+            s.probeVAD = VoiceActivityDetector()
+            s.assembler = ChunkAssembler(
+                channel: .system, sampleRate: tap.sampleRate, chunkDuration: chunkDuration, channelCount: 1,
+                keepChannels: false, continuing: s.timelineEnd)
+        }
+        let pids = objects?.map(\.pid) ?? []
+        systemAudioLog.info("Tapping \(target.description, privacy: .public) (pids \(pids, privacy: .public))")
+        eventSink.yield(.tapping(objects == nil ? .global : target, pids: pids))
+    }
+
+    /// Replaces the running tap with one for the current target; the timeline continues where it stopped.
+    private func rebuild() {
+        guard state.withLock({ $0.running }) else { return }
+        tearDownTaps()
+        do {
+            try build(state.withLock { $0.target })
+        } catch {
+            systemAudioLog.error("System audio tap failed: \(error.localizedDescription, privacy: .public)")
+            eventSink.yield(.failed(error.localizedDescription))
+        }
+    }
+
+    /// Stops the taps, emitting what they captured, and remembers where the timeline ended.
+    private func tearDownTaps() {
+        let (tap, probe) = state.withLock { s -> (Tap?, Tap?) in
+            defer {
+                s.tap = nil
+                s.probe = nil
+            }
+            return (s.tap, s.probe)
+        }
+        tap?.tap.stop()
+        probe?.tap.stop()
         drain()
         let (tail, continuation) = state.withLock { s -> (AudioChunk?, AsyncStream<AudioChunk>.Continuation?) in
-            defer {
-                s.assembler = nil
-                s.continuation = nil
-            }
-            return (s.assembler?.flush(), s.continuation)
+            let tail = s.assembler?.flush()
+            if let end = s.assembler?.emittedEnd { s.timelineEnd = end }
+            s.assembler = nil
+            return (tail, s.continuation)
         }
         if let tail { continuation?.yield(tail) }
-        continuation?.finish()
     }
 
-    /// Moves accumulated samples into fixed-size chunks and delivers them (runs off the IO thread).
-    private func drain() {
-        let (samples, arrival) = accumulator.withLock { a -> ([Float], TimeInterval) in
-            guard !a.samples.isEmpty else { return ([], a.lastArrival) }
-            let taken = a.samples
-            a.samples.removeAll(keepingCapacity: true)
-            return (taken, a.lastArrival)
+    /// Stops everything for `session` (nil: any) and returns the stream to finish outside `queue`.
+    @discardableResult
+    private func shutDown(session: UInt64?) -> AsyncStream<AudioChunk>.Continuation? {
+        let taken = state.withLock { s -> (DispatchSourceTimer?, (any ProcessWatch)?)? in
+            guard s.running, session == nil || session == s.session else { return nil }
+            s.running = false
+            defer {
+                s.timer = nil
+                s.watch = nil
+            }
+            return (s.timer, s.watch)
         }
-        guard !samples.isEmpty else { return }
+        guard let (timer, watch) = taken else { return nil }
+        timer?.cancel()
+        watch?.cancel()
+        tearDownTaps()
+        return state.withLock { s in
+            defer { s.continuation = nil }
+            return s.continuation
+        }
+    }
+
+    private func startTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let interval = chunkDuration / 2
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in self?.tick() }
+        state.withLock { $0.timer = timer }
+        timer.resume()
+    }
+
+    private func tick() {
+        guard let family = drain() else { return }
+        checkFallback(familySamples: family)
+    }
+
+    /// Moves the tap's samples into chunks and delivers them. Returns the samples drained (nil when stopped).
+    @discardableResult
+    private func drain() -> [Float]? {
+        guard let sink = state.withLock({ $0.tap?.sink }) else { return nil }
+        let (samples, arrival) = sink.take()
+        guard !samples.isEmpty else { return [] }
         let (chunks, continuation) = state.withLock { s -> ([AudioChunk], AsyncStream<AudioChunk>.Continuation?) in
             let out = samples.withUnsafeBufferPointer { buffer in
                 s.assembler?.append(frames: buffer.count, arrivalTime: arrival) { _ in buffer } ?? []
             }
+            if let end = s.assembler?.emittedEnd { s.timelineEnd = end }
             return (out, s.continuation)
         }
         for chunk in chunks { continuation?.yield(chunk) }
+        return samples
     }
 
-    // MARK: - Core Audio objects
+    // MARK: - Family changes and fallback (on `queue`)
 
-    private func makeTapDescription() throws -> CATapDescription {
-        let description: CATapDescription
-        if let pids = processIDs, !pids.isEmpty {
-            let objects = pids.compactMap(Self.processObject(pid:))
-            guard !objects.isEmpty else { throw AudioCaptureError.processesNotFound(pids: pids) }
-            description = CATapDescription(stereoMixdownOfProcesses: objects)
-        } else {
-            let own = Self.processObject(pid: getpid()).map { [$0] } ?? []
-            description = CATapDescription(stereoGlobalTapButExcludeProcesses: own)
-        }
-        description.uuid = UUID()
-        description.name = "Voiccenger system audio"
-        description.isPrivate = true
-        description.muteBehavior = .unmuted
-        return description
-    }
-
-    /// Core Audio process object for a pid (nil when the process has never touched audio).
-    static func processObject(pid: Int32) -> AudioObjectID? {
-        var qualifierPID = pid
-        let object = withUnsafeBytes(of: &qualifierPID) { qualifier in
-            try? CoreAudioProperty.scalar(
-                AudioObjectID.self, object: AudioObjectID(kAudioObjectSystemObject),
-                address: CoreAudioProperty.address(kAudioHardwarePropertyTranslatePIDToProcessObject),
-                qualifier: qualifier, operation: "translate pid \(pid)")
-        }
-        guard let object, object != kAudioObjectUnknown else { return nil }
-        return object
-    }
-
-    /// Private aggregate device whose only input is the tap. The default output device is its clock source.
-    private static func createAggregateDevice(tapUID: String) throws -> AudioObjectID {
-        var description: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "Voiccenger System Audio",
-            kAudioAggregateDeviceUIDKey: aggregateUIDPrefix + UUID().uuidString,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceTapListKey: [
-                [kAudioSubTapUIDKey: tapUID, kAudioSubTapDriftCompensationKey: true]
-            ],
-        ]
-        if let outputUID = defaultOutputDeviceUID() {
-            description[kAudioAggregateDeviceMainSubDeviceKey] = outputUID
-            description[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: outputUID]]
-        }
-        var aggregateID = AudioObjectID(kAudioObjectUnknown)
-        let status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggregateID)
-        guard status == noErr else {
-            throw AudioCaptureError.coreAudio(operation: "create the system audio capture device", status: status)
-        }
-        return aggregateID
-    }
-
-    private static func defaultOutputDeviceUID() -> String? {
-        guard let device = try? CoreAudioProperty.scalar(
-            AudioObjectID.self, object: AudioObjectID(kAudioObjectSystemObject),
-            address: CoreAudioProperty.address(kAudioHardwarePropertyDefaultSystemOutputDevice),
-            operation: "read the default output device"),
-            device != kAudioObjectUnknown
-        else { return nil }
-        return try? CoreAudioProperty.string(
-            object: device, address: CoreAudioProperty.address(kAudioDevicePropertyDeviceUID),
-            operation: "read the output device UID")
-    }
-
-    private static func teardown(tapID: AudioObjectID, aggregateID: AudioObjectID, ioProcID: AudioDeviceIOProcID?) {
-        if aggregateID != kAudioObjectUnknown {
-            if let ioProcID {
-                AudioDeviceStop(aggregateID, ioProcID)
-                AudioDeviceDestroyIOProcID(aggregateID, ioProcID)
+    private func processesChanged() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let schedule = state.withLock { s -> Bool in
+                guard s.running, !s.refreshScheduled, case .app = s.target else { return false }
+                s.refreshScheduled = true
+                return true
             }
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-        }
-        if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID) }
-    }
-
-    /// Built outside any isolation domain: the HAL calls it on its realtime IO thread. It only averages the
-    /// channels into the (pre-reserved) accumulator under a short lock.
-    private static func makeIOBlock(
-        accumulator: SampleAccumulator, clock: SessionClock, channels: Int, interleaved: Bool
-    ) -> AudioDeviceIOBlock {
-        { _, inputData, _, _, _ in
-            let arrival = clock.now()
-            let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
-            accumulator.withLock { a in
-                if interleaved {
-                    guard let buffer = buffers.first, let data = buffer.mData else { return }
-                    let perFrame = max(1, Int(buffer.mNumberChannels))
-                    let frames = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * perFrame)
-                    let samples = data.assumingMemoryBound(to: Float.self)
-                    let scale = 1 / Float(perFrame)
-                    for f in 0..<frames {
-                        var sum: Float = 0
-                        for c in 0..<perFrame { sum += samples[f * perFrame + c] }
-                        a.samples.append(sum * scale)
-                    }
-                } else {
-                    let planes = buffers.prefix(channels).compactMap { b -> UnsafeBufferPointer<Float>? in
-                        guard let data = b.mData else { return nil }
-                        return UnsafeBufferPointer(
-                            start: data.assumingMemoryBound(to: Float.self),
-                            count: Int(b.mDataByteSize) / MemoryLayout<Float>.size)
-                    }
-                    guard let frames = planes.map(\.count).min(), frames > 0 else { return }
-                    let scale = 1 / Float(planes.count)
-                    for f in 0..<frames {
-                        var sum: Float = 0
-                        for p in planes { sum += p[f] }
-                        a.samples.append(sum * scale)
-                    }
-                }
-                a.lastArrival = arrival
-                if a.capacity > 0, a.samples.count > a.capacity {
-                    a.samples.removeFirst(a.samples.count - a.capacity)
-                }
+            guard schedule else { return }
+            queue.asyncAfter(deadline: .now() + Self.rebuildDebounce) { [weak self] in
+                self?.state.withLock { $0.refreshScheduled = false }
+                self?.refreshFamily()
             }
         }
     }
 
-    private static func tapError(_ status: OSStatus) -> AudioCaptureError {
-        .coreAudio(operation: "start capturing system audio", status: status)
+    /// Rebuilds the family tap when a family process it doesn't cover has appeared.
+    private func refreshFamily() {
+        let (target, tapped, isGlobal) = state.withLock { ($0.target, $0.tapped, $0.isGlobal) }
+        guard case .app(let app) = target else { return }
+        let own = getpid()
+        let family = Set(
+            AudioProcesses.family(of: app, in: backend.processes()).filter { $0.pid != own }.map(\.objectID))
+        guard !family.isEmpty, isGlobal || !family.isSubset(of: tapped) else { return }
+        systemAudioLog.info("\(app.displayName, privacy: .public) has new audio processes; rebuilding its tap")
+        rebuild()
     }
 
-    private static func describe(_ f: AudioStreamBasicDescription) -> String {
-        "\(f.mChannelsPerFrame) ch, \(f.mBitsPerChannel)-bit, \(f.mSampleRate) Hz, flags \(f.mFormatFlags)"
+    private func checkFallback(familySamples: [Float]) {
+        let probe = state.withLock { s -> (TapSink, Double)? in
+            guard let probe = s.probe else { return nil }
+            return (probe.sink, probe.tap.sampleRate)
+        }
+        guard let (probeSink, probeRate) = probe else { return }
+        let (global, arrival) = probeSink.take()
+        let audible = SilentTapFallback.isAudible(familySamples)
+        let switchNow = state.withLock { s -> Bool in
+            let speech = s.probeVAD.process(global, sampleRate: probeRate).filter { $0 }.count
+            let seconds = Double(speech) * s.probeVAD.frameDuration
+            return s.fallback.update(familyAudible: audible, globalSpeechSeconds: seconds, at: arrival)
+        }
+        guard switchNow, case .app(let app) = state.withLock({ $0.target }) else { return }
+        let reason = String(
+            format: "%@ stayed silent while other audio on this Mac carried speech for over %.0f s",
+            app.displayName, SilentTapFallback.requiredSpeechSeconds)
+        fallBack(from: app, reason: reason)
+        rebuild()
+    }
+
+    private func fallBack(from app: MeetingApp, reason: String) {
+        systemAudioLog.notice(
+            "Recording all computer audio instead of \(app.displayName, privacy: .public): \(reason, privacy: .public)")
+        state.withLock { $0.target = .global }
+        eventSink.yield(.fellBackToGlobal(app: app, reason: reason))
+    }
+}
+
+/// Decides when a silent family tap should give way to the global tap: the family has been inaudible while the
+/// rest of the Mac's output carried more than `requiredSpeechSeconds` of speech, with no pause in that speech
+/// longer than `maximumPause`. Any audible family audio starts the count afresh. Pure; time is session seconds.
+struct SilentTapFallback: Sendable {
+    static let requiredSpeechSeconds: TimeInterval = 10
+    static let maximumPause: TimeInterval = 5
+    /// Below this the family tap counts as silent (−41 dBFS speech from a quiet output is far above it).
+    static let audibleDB: Float = -70
+
+    private var speechSeconds: TimeInterval = 0
+    private var lastSpeech: TimeInterval?
+
+    static func isAudible(_ samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return false }
+        var sum: Float = 0
+        for s in samples { sum += s * s }
+        return 10 * log10(max(sum / Float(samples.count), 1e-12)) > audibleDB
+    }
+
+    /// Feeds one interval ending at `time`; returns true once the family should be abandoned.
+    mutating func update(familyAudible: Bool, globalSpeechSeconds: TimeInterval, at time: TimeInterval) -> Bool {
+        if familyAudible {
+            speechSeconds = 0
+            lastSpeech = nil
+            return false
+        }
+        if let last = lastSpeech, time - last > Self.maximumPause {
+            speechSeconds = 0
+            lastSpeech = nil
+        }
+        if globalSpeechSeconds > 0 {
+            speechSeconds += globalSpeechSeconds
+            lastSpeech = time
+        }
+        return speechSeconds > Self.requiredSpeechSeconds
     }
 }

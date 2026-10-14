@@ -43,6 +43,21 @@ struct AppSettingsTests {
         #expect(AppSettings(defaults: defaults).speechEngine == .cohere)
     }
 
+    @Test("Computer audio is recorded in person by default; turning it off persists and reaches new meetings")
+    func computerAudioInPerson() throws {
+        let suite = "vc-settings-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let fresh = AppSettings(defaults: defaults)
+        #expect(fresh.recordComputerAudioInPerson)
+        #expect(fresh.sessionConfig(kind: .inPerson, detected: nil, meetingsDirectory: FileManager.default.temporaryDirectory).recordComputerAudio)
+
+        fresh.recordComputerAudioInPerson = false
+        let reloaded = AppSettings(defaults: defaults)
+        #expect(!reloaded.recordComputerAudioInPerson)
+        #expect(!reloaded.sessionConfig(kind: .inPerson, detected: nil, meetingsDirectory: FileManager.default.temporaryDirectory).recordComputerAudio)
+    }
+
     @Test("Recording waits for consent until acknowledged, and the acknowledgement persists")
     func recordingConsentGate() async throws {
         let suite = "vc-settings-\(UUID().uuidString)"

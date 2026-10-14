@@ -41,6 +41,9 @@ public final class MeetingSession {
         /// Names and jargon to recognize (enrolled names and vocabularies are added automatically).
         public var contextualStrings: [String]
         public var recordAudio: Bool
+        /// In-person meetings also record the computer's audio (online meetings always do): with headphones on,
+        /// a remote party's voice never reaches the microphone.
+        public var recordComputerAudio: Bool
         /// Root of the `MeetingStore` the finished meeting is saved to.
         public var meetingsDirectory: URL
         public var speakerConfig: SpeakerIDConfig
@@ -61,7 +64,7 @@ public final class MeetingSession {
             engineKind: IntelligenceEngineKind = .apple, speechEngine: SpeechEngineKind = .cohere,
             deepgramModel: String = Deepgram.defaultModel,
             spelling: SpellingVariant = .unchanged, contextualStrings: [String] = [], recordAudio: Bool = true,
-            meetingsDirectory: URL = AppPaths.default.meetings, speakerConfig: SpeakerIDConfig = .init(),
+            recordComputerAudio: Bool = true, meetingsDirectory: URL = AppPaths.default.meetings, speakerConfig: SpeakerIDConfig = .init(),
             mode: ProcessingMode = .live, liveAnalysis: Bool = true, alignmentTimeout: TimeInterval = 15,
             analysisBacklog: Int = 6, analysisContextLines: Int = 8
         ) {
@@ -78,6 +81,7 @@ public final class MeetingSession {
             self.spelling = spelling
             self.contextualStrings = contextualStrings
             self.recordAudio = recordAudio
+            self.recordComputerAudio = recordComputerAudio
             self.meetingsDirectory = meetingsDirectory
             self.speakerConfig = speakerConfig
             self.mode = mode
@@ -118,6 +122,10 @@ public final class MeetingSession {
 
     public let id: UUID
     public let config: Config
+    /// Starts as `config.kind`; an in-person recording becomes online when a meeting app starts using the mic.
+    public private(set) var kind: MeetingKind
+    /// The conferencing app the meeting runs in (from detection, at the start or mid-recording).
+    public private(set) var detectedMeeting: DetectedMeeting?
     public private(set) var state: State = .idle
     public private(set) var startedAt: Date?
     public private(set) var endedAt: Date?
@@ -135,6 +143,10 @@ public final class MeetingSession {
     public private(set) var latestDirection: DirectionEstimate?
     /// Non-fatal problems (a source or model that couldn't start, analysis failures).
     public private(set) var warnings: [String] = []
+    /// Capture problems in effect now (a silent meeting app, a silenced microphone); see `CaptureHealthMonitor`.
+    public private(set) var captureWarnings: [CaptureWarning] = []
+    /// Microphone lines dropped because they repeated the computer's audio heard through the speakers.
+    public private(set) var bleedLinesRemoved = 0
     /// Set when the report couldn't be generated; the meeting is still saved.
     public private(set) var reportError: String?
     public private(set) var intelligenceEngineName: String?
@@ -154,6 +166,8 @@ public final class MeetingSession {
     @ObservationIgnored private let library: SpeechModelLibrary
     @ObservationIgnored private var clock: SessionClock?
     @ObservationIgnored private var sources: [any AudioSource] = []
+    @ObservationIgnored private var systemSource: SystemAudioSource?
+    @ObservationIgnored private var health = CaptureHealthMonitor()
     @ObservationIgnored private var transcribers: [AudioChannel: any ChannelTranscriber] = [:]
     @ObservationIgnored private var identifiers: [AudioChannel: SpeakerIdentifier] = [:]
     /// Capture loops; each returns the session time of the end of the last chunk it forwarded.
@@ -192,6 +206,8 @@ public final class MeetingSession {
     public init(config: Config, profiles: [SpeakerProfile], id: UUID = UUID(), library: SpeechModelLibrary = .shared) {
         self.id = id
         self.config = config
+        self.kind = config.kind
+        self.detectedMeeting = config.detectedMeeting
         self.profiles = profiles
         self.voices = SessionVoices(
             profiles: profiles, contextualStrings: config.contextualStrings, sessionSpelling: config.spelling)
@@ -205,20 +221,58 @@ public final class MeetingSession {
 
     // MARK: - Lifecycle
 
-    /// Starts live capture: the microphone always, plus the meeting app's audio for online meetings.
+    /// Starts live capture: the microphone, plus the computer's audio for online meetings and (unless turned off)
+    /// in-person ones. A native meeting app's whole process family is tapped; a browser or no app taps everything
+    /// the Mac plays except Voiccenger.
     public func start() async throws {
-        var channels: [AudioChannel] = [.microphone]
-        if config.kind == .online { channels.append(.system) }
         let config = self.config
-        try await run(channels: channels) { clock in
+        let computerAudio = config.kind == .online || config.recordComputerAudio
+        let target = SystemAudioTarget(meetingApp: config.detectedMeeting?.app)
+        try await run(channels: computerAudio ? [.microphone, .system] : [.microphone]) { clock in
             var sources: [any AudioSource] = [
                 MicrophoneSource(
                     deviceUID: config.microphoneDeviceUID, arrayGeometry: config.arrayGeometry, clock: clock)
             ]
-            if config.kind == .online {
-                sources.append(SystemAudioSource(processIDs: config.detectedMeeting?.processIDs, clock: clock))
-            }
+            if computerAudio { sources.append(SystemAudioSource(target: target, clock: clock)) }
             return sources
+        }
+    }
+
+    /// A meeting app started using the microphone during a recording that had none: the meeting becomes online in
+    /// that app, and the computer-audio channel narrows to the app's processes (starting it if it was off),
+    /// without restarting the recording.
+    public func upgradeToOnline(_ meeting: DetectedMeeting) async {
+        guard state == .recording, config.mode == .live, detectedMeeting == nil else { return }
+        kind = .online
+        detectedMeeting = meeting
+        health.setMeetingApp(meeting.app.displayName, at: now())
+        let target = SystemAudioTarget(meetingApp: meeting.app)
+        if let systemSource {
+            systemSource.retarget(target)
+        } else {
+            await startComputerAudio(target: target)
+        }
+    }
+
+    /// Adds the computer-audio channel to a running recording.
+    private func startComputerAudio(target: SystemAudioTarget) async {
+        guard let clock else { return }
+        do {
+            try await prepare(channel: .system)
+            let source = SystemAudioSource(target: target, clock: clock)
+            let stream = try await source.start()
+            guard state == .recording else {
+                await source.stop()
+                await transcribers.removeValue(forKey: .system)?.finish()
+                return
+            }
+            sources.append(source)
+            launch(source: source, stream: stream)
+            if let transcriber = transcribers[.system] { launchEvents(channel: .system, transcriber: transcriber) }
+        } catch {
+            warn("Meeting audio couldn't be captured (\(error.localizedDescription)); recording the microphone only.")
+            await transcribers.removeValue(forKey: .system)?.finish()
+            identifiers.removeValue(forKey: .system)
         }
     }
 
@@ -271,10 +325,10 @@ public final class MeetingSession {
         endedAt = live ? Date() : (startedAt ?? Date()).addingTimeInterval(audioEnd)
 
         var meeting = Meeting(
-            id: id, title: config.title ?? defaultTitle(), kind: config.kind,
-            appName: config.detectedMeeting?.app.displayName, startedAt: startedAt ?? Date(), endedAt: endedAt,
+            id: id, title: config.title ?? defaultTitle(), kind: kind,
+            appName: detectedMeeting?.app.displayName, startedAt: startedAt ?? Date(), endedAt: endedAt,
             participants: participants, segments: segments, report: nil, audioFiles: audioFiles,
-            localeIDs: localesUsed)
+            localeIDs: localesUsed, captureWarnings: health.raised)
         meeting.report = await generateReport(for: meeting)
         if config.title == nil, let title = meeting.report?.title.nonEmpty { meeting.title = title }
 
@@ -346,6 +400,7 @@ public final class MeetingSession {
             }
             sources = started.map(\.0)
             startedAt = Date()
+            if config.mode == .live { health.setMeetingApp(detectedMeeting?.app.displayName, at: 0) }
             for (source, stream) in started { launch(source: source, stream: stream) }
             for (channel, transcriber) in transcribers { launchEvents(channel: channel, transcriber: transcriber) }
             launchAnalysis()
@@ -381,33 +436,7 @@ public final class MeetingSession {
         }
         if voices.mayReroute(sessionLanguage: sessionLanguage) { archive = MeetingAudioArchive() }
 
-        for channel in channels {
-            let transcriber = makeTranscriber(channel: channel)
-            try await transcriber.start()
-            if let deepgram = transcriber as? DeepgramLiveTranscriber {
-                if let reason = await deepgram.fallbackReason {
-                    warn("Deepgram isn't transcribing this meeting (\(reason)); lines are transcribed on this Mac instead.")
-                } else if let reason = await deepgram.modelFallbackReason {
-                    warn("\(reason).")
-                    liveDeepgramModel = Deepgram.defaultModel
-                } else {
-                    liveDeepgramModel = config.deepgramModel
-                }
-            }
-            transcribers[channel] = transcriber
-            currentLocales[channel] = config.localeID
-            noteLocale(config.localeID)
-
-            let identifier = SpeakerIdentifier(channel: channel, config: config.speakerConfig)
-            do {
-                try await identifier.prepare()
-                await identifier.setProfiles(profiles)
-                identifiers[channel] = identifier
-            } catch {
-                warn("Speaker identification is unavailable (\(error.localizedDescription)); lines will be unattributed.")
-                pending.markComplete(channel)
-            }
-        }
+        for channel in channels { try await prepare(channel: channel) }
 
         // The engine is needed for the report even when live analysis is off.
         let choice = ReportWriter.engine(preferring: config.engineKind)
@@ -416,6 +445,35 @@ public final class MeetingSession {
             warn("The selected intelligence engine is unavailable; using \(choice.engine.engineName) instead.")
         }
         intelligenceEngineName = choice.engine.engineName
+    }
+
+    /// Starts the transcriber and speaker identifier for one channel.
+    private func prepare(channel: AudioChannel) async throws {
+        let transcriber = makeTranscriber(channel: channel)
+        try await transcriber.start()
+        if let deepgram = transcriber as? DeepgramLiveTranscriber {
+            if let reason = await deepgram.fallbackReason {
+                warn("Deepgram isn't transcribing this meeting (\(reason)); lines are transcribed on this Mac instead.")
+            } else if let reason = await deepgram.modelFallbackReason {
+                warn("\(reason).")
+                liveDeepgramModel = Deepgram.defaultModel
+            } else {
+                liveDeepgramModel = config.deepgramModel
+            }
+        }
+        transcribers[channel] = transcriber
+        currentLocales[channel] = config.localeID
+        noteLocale(config.localeID)
+
+        let identifier = SpeakerIdentifier(channel: channel, config: config.speakerConfig)
+        do {
+            try await identifier.prepare()
+            await identifier.setProfiles(profiles)
+            identifiers[channel] = identifier
+        } catch {
+            warn("Speaker identification is unavailable (\(error.localizedDescription)); lines will be unattributed.")
+            pending.markComplete(channel)
+        }
     }
 
     /// Deepgram streams when it's the meeting's engine (falling back to on-device per channel when it can't be
@@ -450,11 +508,21 @@ public final class MeetingSession {
 
     /// One capture loop per source; every chunk is copied to independent consumer streams so a slow
     /// consumer (transcriber, diarizer, archive, recorder, DOA) never blocks capture or the others.
+    ///
+    /// Computer audio goes through `AutomaticGainControl` before transcription, speaker identification and the
+    /// archive (quiet outputs such as HDMI monitors arrive ~20 dB down); the recording keeps the raw audio. Its
+    /// speech times also reach the microphone's identifier and the voice-clip collector, so the computer's audio
+    /// heard through the speakers is never matched to, or enrolled as, someone in the room.
     private func launch(source: any AudioSource, stream: AsyncStream<AudioChunk>) {
         let channel = source.channel
         var sinks: [AsyncStream<AudioChunk>.Continuation] = []
+        var rawSinks: [AsyncStream<AudioChunk>.Continuation] = []
         let offline = config.mode == .offline
 
+        if let system = source as? SystemAudioSource {
+            systemSource = system
+            observe(system)
+        }
         if let transcriber = transcribers[channel] {
             let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
             sinks.append(c)
@@ -474,6 +542,13 @@ public final class MeetingSession {
             sinks.append(c)
             consumerTasks.append(Task.detached { await Self.feedArchive(s, archive, channel: channel) })
         }
+        if channel == .system {
+            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
+            sinks.append(c)
+            let micIdentifier = identifiers[.microphone]
+            let collector = self.collector
+            consumerTasks.append(Task.detached { await Self.feedSystemSpeech(s, micIdentifier, collector) })
+        }
         if channel == .microphone, let geometry = config.arrayGeometry {
             // Direction is advisory live: keep only the newest chunks if estimation falls behind.
             let (s, c) = AsyncStream.makeStream(
@@ -484,7 +559,7 @@ public final class MeetingSession {
         }
         if config.recordAudio {
             let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
-            sinks.append(c)
+            rawSinks.append(c)
             let name = "\(channel.rawValue).wav"
             let url = MeetingStore(directory: config.meetingsDirectory).directory(for: id).appending(path: name)
             recorderTasks.append(Task.detached { [weak self] in await Self.record(s, to: url, session: self) })
@@ -499,18 +574,85 @@ public final class MeetingSession {
             }
         }
         let outputs = sinks
+        let raw = rawSinks
         let tap = meter
+        let normalize = channel == .system
+        var levels: (@Sendable (LevelWindow) -> Void)?
+        if !offline {
+            levels = { [weak self] window in
+                Task { @MainActor in self?.noteLevels(window, channel: channel) }
+            }
+        }
+        let report = levels
         captureTasks.append(
             Task.detached {
                 var end = 0.0
+                var gain = AutomaticGainControl()
+                var window = LevelWindow()
                 for await chunk in stream {
-                    for sink in outputs { sink.yield(chunk) }
+                    for sink in raw { sink.yield(chunk) }
+                    let processed = normalize ? gain.process(chunk) : chunk
+                    for sink in outputs { sink.yield(processed) }
                     tap?(chunk)
+                    if let report, let full = window.add(chunk) { report(full) }
                     end = max(end, chunk.range.end)
                 }
-                for sink in outputs { sink.finish() }
+                for sink in outputs + raw { sink.finish() }
                 return end
             })
+    }
+
+    /// Raw level of half a second of one channel, for the capture-health rules.
+    struct LevelWindow: Sendable {
+        static let seconds = 0.5
+        var sumSquares: Double = 0
+        var count = 0
+        var peak: Float = 0
+        var end: TimeInterval = 0
+        private var start: TimeInterval?
+
+        var rmsDB: Double { 10 * log10(max(sumSquares / Double(max(count, 1)), 1e-12)) }
+
+        /// Adds a chunk; returns the window and starts a new one once it spans `seconds`.
+        mutating func add(_ chunk: AudioChunk) -> LevelWindow? {
+            if start == nil { start = chunk.startTime }
+            for s in chunk.samples {
+                sumSquares += Double(s * s)
+                peak = max(peak, abs(s))
+            }
+            count += chunk.samples.count
+            end = chunk.range.end
+            guard end - start! >= Self.seconds else { return nil }
+            defer { self = LevelWindow() }
+            return self
+        }
+    }
+
+    private func noteLevels(_ window: LevelWindow, channel: AudioChannel) {
+        switch channel {
+        case .microphone: health.microphone(peak: window.peak, at: window.end)
+        case .system: health.system(rmsDB: window.rmsDB, at: window.end)
+        }
+    }
+
+    /// Logs what the computer-audio source did on its own (falling back to the global tap, failing).
+    private func observe(_ system: SystemAudioSource) {
+        let events = system.events
+        eventTasks.append(
+            Task.detached { [weak self] in
+                for await event in events { await self?.handle(event) }
+            })
+    }
+
+    private func handle(_ event: SystemAudioEvent) {
+        switch event {
+        case .tapping:
+            break
+        case .fellBackToGlobal(let app, let reason):
+            warn("Recording all computer audio instead of only \(app.displayName)'s: \(reason).")
+        case .failed(let reason):
+            warn("Computer audio couldn't be captured (\(reason)); the meeting's remote side may be missing.")
+        }
     }
 
     private func launchEvents(channel: AudioChannel, transcriber: any ChannelTranscriber) {
@@ -526,8 +668,14 @@ public final class MeetingSession {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 self?.releasePending()
+                self?.checkHealth()
             }
         }
+    }
+
+    private func checkHealth() {
+        health.inputVolume(AudioDevices.inputVolume(deviceUID: config.microphoneDeviceUID))
+        if health.evaluate(at: now()) { captureWarnings = health.active }
     }
 
     private func observeEngineStatuses() {
@@ -540,6 +688,19 @@ public final class MeetingSession {
     private nonisolated static func feedTranscriber(_ stream: AsyncStream<AudioChunk>, _ t: any ChannelTranscriber) async {
         for await chunk in stream { await t.append(chunk) }
         await t.finish()
+    }
+
+    /// Tells the microphone's identifier and the clip collector when the computer's audio carried speech.
+    private nonisolated static func feedSystemSpeech(
+        _ stream: AsyncStream<AudioChunk>, _ micIdentifier: SpeakerIdentifier?, _ collector: VoiceClipCollector
+    ) async {
+        var detector = SpeechSpanDetector()
+        for await chunk in stream {
+            let spans = detector.spans(in: chunk)
+            guard !spans.isEmpty else { continue }
+            await micIdentifier?.excludeFromMatching(spans)
+            await collector.excludeSystemSpeech(spans)
+        }
     }
 
     private nonisolated static func feedArchive(
@@ -704,18 +865,23 @@ public final class MeetingSession {
         let nearby = (turns[update.channel] ?? []).filter { $0.range.overlap(with: window) > 0 }
         noteLocale(update.localeID)
         for piece in TranscriptAligner.align(update: update, turns: nearby) {
+            let segment = TranscriptSegment(
+                channel: update.channel, speakerKey: piece.speakerKey, range: piece.range,
+                text: voices.customize(piece.text, speakerKey: piece.speakerKey), confidence: piece.confidence,
+                localeID: update.localeID,
+                direction: update.channel == .microphone ? direction(during: piece.range) : nil, engine: update.engine)
+            if isBleed(segment) {
+                bleedLinesRemoved += 1
+                continue
+            }
             roster.ensure(key: piece.speakerKey, channel: update.channel)
             if piece.speakerKey == TranscriptAligner.unknownSpeakerKey(for: update.channel) {
                 // Unattributed speech has no turn to credit its time from.
                 roster.addSpeakingTime(piece.range.duration, for: piece.speakerKey)
             }
             roster.setLocale(update.localeID, for: piece.speakerKey)
-            let segment = TranscriptSegment(
-                channel: update.channel, speakerKey: piece.speakerKey, range: piece.range,
-                text: voices.customize(piece.text, speakerKey: piece.speakerKey), confidence: piece.confidence,
-                localeID: update.localeID,
-                direction: update.channel == .microphone ? direction(during: piece.range) : nil, engine: update.engine)
             segments.append(segment)
+            if segment.channel == .system { removeBleed(repeating: segment) }
             if let archive,
                 let route = voices.route(
                     speakerKey: piece.speakerKey, segmentEngine: update.engine,
@@ -728,6 +894,27 @@ public final class MeetingSession {
                 enqueueAnalysis(of: segment)
             }
         }
+    }
+
+    // MARK: - Bleed
+
+    /// A microphone line that repeats the computer's audio heard through the speakers (`BleedSuppression`).
+    private func isBleed(_ segment: TranscriptSegment) -> Bool {
+        guard segment.channel == .microphone else { return false }
+        let system = segments.filter { $0.channel == .system && $0.range.overlap(with: segment.range) > 0 }
+        return BleedSuppression.isBleed(segment, system: system)
+    }
+
+    /// Removes microphone lines that turn out to repeat the system line `segment` (the mic's copy is often
+    /// finalised first).
+    private func removeBleed(repeating segment: TranscriptSegment) {
+        let bleed = Set(
+            segments.filter { $0.channel == .microphone && $0.range.overlap(with: segment.range) > 0 && isBleed($0) }
+                .map(\.id))
+        guard !bleed.isEmpty else { return }
+        segments.removeAll { bleed.contains($0.id) }
+        attentionItems.removeAll { bleed.contains($0.segmentID) }
+        bleedLinesRemoved += bleed.count
     }
 
     /// Audio either side of a line included when it's re-transcribed, so edge words aren't clipped.
@@ -768,7 +955,15 @@ public final class MeetingSession {
                 noteLocale(route.languageCode)
             }
         }
-        enqueueAnalysis(of: segments[i])
+        // The new text may now show the line repeats (or is repeated by) the computer's audio.
+        let segment = segments[i]
+        if isBleed(segment) {
+            segments.remove(at: i)
+            bleedLinesRemoved += 1
+            return
+        }
+        if segment.channel == .system { removeBleed(repeating: segment) }
+        enqueueAnalysis(of: segment)
     }
 
     private func rerouteFailed(_ route: EngineRoute, _ error: Error) {
@@ -916,8 +1111,8 @@ public final class MeetingSession {
     private func defaultTitle() -> String {
         if let sourceName { return sourceName }
         let date = (startedAt ?? Date()).formatted(date: .abbreviated, time: .shortened)
-        if let app = config.detectedMeeting?.app.displayName { return "\(app) meeting, \(date)" }
-        return config.kind == .online ? "Online meeting, \(date)" : "Meeting, \(date)"
+        if let app = detectedMeeting?.app.displayName { return "\(app) meeting, \(date)" }
+        return kind == .online ? "Online meeting, \(date)" : "Meeting, \(date)"
     }
 
     /// Awaits `task`, cancelling it if it hasn't finished within `timeout`. Returns the task's value.

@@ -25,6 +25,9 @@ actor VoiceClipCollector {
 
     private var history: [AudioChannel: History] = [:]
     private var clips: [String: Clip] = [:]
+    /// When the computer's audio carried speech (sorted, merged): the microphone may hear it through the
+    /// speakers, so those stretches never go into a microphone speaker's clip.
+    private var systemSpeech: [TimeRange] = []
 
     func append(_ chunk: AudioChunk) {
         guard chunk.sampleRate > 0, !chunk.samples.isEmpty else { return }
@@ -46,20 +49,48 @@ actor VoiceClipCollector {
         history[chunk.channel] = h
     }
 
+    /// Computer audio carried speech during `ranges`.
+    func excludeSystemSpeech(_ ranges: [TimeRange]) {
+        var merged: [TimeRange] = []
+        for range in (systemSpeech + ranges).sorted(by: { $0.start < $1.start }) where range.duration > 0 {
+            if let last = merged.last, range.start <= last.end {
+                merged[merged.count - 1].end = max(last.end, range.end)
+            } else {
+                merged.append(range)
+            }
+        }
+        let horizon = (merged.last?.end ?? 0) - Self.historySeconds * 2
+        systemSpeech = merged.filter { $0.end >= horizon }
+    }
+
     func collect(_ turns: [SpeakerTurn]) {
         for turn in turns {
             guard let h = history[turn.channel] else { continue }
-            let from = Int(((turn.range.start - h.startTime) * h.sampleRate).rounded())
-            let to = Int(((turn.range.end - h.startTime) * h.sampleRate).rounded())
-            let lo = max(0, from), hi = min(h.samples.count, to)
-            guard hi > lo else { continue }
             var clip = clips[turn.speakerKey] ?? Clip(sampleRate: h.sampleRate)
             guard clip.sampleRate == h.sampleRate else { continue }
-            let room = Int(Self.clipSeconds * h.sampleRate) - clip.samples.count
-            guard room > 0 else { continue }
-            clip.samples.append(contentsOf: h.samples[lo..<min(hi, lo + room)])
-            clips[turn.speakerKey] = clip
+            let pieces = turn.channel == .microphone ? Self.subtract(systemSpeech, from: turn.range) : [turn.range]
+            for piece in pieces {
+                let from = Int(((piece.start - h.startTime) * h.sampleRate).rounded())
+                let to = Int(((piece.end - h.startTime) * h.sampleRate).rounded())
+                let lo = max(0, from), hi = min(h.samples.count, to)
+                let room = Int(Self.clipSeconds * h.sampleRate) - clip.samples.count
+                guard hi > lo, room > 0 else { continue }
+                clip.samples.append(contentsOf: h.samples[lo..<min(hi, lo + room)])
+            }
+            if !clip.samples.isEmpty { clips[turn.speakerKey] = clip }
         }
+    }
+
+    /// The parts of `range` outside `excluded` (sorted, non-overlapping).
+    static func subtract(_ excluded: [TimeRange], from range: TimeRange) -> [TimeRange] {
+        var pieces: [TimeRange] = []
+        var start = range.start
+        for e in excluded where e.end > start && e.start < range.end {
+            if e.start > start { pieces.append(TimeRange(start: start, end: e.start)) }
+            start = max(start, e.end)
+        }
+        if range.end > start { pieces.append(TimeRange(start: start, end: range.end)) }
+        return pieces
     }
 
     /// The speaker's collected audio resampled to 16 kHz.

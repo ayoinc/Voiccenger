@@ -11,8 +11,6 @@ public enum AudioCaptureError: Error, LocalizedError, Equatable, Sendable {
     case deviceNotFound(uid: String)
     /// A microphone-array channel map refers to channels the device does not have.
     case invalidChannelMap(channelMap: [Int], deviceChannelCount: Int)
-    /// None of the requested process IDs is known to Core Audio (the processes are not running or have never used audio).
-    case processesNotFound(pids: [Int32])
     /// The stream format cannot be captured by this module.
     case unsupportedFormat(String)
     /// `start()` was called on a source that is already running.
@@ -36,8 +34,6 @@ public enum AudioCaptureError: Error, LocalizedError, Equatable, Sendable {
             "The audio input device “\(uid)” is not connected."
         case .invalidChannelMap(let map, let count):
             "The microphone array channel map \(map) does not fit a device with \(count) input channel\(count == 1 ? "" : "s")."
-        case .processesNotFound(let pids):
-            "None of the processes \(pids.map(String.init).joined(separator: ", ")) is producing audio."
         case .unsupportedFormat(let detail):
             "Unsupported audio format: \(detail)."
         case .alreadyRunning:

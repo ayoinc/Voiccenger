@@ -102,6 +102,7 @@ public enum ReportRenderer {
             lines.append("- **Transcribed by:** \(SpeechModelLibrary.info(engine).displayName)")
         }
         if let r = m.report { lines.append("- **Report by:** \(r.generatedBy)") }
+        for warning in m.captureWarnings { lines.append("- **Capture warning:** \(warning.message)") }
         return lines
     }
 

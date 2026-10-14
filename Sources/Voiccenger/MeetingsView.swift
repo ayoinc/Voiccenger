@@ -278,6 +278,11 @@ private struct ReportView: View {
                         if !report.overview.isEmpty {
                             Text(report.overview).font(.title3)
                         }
+                        ForEach(meeting.captureWarnings) { warning in
+                            Label("During recording: \(warning.message)", systemImage: "exclamationmark.triangle.fill")
+                                .symbolRenderingMode(.multicolor)
+                                .font(.callout)
+                        }
                     }
                     if report.kind == .transcriptOutline {
                         OutlineSection("Transcript Outline (no AI)", segments: report.outline, meeting: meeting, showInTranscript: showInTranscript)

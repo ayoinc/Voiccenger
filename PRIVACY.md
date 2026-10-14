@@ -5,7 +5,7 @@ _Last updated: 14 October 2026_
 Voiccenger records and transcribes meetings on your Mac. It is built to keep your conversations on your device; the only exceptions are the optional cloud services below, which you turn on with your own API keys.
 
 ## What Voiccenger processes
-- **Audio** from your microphone and, during online meetings, from the meeting app you're using (for example Zoom, Teams or a browser). Audio is captured only while a recording is running, or briefly analysed on-device to detect that a meeting has started.
+- **Audio** from your microphone and from your Mac's own sound output: during online meetings, the meeting app you're using (for example Zoom, Teams or a browser); during in-person recordings, everything your Mac plays (you can turn this off in Settings › Audio). The microphone is recorded even while you're muted inside the meeting app, because Voiccenger reads the microphone directly. Audio is captured only while a recording is running, or briefly analysed on-device to detect that a meeting has started.
 - **Transcripts, speaker names, voice profiles** (mathematical voice signatures used to recognise enrolled people), accent and vocabulary settings, and meeting reports.
 
 ## Where it is processed

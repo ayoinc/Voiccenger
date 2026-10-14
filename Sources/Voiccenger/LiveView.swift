@@ -56,8 +56,8 @@ struct LiveView: View {
 
     private var subtitle: String {
         guard let session = coordinator.session, session.isActive else { return StatusSymbol.label(for: coordinator.status) }
-        if let app = session.config.detectedMeeting?.app.displayName { return "Online meeting · \(app)" }
-        return session.config.kind == .online ? "Online meeting" : "In-person meeting"
+        if let app = session.detectedMeeting?.app.displayName { return "Online meeting · \(app)" }
+        return session.kind == .online ? "Online meeting" : "In-person meeting"
     }
 }
 
@@ -217,6 +217,11 @@ private struct SessionHeader: View {
                         .foregroundStyle(.secondary)
                         .help("Live analysis engine: \(engine)")
                 }
+            }
+            ForEach(session.captureWarnings) { warning in
+                Label(warning.message, systemImage: warning.kind == .meetingAppSilent ? "speaker.slash.fill" : "mic.slash.fill")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.red)
             }
             ForEach(session.warnings, id: \.self) { warning in
                 Label(warning, systemImage: "exclamationmark.triangle.fill")

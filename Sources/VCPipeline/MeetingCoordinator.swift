@@ -12,7 +12,8 @@ import VCTranscription
 /// they are recorded automatically or announced with a notification offering to start. In-person meetings
 /// are detected from sustained conversation on the microphone (only when the user enabled it) and are always
 /// announced rather than recorded. A session started for a detected online meeting stops when the app
-/// releases the microphone. Until the user acknowledges telling participants they're being recorded, every
+/// releases the microphone; a recording without a meeting app becomes that app's online meeting when one starts
+/// using the microphone mid-recording. Until the user acknowledges telling participants they're being recorded, every
 /// start waits for confirmation (`pendingRecording`) and nothing is recorded automatically.
 @MainActor @Observable
 public final class MeetingCoordinator {
@@ -410,6 +411,11 @@ public final class MeetingCoordinator {
         switch event {
         case .meetingStarted(let meeting):
             detectedMeeting = meeting
+            if let session, session.state == .recording {
+                // A call began during a recording without a meeting app (say, started as in person).
+                if session.detectedMeeting == nil { await session.upgradeToOnline(meeting) }
+                return
+            }
             guard session?.isActive != true else { return }
             if settings.autoRecordOnline, settings.recordingConsentAcknowledged {
                 await startRecording(kind: .online, detected: meeting)
