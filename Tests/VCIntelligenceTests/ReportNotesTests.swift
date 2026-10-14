@@ -36,10 +36,10 @@ import Testing
     @available(macOS 26.0, *)
     @Test func compactionShrinksMonotonicallyAndTerminates() {
         var notes = Self.bulkyNotes(items: 37)
-        var previousCost = AppleIntelligenceEngine.cost(of: notes)
+        var previousCost = ReportComposer.cost(of: notes)
         var steps = 0
         while let smaller = ReportNotes.compacted(notes) {
-            let cost = AppleIntelligenceEngine.cost(of: smaller)
+            let cost = ReportComposer.cost(of: smaller)
             #expect(cost < previousCost)
             // Keeps the earliest items of every list.
             #expect(smaller.decisions == Array(notes.decisions.prefix(smaller.decisions.count)))
@@ -56,12 +56,12 @@ import Testing
     @Test func fittedRespectsLimitOrThrows() throws {
         let notes = Self.bulkyNotes(items: 40)
         let limit = 300
-        let fitted = try AppleIntelligenceEngine.fitted(notes, within: limit)
-        #expect(AppleIntelligenceEngine.cost(of: fitted) <= limit)
-        #expect(AppleIntelligenceEngine.cost(of: notes) > limit)
+        let fitted = try ReportComposer.fitted(notes, within: limit)
+        #expect(ReportComposer.cost(of: fitted) <= limit)
+        #expect(ReportComposer.cost(of: notes) > limit)
 
         #expect(throws: IntelligenceError.contextWindowExceeded) {
-            try AppleIntelligenceEngine.fitted(notes, within: 10)
+            try ReportComposer.fitted(notes, within: 10)
         }
     }
 }

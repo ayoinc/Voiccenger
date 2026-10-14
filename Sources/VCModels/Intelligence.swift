@@ -137,13 +137,57 @@ public struct OutlineSegment: Codable, Sendable, Hashable {
     public var points: [OutlinePoint]
     /// Built from the transcript (quoted sentences) because the language model left this stretch out.
     public var isExtracted: Bool
+    /// Built from the transcript because the language model's safety filter declined these lines (`isExtracted`
+    /// is true as well).
+    public var isDeclined: Bool
 
-    public init(heading: String, start: TimeInterval, end: TimeInterval, points: [OutlinePoint], isExtracted: Bool = false) {
+    public init(
+        heading: String, start: TimeInterval, end: TimeInterval, points: [OutlinePoint], isExtracted: Bool = false,
+        isDeclined: Bool = false
+    ) {
         self.heading = heading
         self.start = start
         self.end = end
         self.points = points
-        self.isExtracted = isExtracted
+        self.isExtracted = isExtracted || isDeclined
+        self.isDeclined = isDeclined
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case heading, start, end, points, isExtracted, isDeclined
+    }
+
+    /// Segments saved before `isDeclined` existed decode as not declined.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        heading = try c.decode(String.self, forKey: .heading)
+        start = try c.decode(TimeInterval.self, forKey: .start)
+        end = try c.decode(TimeInterval.self, forKey: .end)
+        points = try c.decode([OutlinePoint].self, forKey: .points)
+        isExtracted = try c.decode(Bool.self, forKey: .isExtracted)
+        isDeclined = try c.decodeIfPresent(Bool.self, forKey: .isDeclined) ?? false
+    }
+}
+
+/// Something the reader should know about how a report was written: parts handled without a language model,
+/// or another engine standing in for the chosen one. Shown with the report, worded for the user.
+public struct ReportNotice: Codable, Sendable, Hashable {
+    public enum Reason: String, Codable, Sendable, Hashable {
+        /// The language model's safety filter declined some requests; those parts come from the transcript.
+        case safetyFilter
+        /// The chosen engine could not write the report; another one did.
+        case engineFallback
+    }
+
+    public var reason: Reason
+    public var message: String
+    /// Meeting time (seconds) handled without a language model; nil when none was.
+    public var timeWithoutAI: TimeInterval?
+
+    public init(reason: Reason, message: String, timeWithoutAI: TimeInterval? = nil) {
+        self.reason = reason
+        self.message = message
+        self.timeWithoutAI = timeWithoutAI
     }
 }
 
@@ -175,12 +219,14 @@ public struct MeetingReport: Codable, Sendable, Hashable {
     public var kind: ReportKind
     public var generatedBy: String
     public var generatedAt: Date
+    /// How the report was written, when the reader should know: parts handled without AI, a stand-in engine.
+    public var notices: [ReportNotice]
 
     public init(
         title: String, overview: String, topics: [TopicSummary], decisions: [String], actionItems: [ActionItem],
         notesToRemember: [String], missedOpportunities: [String], openQuestions: [String],
         corrections: [CorrectionNote], participantSummaries: [ParticipantSummary], outline: [OutlineSegment] = [],
-        kind: ReportKind = .languageModel, generatedBy: String, generatedAt: Date = Date()
+        kind: ReportKind = .languageModel, generatedBy: String, generatedAt: Date = Date(), notices: [ReportNotice] = []
     ) {
         self.title = title
         self.overview = overview
@@ -196,14 +242,16 @@ public struct MeetingReport: Codable, Sendable, Hashable {
         self.kind = kind
         self.generatedBy = generatedBy
         self.generatedAt = generatedAt
+        self.notices = notices
     }
 
     private enum CodingKeys: String, CodingKey {
         case title, overview, topics, decisions, actionItems, notesToRemember, missedOpportunities, openQuestions
-        case corrections, participantSummaries, outline, kind, generatedBy, generatedAt
+        case corrections, participantSummaries, outline, kind, generatedBy, generatedAt, notices
     }
 
-    /// Reports saved before the outline existed decode with an empty outline, as language-model reports.
+    /// Reports saved before the outline existed decode with an empty outline, as language-model reports; before
+    /// notices existed, without notices.
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         title = try c.decode(String.self, forKey: .title)
@@ -220,6 +268,7 @@ public struct MeetingReport: Codable, Sendable, Hashable {
         kind = try c.decodeIfPresent(ReportKind.self, forKey: .kind) ?? .languageModel
         generatedBy = try c.decode(String.self, forKey: .generatedBy)
         generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        notices = try c.decodeIfPresent([ReportNotice].self, forKey: .notices) ?? []
     }
 }
 

@@ -7,23 +7,25 @@ extension ResultAssembler {
     /// Cleans the model's report and keeps only what the transcript supports: every list item must cite existing
     /// lines (`L1` is `transcript[0]`) that share content words with it and carry the right kind of speech act.
     /// Meetings with little substance get a brief report; others get lists capped by transcript length.
+    /// `declined` lines were handled without AI: the outline quotes them, the lists add the questions and possible
+    /// action items found in them by word cues, and an overview declined everywhere is the transcript overview.
     static func report(
         from raw: RawReport, transcript: [ContextLine], participants: [String], meetingTitle: String?,
-        generatedBy: String, generatedAt: Date = Date()
+        generatedBy: String, generatedAt: Date = Date(), declined: DeclinedLines = DeclinedLines()
     ) -> MeetingReport {
         let givenTitle = meetingTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let title = (givenTitle?.isEmpty == false ? givenTitle : nil) ?? raw.title ?? "Meeting"
         let shape = ReportShape(Grounding.substance(transcript))
         let evidence = Evidence(transcript)
 
-        let actionItems = Array(groundedActionItems(raw.actionItems, evidence: evidence).prefix(shape.actionItems))
+        var actionItems = Array(groundedActionItems(raw.actionItems, evidence: evidence).prefix(shape.actionItems))
         // A decision is a statement ("What's the budget?" is not one, whatever line it cites).
         let decisions = Array(groundedItems(raw.decisions, evidence: evidence) { text, lines in
             !text.contains("?") && lines.contains { Grounding.hasDecisionCue($0.text) }
                 && Grounding.namesOnlyWhatWasSaid(text, evidence: evidence.around(lines), names: evidence.speakers)
         }.prefix(shape.decisions))
         // The question itself must be about the item, not just some other cited line.
-        let openQuestions = Array(groundedItems(raw.openQuestions, evidence: evidence) { text, lines in
+        var openQuestions = Array(groundedItems(raw.openQuestions, evidence: evidence) { text, lines in
             lines.contains { Grounding.isQuestion($0.text) && Grounding.sharesContent(text, with: $0.text) }
         }.prefix(shape.openQuestions))
         let settled = decisions + actionItems.map(\.task) + openQuestions
@@ -46,7 +48,17 @@ extension ResultAssembler {
         }
         // Sentences claiming as done what was only promised go; the first sentence always stays. Paragraphs are
         // kept; a thin meeting gets at most two sentences.
-        let overview = groundedOverview(raw.overview ?? "", evidence: evidence, isThin: shape.isThin)
+        var overview = groundedOverview(raw.overview ?? "", evidence: evidence, isThin: shape.isThin)
+        let conversation = outline(raw.outline, evidence: evidence, shape: shape, declined: declined.outline)
+        if overview.isEmpty, !declined.summary.isEmpty {
+            overview = TranscriptOutliner.overview(
+                transcript: transcript, speakers: TranscriptFormatter.speakingParticipants(participants, transcript: transcript), outline: conversation)
+        }
+        if !declined.lists.isEmpty {
+            let extracted = extractedLists(declined.lists, transcript: transcript)
+            openQuestions += extracted.questions.filter { question in !openQuestions.contains { restates(question, $0) } }
+            actionItems += extracted.actionItems.filter { item in !actionItems.contains { restates(item.task, $0.task) } }
+        }
 
         return MeetingReport(
             title: title,
@@ -60,9 +72,22 @@ extension ResultAssembler {
             corrections: Array(groundedCorrections(raw.corrections, evidence: evidence).prefix(shape.corrections)),
             participantSummaries: shape.keyPoints == 0
                 ? [] : participantSummaries(raw.participantSummaries, participants: participants, evidence: evidence, limit: shape.keyPoints),
-            outline: outline(raw.outline, evidence: evidence, shape: shape),
+            outline: conversation,
             generatedBy: generatedBy,
             generatedAt: generatedAt)
+    }
+
+    /// Most questions and possible action items `extractedLists` adds, as in a report without AI.
+    static let extractedQuestionLimit = 10
+    static let extractedActionItemLimit = 12
+
+    /// The questions and possible action items `TranscriptOutliner` finds by word cues in `ranges` (lines whose
+    /// lists request the model declined), each range on its own.
+    static func extractedLists(_ ranges: [Range<Int>], transcript: [ContextLine]) -> (questions: [String], actionItems: [ActionItem]) {
+        let pieces = ranges.filter { $0.upperBound <= transcript.count }.map { Array(transcript[$0]) }
+        return (
+            Array(deduplicated(pieces.flatMap(TranscriptOutliner.questions)).prefix(extractedQuestionLimit)),
+            Array(pieces.flatMap(TranscriptOutliner.possibleActionItems).prefix(extractedActionItemLimit)))
     }
 
     /// The overview's paragraphs without sentences that call promises done; the first sentence always stays.

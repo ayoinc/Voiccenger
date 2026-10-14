@@ -179,6 +179,15 @@ public enum IntelligencePrompts {
         return prompt
     }
 
+    /// Added to a request's instructions when it is retried as plain text (permissive guardrails cover only text
+    /// answers): the answer is the JSON the schema describes, nothing else.
+    public static func jsonAnswerInstructions(schema: String) -> String {
+        """
+        Answer with one JSON object that follows this JSON schema, and nothing else (no Markdown, no comments): \
+        \(schema)
+        """
+    }
+
     private static func header(participants: [String], meetingTitle: String?, transcript: [ContextLine]) -> String {
         var header = ""
         if let title = meetingTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {

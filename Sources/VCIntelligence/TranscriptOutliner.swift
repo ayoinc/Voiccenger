@@ -214,10 +214,11 @@ enum TranscriptOutliner {
     /// Consecutive segments (`ranges`, adjacent and in order) grouped for merging, as lists of their indices.
     /// First every thin segment (fewer than `minimumSubstantiveLines` substantive lines, or `weak`: only quotes
     /// filled in from the transcript) joins whichever neighbour shares more of its words; then, while there are
-    /// more than `segmentLimit` segments, the adjacent pair that shares the most words merges, less half its
-    /// combined length relative to an even split (a merged block shares words with everything, so without the
-    /// penalty one segment swallows the meeting). Ties: the earlier pair. Deterministic.
-    static func mergeGroups(_ ranges: [Range<Int>], weak: [Bool], transcript: [ContextLine]) -> [[Int]] {
+    /// more than `limit` segments (by default `segmentLimit` of the meeting), the adjacent pair that shares the
+    /// most words merges, less half its combined length relative to an even split (a merged block shares words
+    /// with everything, so without the penalty one segment swallows the meeting). Ties: the earlier pair.
+    /// Deterministic.
+    static func mergeGroups(_ ranges: [Range<Int>], weak: [Bool], transcript: [ContextLine], limit: Int? = nil) -> [[Int]] {
         guard ranges.count > 1 else { return ranges.indices.map { [$0] } }
         let vocabulary = Vocabulary(transcript)
         let bags = transcript.map { vocabulary.weights(Grounding.contentStems($0.text)) }
@@ -241,8 +242,8 @@ enum TranscriptOutliner {
             }
         }
         let duration = transcript.isEmpty ? 0 : times(of: transcript.indices, in: transcript).end - transcript[0].time
-        let limit = segmentLimit(duration: duration)
-        let evenSplit = Double(transcript.count) / Double(limit)
+        let limit = limit ?? segmentLimit(duration: duration)
+        let evenSplit = Double(ranges.reduce(0) { $0 + $1.count }) / Double(limit)
         while groups.count > limit {
             func score(_ i: Int) -> Double {
                 similarity(groups[i], groups[i + 1]) - 0.5 * Double(span(groups[i]).count + span(groups[i + 1]).count) / evenSplit

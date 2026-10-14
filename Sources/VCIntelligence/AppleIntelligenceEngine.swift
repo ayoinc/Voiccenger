@@ -6,8 +6,9 @@ import VCModels
 ///
 /// Every request uses a fresh `LanguageModelSession`, so calls are independent and can run concurrently.
 /// The model's context window is small (4,096 tokens on macOS 26), so reports over long transcripts are
-/// built map-reduce: notes per transcript chunk, then merges of those notes until one set remains.
-/// Whenever the model reports that a request overflowed its window, the request is shrunk and retried.
+/// built map-reduce by `ReportComposer`: notes per transcript chunk, then merges of those notes until one set
+/// remains. A request the safety filter declines is retried with permissive guardrails, then narrowed down to
+/// the lines it declines, which are handled without AI.
 @available(macOS 26.0, *)
 public final class AppleIntelligenceEngine: MeetingIntelligence {
     /// Upper bound for transcript tokens in one notes request (summary or lists).
@@ -75,111 +76,15 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
 
     // MARK: Report
 
-    /// The report in three kinds of requests over the transcript, run side by side: the summary (title, overview,
-    /// topics, participants) and the lists (decisions, action items and the rest) — one request each, or per chunk
-    /// and then merged — and the conversation outline, one request per chunk, every chunk's outline kept as written.
+    /// The report, written by `ReportComposer` over the window-derived budgets.
     public func report(transcript: [ContextLine], participants: [String], meetingTitle: String?) async throws -> MeetingReport {
         try Self.requireAvailable()
-        let participants = TranscriptFormatter.speakingParticipants(participants, transcript: transcript)
-        var notes: RawReport
-        if transcript.isEmpty {
-            notes = RawReport(overview: "No speech was transcribed.")
-        } else {
-            let budget = await transcriptBudget()
-            let mergeBudget = await mergeBudget()
-            let outlineTokens = await outlineBudget()
-            async let written = reportNotes(
-                transcript: transcript, participants: participants, meetingTitle: meetingTitle,
-                budget: budget, mergeBudget: mergeBudget)
-            async let outlined = outline(
-                NumberedLine.numbering(transcript), participants: participants, meetingTitle: meetingTitle, budget: outlineTokens)
-            notes = try await written
-            notes.outline = try await outlined
-        }
-        return ResultAssembler.report(
-            from: notes, transcript: transcript, participants: participants, meetingTitle: meetingTitle, generatedBy: engineName)
-    }
-
-    /// Notes in one pass when the whole transcript fits `budget`, map-reduce otherwise: notes per chunk, then the
-    /// parts' summaries (title, overview, topics) merged by the model while their lists and participant points are
-    /// joined as they are. Lines are numbered over the whole meeting so every request cites the same `L` numbers.
-    /// `mergeBudget` bounds the summaries sent to one merge request; it comes from the context window, not from
-    /// the transcript budget.
-    func reportNotes(
-        transcript: [ContextLine], participants: [String], meetingTitle: String?, budget initialBudget: Int, mergeBudget: Int
-    ) async throws -> RawReport {
-        var budget = initialBudget
-        let numbered = NumberedLine.numbering(transcript)
-        let lines = TranscriptChunker.splitLongLines(numbered, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))
-        if await Self.fits(lines, budget: budget) {
-            do {
-                return try await notes(lines, participants: participants, meetingTitle: meetingTitle, part: nil)
-            } catch let error where Self.isContextOverflow(error) {
-                budget = try Self.shrunk(budget)
-            }
-        }
-        let parts = try await partNotes(numbered, participants: participants, meetingTitle: meetingTitle, budget: budget)
-        let summary = try await merged(parts.map(ReportNotes.summary), participants: participants, meetingTitle: meetingTitle, budget: mergeBudget)
-        return ReportNotes.joined(parts, summary: summary)
-    }
-
-    /// Notes on `lines` (the meeting, or `part` of it) from a summary request and a lists request, run side by side.
-    /// The overview has two to four paragraphs for a whole meeting with substance, one or two for a part (the merge
-    /// writes the meeting's), and one for a thin meeting.
-    func notes(_ lines: [NumberedLine], participants: [String], meetingTitle: String?, part: (index: Int, count: Int)?) async throws -> RawReport {
-        let prompt = IntelligencePrompts.reportPrompt(transcript: lines, participants: participants, meetingTitle: meetingTitle, part: part)
-        let paragraphs: ClosedRange<Int> =
-            (part?.count ?? 1) > 1 ? 1...2 : ReportShape(Grounding.substance(lines.map(\.line))).isThin ? 1...1 : 2...4
-        async let summary = Self.generate(
-            GenSummary.self, schema: GenSummary.schema(paragraphs: paragraphs), instructions: IntelligencePrompts.summaryInstructions, prompt: prompt)
-        async let lists = Self.generate(GenLists.self, instructions: IntelligencePrompts.listsInstructions, prompt: prompt)
-        let (written, listed) = try await (summary, lists)
-        return listed.notes(with: written)
-    }
-
-    /// Outline map step: the outline of each consecutive chunk, concatenated in order and never merged or
-    /// compacted, so a long meeting keeps all its detail. A chunk that overflows is retried smaller.
-    func outline(_ transcript: [NumberedLine], participants: [String], meetingTitle: String?, budget initialBudget: Int) async throws -> [RawOutlineSegment] {
-        var budget = initialBudget
-        var remaining = TranscriptChunker.splitLongLines(transcript, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
-        var segments: [RawOutlineSegment] = []
-        var done = 0
-        while !remaining.isEmpty {
-            let chunks = await Self.fits(Array(remaining), budget: budget)
-                ? [Array(remaining)] : TranscriptChunker.balancedChunk(Array(remaining), tokenBudget: budget)
-            let chunk = chunks[0]
-            let prompt = IntelligencePrompts.reportPrompt(
-                transcript: chunk, participants: participants, meetingTitle: meetingTitle, part: (index: done, count: done + chunks.count))
-            do {
-                segments += try await Self.generate(GenOutline.self, instructions: IntelligencePrompts.outlineInstructions, prompt: prompt).raw
-                done += 1
-                remaining = remaining.dropFirst(chunk.count)
-            } catch let error where Self.isContextOverflow(error) {
-                budget = try Self.shrunk(budget)
-                remaining = TranscriptChunker.splitLongLines(Array(remaining), maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
-            }
-        }
-        return segments
-    }
-
-    /// Map step: notes for consecutive chunks. A chunk that overflows is retried smaller; finished parts are kept.
-    func partNotes(_ transcript: [NumberedLine], participants: [String], meetingTitle: String?, budget initialBudget: Int) async throws -> [RawReport] {
-        var budget = initialBudget
-        var remaining = TranscriptChunker.splitLongLines(transcript, maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
-        var parts: [RawReport] = []
-        while !remaining.isEmpty {
-            let chunks = TranscriptChunker.balancedChunk(Array(remaining), tokenBudget: budget)
-            let chunk = chunks[0]
-            do {
-                parts.append(try await notes(
-                    chunk, participants: participants, meetingTitle: meetingTitle, part: (index: parts.count, count: parts.count + chunks.count)))
-                remaining = remaining.dropFirst(chunk.count)
-            } catch let error where Self.isContextOverflow(error) {
-                budget = try Self.shrunk(budget)
-                remaining = TranscriptChunker.splitLongLines(Array(remaining), maxTokens: max(Self.minimumTranscriptBudget / 2, budget / 2))[...]
-            }
-        }
-        return parts
+        let budgets = transcript.isEmpty
+            ? ReportBudgets(notes: 0, merge: 0, outline: 0)
+            : ReportBudgets(notes: await transcriptBudget(), merge: await mergeBudget(), outline: await outlineBudget())
+        return try await ReportComposer(model: AppleReportModel(), minimumBudget: Self.minimumTranscriptBudget).report(
+            transcript: transcript, participants: participants, meetingTitle: meetingTitle, budgets: budgets,
+            generatedBy: engineName, modelName: "Apple Intelligence")
     }
 
     /// Whether `lines` fit `budget` transcript tokens: by the estimate, or else (macOS 26.4 and later) by the
@@ -190,52 +95,6 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
             return exact <= budget
         }
         return false
-    }
-
-    /// Reduce step: merges part summaries in groups that fit `budget` until one remains. Summaries too large to
-    /// share a request are compacted first; a merge that overflows is retried on compacted summaries.
-    func merged(_ parts: [RawReport], participants: [String], meetingTitle: String?, budget: Int) async throws -> RawReport {
-        var level = parts
-        while level.count > 1 {
-            // Every note at most half the budget, so any two fit together and each level makes progress.
-            level = try level.map { try Self.fitted($0, within: budget / 2) }
-            var next: [RawReport] = []
-            var index = level.startIndex
-            while index < level.endIndex {
-                var group = [level[index]]
-                var used = Self.cost(of: level[index])
-                index += 1
-                while index < level.endIndex, used + Self.cost(of: level[index]) <= budget {
-                    used += Self.cost(of: level[index])
-                    group.append(level[index])
-                    index += 1
-                }
-                if group.count == 1 {
-                    next.append(group[0])
-                } else {
-                    next.append(try await merge(group, participants: participants, meetingTitle: meetingTitle))
-                }
-            }
-            level = next
-        }
-        return level[0]
-    }
-
-    private func merge(_ group: [RawReport], participants: [String], meetingTitle: String?) async throws -> RawReport {
-        var group = group
-        while true {
-            let prompt = IntelligencePrompts.mergePrompt(
-                renderedNotes: group.map(ReportNotes.render), participants: participants, meetingTitle: meetingTitle)
-            do {
-                return try await Self.generate(
-                    GenSummary.self, schema: GenSummary.mergeSchema, instructions: IntelligencePrompts.mergeSummaryInstructions, prompt: prompt
-                ).raw
-            } catch let error where Self.isContextOverflow(error) {
-                let smaller = group.map { ReportNotes.compacted($0) }
-                guard smaller.contains(where: { $0 != nil }) else { throw IntelligenceError.contextWindowExceeded }
-                group = zip(group, smaller).map { $1 ?? $0 }
-            }
-        }
     }
 
     // MARK: Budgets
@@ -287,42 +146,57 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
         return TokenEstimator.estimate(instructions) + estimatedSchema + 100
     }
 
-    private static func shrunk(_ budget: Int) throws -> Int {
-        guard budget > minimumTranscriptBudget else { throw IntelligenceError.contextWindowExceeded }
-        return max(minimumTranscriptBudget, budget * 2 / 3)
-    }
-
-    static func cost(of notes: RawReport) -> Int {
-        TokenEstimator.estimate(ReportNotes.render(notes)) + 8
-    }
-
-    /// Compacts `notes` until they cost at most `limit`; throws when they cannot shrink that far.
-    static func fitted(_ notes: RawReport, within limit: Int) throws -> RawReport {
-        var notes = notes
-        while cost(of: notes) > limit {
-            guard let smaller = ReportNotes.compacted(notes) else { throw IntelligenceError.contextWindowExceeded }
-            notes = smaller
-        }
-        return notes
-    }
-
     // MARK: Model calls
 
     private static func requireAvailable() throws {
         if let reason = unavailableReason { throw IntelligenceError.unavailable(reason) }
     }
 
-    /// One request in a fresh session, answered in `schema` (by default `Content`'s own).
-    private static func generate<Content: Generable>(
-        _ type: Content.Type, schema: GenerationSchema = Content.generationSchema, instructions: String, prompt: String
+    /// One request in a fresh session, answered in `schema` (by default `Content`'s own). With `.permissive`
+    /// guardrails the request runs on the model's permissive content-transformation mode, which only covers
+    /// String answers (guided generation keeps the default guardrails): the same schema is asked for as JSON
+    /// text and parsed strictly into the same type.
+    static func generate<Content: Generable>(
+        _ type: Content.Type, schema: GenerationSchema = Content.generationSchema, instructions: String, prompt: String,
+        guardrails: ReportGuardrails = .standard
     ) async throws -> Content {
-        let session = LanguageModelSession(instructions: instructions)
         do {
-            let content = try await session.respond(to: prompt, schema: schema, includeSchemaInPrompt: true, options: generationOptions).content
-            return try Content(content)
+            switch guardrails {
+            case .standard:
+                let session = LanguageModelSession(instructions: instructions)
+                let content = try await session.respond(to: prompt, schema: schema, includeSchemaInPrompt: true, options: generationOptions).content
+                return try Content(content)
+            case .permissive:
+                let schemaJSON = String(decoding: try JSONEncoder().encode(schema), as: UTF8.self)
+                let session = LanguageModelSession(
+                    model: SystemLanguageModel(guardrails: .permissiveContentTransformations),
+                    instructions: instructions + "\n" + IntelligencePrompts.jsonAnswerInstructions(schema: schemaJSON))
+                let text: String = try await session.respond(to: prompt, options: generationOptions).content
+                return try Content(try strictJSON(text, schema: schemaJSON))
+            }
         } catch {
             throw mapped(error)
         }
+    }
+
+    /// `text` as generated content when it is one complete JSON object (optionally in a Markdown code fence)
+    /// holding every property `schema` (JSON Schema text) requires; else `IntelligenceError.malformedResponse`.
+    /// `GeneratedContent(json:)` alone would accept a truncated object.
+    static func strictJSON(_ text: String, schema: String) throws -> GeneratedContent {
+        var body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.hasPrefix("```") {
+            body = String(body.drop { $0 != "\n" }).trimmingCharacters(in: .whitespacesAndNewlines)
+            if body.hasSuffix("```") { body = String(body.dropLast(3)).trimmingCharacters(in: .whitespacesAndNewlines) }
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any] else {
+            throw IntelligenceError.malformedResponse("the answer is not one JSON object")
+        }
+        let required = (try? JSONSerialization.jsonObject(with: Data(schema.utf8)) as? [String: Any])?["required"] as? [String] ?? []
+        let missing = required.filter { object[$0] == nil }
+        guard missing.isEmpty else {
+            throw IntelligenceError.malformedResponse("the answer lacks \(missing.joined(separator: ", "))")
+        }
+        return try GeneratedContent(json: body)
     }
 
     static func isContextOverflow(_ error: any Error) -> Bool {
@@ -362,5 +236,43 @@ public final class AppleIntelligenceEngine: MeetingIntelligence {
         }
         #endif
         return error
+    }
+}
+
+/// The on-device model behind `ReportComposer`: one guided-generation request per report request, retried as
+/// JSON text with permissive guardrails after a refusal.
+@available(macOS 26.0, *)
+struct AppleReportModel: ReportModel {
+    var hasPermissiveGuardrails: Bool { true }
+
+    func respond(to request: ReportRequest, guardrails: ReportGuardrails) async throws -> RawReport {
+        switch request.kind {
+        case .summary:
+            try await AppleIntelligenceEngine.generate(
+                GenSummary.self, schema: GenSummary.schema(paragraphs: request.paragraphs), instructions: IntelligencePrompts.summaryInstructions,
+                prompt: request.prompt, guardrails: guardrails
+            ).raw
+        case .lists:
+            try await AppleIntelligenceEngine.generate(
+                GenLists.self, instructions: IntelligencePrompts.listsInstructions, prompt: request.prompt, guardrails: guardrails
+            ).raw
+        case .outline:
+            RawReport(outline: try await AppleIntelligenceEngine.generate(
+                GenOutline.self, instructions: IntelligencePrompts.outlineInstructions, prompt: request.prompt, guardrails: guardrails
+            ).raw)
+        case .merge:
+            try await AppleIntelligenceEngine.generate(
+                GenSummary.self, schema: GenSummary.mergeSchema, instructions: IntelligencePrompts.mergeSummaryInstructions,
+                prompt: request.prompt, guardrails: guardrails
+            ).raw
+        }
+    }
+
+    func fits(_ lines: [NumberedLine], budget: Int) async -> Bool {
+        await AppleIntelligenceEngine.fits(lines, budget: budget)
+    }
+
+    func isContextOverflow(_ error: any Error) -> Bool {
+        AppleIntelligenceEngine.isContextOverflow(error)
     }
 }

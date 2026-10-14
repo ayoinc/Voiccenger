@@ -451,16 +451,11 @@ struct GenLists: Generable, Equatable {
         ])
     }
 
-    /// Both halves as one set of notes.
-    func notes(with summary: GenSummary) -> RawReport {
-        var notes = summary.raw
-        notes.decisions = decisions.map(\.raw)
-        notes.actionItems = actionItems.map(\.raw)
-        notes.notesToRemember = notesToRemember.map(\.raw)
-        notes.missedOpportunities = missedOpportunities
-        notes.openQuestions = openQuestions.map(\.raw)
-        notes.corrections = corrections.map(\.raw)
-        return notes
+    /// The lists as raw notes (no summary).
+    var raw: RawReport {
+        RawReport(
+            decisions: decisions.map(\.raw), actionItems: actionItems.map(\.raw), notesToRemember: notesToRemember.map(\.raw),
+            missedOpportunities: missedOpportunities, openQuestions: openQuestions.map(\.raw), corrections: corrections.map(\.raw))
     }
 }
 

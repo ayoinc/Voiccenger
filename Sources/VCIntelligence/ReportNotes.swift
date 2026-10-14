@@ -59,6 +59,20 @@ enum ReportNotes {
         RawReport(title: notes.title, overview: notes.overview, topics: notes.topics)
     }
 
+    /// Whether `notes` carry a summary (title, overview or topics); a part whose summary was declined has none.
+    static func hasSummary(_ notes: RawReport) -> Bool {
+        notes.title != nil || notes.overview != nil || !notes.topics.isEmpty
+    }
+
+    /// Part summaries side by side, for a merge the model declined: the first title, every overview paragraph
+    /// and every topic, in order.
+    static func concatenated(_ parts: [RawReport]) -> RawReport {
+        let overviews = parts.compactMap(\.overview).filter { !$0.isEmpty }
+        return RawReport(
+            title: parts.lazy.compactMap(\.title).first, overview: overviews.isEmpty ? nil : overviews.joined(separator: "\n\n"),
+            topics: parts.flatMap(\.topics))
+    }
+
     /// Every part's lists and participant points joined in order, under `summary`'s title, overview and topics.
     /// Every item keeps the transcript lines it cites (numbered over the whole meeting), so the report's grounding
     /// removes duplicates and anything unsupported, as for a single pass.

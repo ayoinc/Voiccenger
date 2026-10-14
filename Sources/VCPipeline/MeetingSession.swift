@@ -6,6 +6,9 @@ import VCModels
 import VCSpatial
 import VCSpeakers
 import VCTranscription
+import os
+
+private let analysisLog = Logger(subsystem: "com.voiccenger.app", category: "analysis")
 
 /// One recorded meeting: capture → transcription + speaker identification (+ direction of arrival) →
 /// speaker-attributed segments → live analysis → report → storage.
@@ -1058,6 +1061,9 @@ public final class MeetingSession {
                     await self?.apply(insight, to: job.line.segmentID)
                 } catch is CancellationError {
                     return
+                } catch IntelligenceError.refused {
+                    // The model's safety filter declined this line: it simply gets no insight.
+                    analysisLog.info("Live analysis of a line was declined by the safety filter; skipped")
                 } catch {
                     await self?.analysisFailed(error)
                 }

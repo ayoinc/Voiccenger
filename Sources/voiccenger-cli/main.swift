@@ -164,9 +164,10 @@ let usage = """
       system-audio [--seconds 5] [--app bundle-id] [--out capture.wav]
                                        Capture system audio through a Core Audio process tap (all apps, or
                                        one meeting app's processes), report its level, optionally record it.
-      report <transcript.json> [--intelligence apple|claude|outline] [--title text] [--out report.md]
-                                       Write the report for a transcript: a JSON array of lines
-                                       {"speaker", "start", "end"?, "text"} (as in .fixtures/meeting.truth.json).
+      report <transcript.json|meeting.json> [--intelligence apple|claude|outline] [--title text] [--out report.md]
+                                       Write the report for a transcript (a JSON array of lines
+                                       {"speaker", "start", "end"?, "text"}, as in .fixtures/meeting.truth.json)
+                                       or a saved meeting; lists refused, retried and split requests.
       doa --preset name --angle deg [--snr dB] [--reverb gain] [--source file.wav]
                                        Simulate a source around a microphone array and estimate its
                                        direction with GCC-PHAT. Presets: \(ArrayPresetIDs.all.map(\.id).joined(separator: ", "))
@@ -662,7 +663,7 @@ func intelligenceKind(_ raw: String?) throws -> IntelligenceEngineKind {
     }
 }
 
-/// Writes the report for a transcript file, timing it.
+/// Writes the report for a transcript file or a saved meeting, timing it and listing how each request went.
 @MainActor
 func report(_ a: inout Arguments) async throws {
     struct Line: Decodable {
@@ -671,36 +672,62 @@ func report(_ a: inout Arguments) async throws {
         var end: Double?
         var text: String
     }
-    let url = try fileURL(try a.positional(0, "<transcript.json>"))
+    let url = try fileURL(try a.positional(0, "<transcript.json|meeting.json>"))
     let kind = try intelligenceKind(a.option("intelligence"))
     let title = a.option("title")
     let out = a.option("out")
     try a.checkUnused()
 
-    let lines = try JSONDecoder().decode([Line].self, from: Data(contentsOf: url))
-    var participants: [Participant] = []
-    for (i, name) in lines.map(\.speaker).enumerated() where !participants.contains(where: { $0.id == name }) {
-        participants.append(Participant(id: name, displayName: name, channel: .microphone, colorIndex: i))
+    let data = try Data(contentsOf: url)
+    var meeting: Meeting
+    // A saved meeting keeps its title, as in the app; a transcript's report proposes one unless --title is given.
+    var reportTitle = title
+    if let saved = try? MeetingStore.decoder.decode(Meeting.self, from: data) {
+        // A saved meeting: its transcript as stored, without its existing report.
+        meeting = saved
+        reportTitle = title ?? saved.title
+        meeting.report = nil
+    } else {
+        let lines = try JSONDecoder().decode([Line].self, from: data)
+        var participants: [Participant] = []
+        for (i, name) in lines.map(\.speaker).enumerated() where !participants.contains(where: { $0.id == name }) {
+            participants.append(Participant(id: name, displayName: name, channel: .microphone, colorIndex: i))
+        }
+        for i in participants.indices {
+            participants[i].speakingTime = lines.filter { $0.speaker == participants[i].id }.reduce(0) { $0 + max(0, ($1.end ?? $1.start) - $1.start) }
+        }
+        let segments = lines.map { line in
+            TranscriptSegment(
+                channel: .microphone, speakerKey: line.speaker, range: TimeRange(start: line.start, end: line.end ?? line.start),
+                text: line.text, confidence: nil, localeID: "en")
+        }
+        let start = Date()
+        meeting = Meeting(
+            title: title ?? url.deletingPathExtension().lastPathComponent, kind: .inPerson, startedAt: start,
+            endedAt: start.addingTimeInterval(lines.map { $0.end ?? $0.start }.max() ?? 0), participants: participants,
+            segments: segments, localeIDs: ["en"])
     }
-    for i in participants.indices {
-        participants[i].speakingTime = lines.filter { $0.speaker == participants[i].id }.reduce(0) { $0 + max(0, ($1.end ?? $1.start) - $1.start) }
-    }
-    let segments = lines.map { line in
-        TranscriptSegment(
-            channel: .microphone, speakerKey: line.speaker, range: TimeRange(start: line.start, end: line.end ?? line.start),
-            text: line.text, confidence: nil, localeID: "en")
-    }
-    let start = Date()
-    var meeting = Meeting(
-        title: title ?? url.deletingPathExtension().lastPathComponent, kind: .inPerson, startedAt: start,
-        endedAt: start.addingTimeInterval(lines.map { $0.end ?? $0.start }.max() ?? 0), participants: participants,
-        segments: segments, localeIDs: ["en"])
     let choice = ReportWriter.engine(preferring: kind)
     if choice.isFallback { eprint("The requested engine is unavailable; using \(choice.engine.engineName).") }
-    eprint("Writing the report for \(lines.count) lines with \(choice.engine.engineName)…")
+    eprint("Writing the report for \(meeting.segments.count) lines with \(choice.engine.engineName)…")
     let started = ContinuousClock.now
-    meeting.report = try await ReportWriter.report(for: meeting, engine: choice.engine, title: title)
+    let trace = ReportTrace()
+    let written = try await ReportTrace.$current.withValue(trace) {
+        try await ReportWriter.report(for: meeting, engine: choice.engine, title: reportTitle)
+    }
+    meeting.report = written
     eprint("Report written in \(seconds(since: started)).")
+    let summary = trace.summary
+    eprint(
+        "Requests: \(summary.requests), refused: \(summary.refusals), permissive retries: \(summary.retries) "
+            + "(\(summary.answeredOnRetry) answered), bisections: \(summary.bisections), engine fallbacks: \(summary.engineFallbacks)")
+    for detail in trace.details { eprint("  \(detail)") }
+    for notice in written.notices {
+        let time = notice.timeWithoutAI.map { " [\(ReportRenderer.durationText($0)) without AI]" } ?? ""
+        eprint("Note\(time): \(notice.message)")
+    }
+    eprint("Outline: \(written.outline.count) segment(s), \(written.outline.flatMap(\.points).count) point(s), "
+        + "\(written.outline.filter(\.isDeclined).count) declined by the safety filter.")
     let markdown = ReportRenderer.markdown(meeting)
     if let out {
         try markdown.write(to: URL(fileURLWithPath: (out as NSString).expandingTildeInPath), atomically: true, encoding: .utf8)

@@ -56,6 +56,14 @@ public enum ReportRenderer {
     /// How an outline segment filled in from the transcript is labelled in a language-model report.
     public static let extractedSegmentNote = "Not in the AI outline: quoted from the transcript."
 
+    /// How an outline segment whose lines the safety filter declined is labelled.
+    public static let declinedSegmentNote = "Apple Intelligence's safety filter declined this part; quoted from the transcript."
+
+    /// The label of an outline segment built from the transcript in a language-model report, if it has one.
+    public static func segmentNote(_ segment: OutlineSegment) -> String? {
+        segment.isDeclined ? declinedSegmentNote : segment.isExtracted ? extractedSegmentNote : nil
+    }
+
     /// `[mm:ss–mm:ss]` for an outline segment.
     public static func timeRange(_ start: TimeInterval, _ end: TimeInterval) -> String {
         "[\(timestamp(start))–\(timestamp(end))]"
@@ -101,7 +109,10 @@ public enum ReportRenderer {
         if let engine = transcriptionEngine(m) {
             lines.append("- **Transcribed by:** \(SpeechModelLibrary.info(engine).displayName)")
         }
-        if let r = m.report { lines.append("- **Report by:** \(r.generatedBy)") }
+        if let r = m.report {
+            lines.append("- **Report by:** \(r.generatedBy)")
+            for notice in r.notices { lines.append("- **Report note:** \(notice.message)") }
+        }
         for warning in m.captureWarnings { lines.append("- **Capture warning:** \(warning.message)") }
         return lines
     }
@@ -137,8 +148,8 @@ public enum ReportRenderer {
     private static func outline(_ segments: [OutlineSegment], extractedNote: Bool) -> [String] {
         segments.flatMap { segment -> [String] in
             var lines = ["### \(timeRange(segment.start, segment.end)) \(segment.heading)", ""]
-            if extractedNote, segment.isExtracted {
-                lines += ["_\(extractedSegmentNote)_", ""]
+            if extractedNote, let note = segmentNote(segment) {
+                lines += ["_\(note)_", ""]
             }
             lines += segment.points.map { point in
                 let text = point.isQuote ? "“\(point.text)”" : point.text

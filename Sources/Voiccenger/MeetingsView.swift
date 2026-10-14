@@ -275,6 +275,11 @@ private struct ReportView: View {
                             .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
                             .padding(.vertical, 6)
                         }
+                        ForEach(Array(report.notices.enumerated()), id: \.offset) { _, notice in
+                            Label(notice.message, systemImage: "info.circle")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
                         if !report.overview.isEmpty {
                             Text(report.overview).font(.title3)
                         }
@@ -439,8 +444,8 @@ private struct OutlineSection: View {
                 ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
                     DisclosureGroup(isExpanded: expanded(index)) {
                         VStack(alignment: .leading, spacing: 6) {
-                            if segment.isExtracted, meeting.report?.kind == .languageModel {
-                                Text(ReportRenderer.extractedSegmentNote)
+                            if meeting.report?.kind == .languageModel, let note = ReportRenderer.segmentNote(segment) {
+                                Text(note)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }

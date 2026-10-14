@@ -16,13 +16,17 @@ extension ResultAssembler {
         var isQuote: Bool
     }
 
-    /// A segment while it is being built; its first point's first line is where it starts.
+    /// A segment while it is being built; its first point's first line is where it starts (a declined stretch
+    /// starts at its first line).
     struct DraftSegment: Equatable {
         var heading: String?
         var points: [DraftPoint]
         var isExtracted: Bool
+        /// The lines the model's safety filter declined, which this segment quotes.
+        var declined: Range<Int>? = nil
 
-        var first: Int { points.map { $0.lines[0] }.min() ?? 0 }
+        var isDeclined: Bool { declined != nil }
+        var first: Int { declined?.lowerBound ?? points.map { $0.lines[0] }.min() ?? 0 }
         var last: Int { points.flatMap(\.lines).max() ?? 0 }
 
         mutating func add(_ more: [DraftPoint]) {
@@ -41,7 +45,9 @@ extension ResultAssembler {
     ///   minutes (`consolidated`);
     /// - segments cover the whole meeting: each runs from its first cited line to the line before the next.
     /// A heading that shares no content word with its segment's lines is replaced by the segment's own words.
-    static func outline(_ raw: [RawOutlineSegment], evidence: Evidence, shape: ReportShape) -> [OutlineSegment] {
+    /// Each of the `declined` line ranges (lines the model's safety filter declined to outline) becomes a segment
+    /// of its own quoting the speakers' most informative sentences there, never merged with the model's segments.
+    static func outline(_ raw: [RawOutlineSegment], evidence: Evidence, shape: ReportShape, declined: [Range<Int>] = []) -> [OutlineSegment] {
         let transcript = evidence.transcript
         guard !transcript.isEmpty, shape.outlineSegments > 0 else { return [] }
         var seen = Set<String>()
@@ -54,8 +60,22 @@ extension ResultAssembler {
             return draft
         }
         drafts = ordered(drafts, maximumPoints: shape.outlinePoints)
+        if !declined.isEmpty {
+            let vocabulary = TranscriptOutliner.Vocabulary(transcript)
+            let quoted = declined.compactMap { range -> DraftSegment? in
+                guard !range.isEmpty, range.upperBound <= transcript.count else { return nil }
+                let limit = TranscriptOutliner.pointLimit(range, of: transcript, cap: shape.outlinePoints)
+                let points = quotes(in: range, of: transcript, vocabulary: vocabulary, limit: limit)
+                return points.isEmpty ? nil : DraftSegment(heading: nil, points: points, isExtracted: true, declined: range)
+            }
+            drafts = (drafts + quoted).sorted { $0.first < $1.first }
+        }
         if shape.isThin {
-            drafts = Array(drafts.prefix(1)).map { DraftSegment(heading: $0.heading, points: Array($0.points.prefix(shape.outlinePoints)), isExtracted: false) }
+            drafts = Array(drafts.prefix(1)).map { draft in
+                var draft = draft
+                draft.points = Array(draft.points.prefix(shape.outlinePoints))
+                return draft
+            }
         } else {
             drafts = consolidated(filled(drafts, transcript: transcript, maximumPoints: shape.outlinePoints), transcript: transcript)
         }
@@ -73,22 +93,44 @@ extension ResultAssembler {
     /// from the transcript) into their closer neighbour, then the closest neighbours until the meeting has about
     /// one segment per three minutes. A merged segment keeps every point (so the coverage holds) and the heading of
     /// the member the model wrote (not filled in from the transcript) with the most points of the model's own, then
-    /// the most points, then the most substantive lines.
+    /// the most points, then the most substantive lines. Declined segments stay as they are; the drafts between
+    /// them merge among themselves, with a share of the meeting's segments proportional to their lines.
     static func consolidated(_ drafts: [DraftSegment], transcript: [ContextLine]) -> [DraftSegment] {
         guard drafts.count > 1 else { return drafts }
         let ranges = spans(drafts, lineCount: transcript.count)
-        let groups = TranscriptOutliner.mergeGroups(ranges, weak: drafts.map(\.isExtracted), transcript: transcript)
         func rank(_ i: Int) -> [Int] {
             [drafts[i].isExtracted ? 0 : 1, drafts[i].points.filter { !$0.isQuote }.count, drafts[i].points.count,
              TranscriptOutliner.substantiveLines(ranges[i], of: transcript)]
         }
-        return groups.map { group in
-            let members = group.map { drafts[$0] }
-            let lead = group.max { rank($0).lexicographicallyPrecedes(rank($1)) }!
-            var merged = DraftSegment(heading: drafts[lead].heading, points: [], isExtracted: members.allSatisfy(\.isExtracted))
-            merged.add(members.flatMap(\.points))
-            return merged
+        let duration = TranscriptOutliner.times(of: transcript.indices, in: transcript).end - transcript[0].time
+        let meetingLimit = TranscriptOutliner.segmentLimit(duration: duration)
+        var result: [DraftSegment] = []
+        var run: [Int] = []
+        func flush() {
+            guard !run.isEmpty else { return }
+            let lines = run.reduce(0) { $0 + ranges[$1].count }
+            let limit = max(1, Int((Double(meetingLimit) * Double(lines) / Double(transcript.count)).rounded()))
+            let groups = TranscriptOutliner.mergeGroups(
+                run.map { ranges[$0] }, weak: run.map { drafts[$0].isExtracted }, transcript: transcript, limit: limit)
+            result += groups.map { group in
+                let members = group.map { run[$0] }
+                let lead = members.max { rank($0).lexicographicallyPrecedes(rank($1)) }!
+                var merged = DraftSegment(heading: drafts[lead].heading, points: [], isExtracted: members.allSatisfy { drafts[$0].isExtracted })
+                merged.add(members.flatMap { drafts[$0].points })
+                return merged
+            }
+            run = []
         }
+        for index in drafts.indices {
+            if drafts[index].isDeclined {
+                flush()
+                result.append(drafts[index])
+            } else {
+                run.append(index)
+            }
+        }
+        flush()
+        return result
     }
 
     /// An outline point the transcript supports, attributed to a speaker who spoke. A leading "Name:" is the
@@ -137,19 +179,22 @@ extension ResultAssembler {
     }
 
     /// Stretches of substantive lines no point covers, as index ranges from the first to the last uncovered
-    /// substantive line; a covered line ends a stretch.
+    /// substantive line; a covered line ends a stretch, and so does the edge of a declined segment's lines.
     static func uncoveredStretches(_ drafts: [DraftSegment], transcript: [ContextLine]) -> [(range: ClosedRange<Int>, substantive: Int)] {
         var covered = Set<Int>()
         for line in drafts.flatMap({ $0.points.flatMap(\.lines) }) {
             covered.formUnion(max(0, line - outlineReach)...min(transcript.count - 1, line + outlineReach))
         }
+        let edges = Set(drafts.compactMap(\.declined).flatMap { [$0.lowerBound, $0.upperBound] })
         var stretches: [(range: ClosedRange<Int>, substantive: Int)] = []
         var current: (first: Int, last: Int, count: Int)?
         for index in transcript.indices {
-            if covered.contains(index) {
+            if covered.contains(index) || edges.contains(index) {
                 if let open = current { stretches.append((open.first...open.last, open.count)) }
                 current = nil
-            } else if TranscriptOutliner.isSubstantive(transcript[index].text) {
+                if covered.contains(index) { continue }
+            }
+            if TranscriptOutliner.isSubstantive(transcript[index].text) {
                 current = current.map { ($0.first, index, $0.count + 1) } ?? (index, index, 1)
             }
         }
@@ -163,7 +208,8 @@ extension ResultAssembler {
     /// `drafts` with every uncovered stretch filled from the transcript, repeating until every substantive line is
     /// covered. A stretch joins the segment whose span it falls in (or the one before it); only a long stretch
     /// (`ownSegmentLines` substantive lines or more) becomes a segment of its own, splitting a segment it falls
-    /// inside into it and its continuation. A stretch without a quotable sentence quotes its first substantive line.
+    /// inside into it and its continuation. A stretch among a declined segment's lines always joins it; one after
+    /// them never does, so a declined segment quotes only declined lines.
     static func filled(_ drafts: [DraftSegment], transcript: [ContextLine], maximumPoints: Int) -> [DraftSegment] {
         var drafts = drafts
         let vocabulary = TranscriptOutliner.Vocabulary(transcript)
@@ -171,17 +217,14 @@ extension ResultAssembler {
         for _ in transcript.indices {
             guard let stretch = uncoveredStretches(drafts, transcript: transcript).first else { break }
             let range = stretch.range.lowerBound..<(stretch.range.upperBound + 1)
-            let limit = min(maximumPoints, max(1, stretch.substantive / 2))
-            var quotes = TranscriptOutliner.points(in: range, of: transcript, vocabulary: vocabulary, limit: limit).compactMap { point in
-                transcript.firstIndex { $0.segmentID == point.segmentIDs.first }.map {
-                    DraftPoint(speaker: point.speaker, text: point.text, lines: [$0], isQuote: true)
-                }
-            }
-            if quotes.isEmpty, let line = range.first(where: { TranscriptOutliner.isSubstantive(transcript[$0].text) }) {
-                quotes = [DraftPoint(speaker: transcript[line].speaker, text: TranscriptOutliner.cleaned(transcript[line].text), lines: [line], isQuote: true)]
+            let quotes = quotes(in: range, of: transcript, vocabulary: vocabulary, limit: min(maximumPoints, max(1, stretch.substantive / 2)))
+            if let declined = drafts.firstIndex(where: { $0.declined?.contains(range.lowerBound) == true }) {
+                drafts[declined].add(quotes)
+                continue
             }
             // The draft whose span (first cited line up to the next draft) holds the stretch, else the first one.
-            let holder = drafts.lastIndex { $0.first <= range.lowerBound } ?? (drafts.isEmpty ? nil : 0)
+            var holder = drafts.lastIndex { $0.first <= range.lowerBound } ?? (drafts.isEmpty ? nil : 0)
+            if let index = holder, drafts[index].isDeclined { holder = nil }
             if stretch.substantive < Self.ownSegmentLines, let holder {
                 drafts[holder].add(quotes)
                 continue
@@ -204,6 +247,18 @@ extension ResultAssembler {
         return drafts
     }
 
+    /// The speakers' most informative sentences in `range`, quoted, at most `limit`; a range without one quotes
+    /// its first substantive line.
+    static func quotes(in range: Range<Int>, of transcript: [ContextLine], vocabulary: TranscriptOutliner.Vocabulary, limit: Int) -> [DraftPoint] {
+        let quotes = TranscriptOutliner.points(in: range, of: transcript, vocabulary: vocabulary, limit: limit).compactMap { point in
+            transcript.firstIndex { $0.segmentID == point.segmentIDs.first }.map {
+                DraftPoint(speaker: point.speaker, text: point.text, lines: [$0], isQuote: true)
+            }
+        }
+        guard quotes.isEmpty, let line = range.first(where: { TranscriptOutliner.isSubstantive(transcript[$0].text) }) else { return quotes }
+        return [DraftPoint(speaker: transcript[line].speaker, text: TranscriptOutliner.cleaned(transcript[line].text), lines: [line], isQuote: true)]
+    }
+
     /// Final segments covering every line: each runs from its first cited line (the first from line 0) to the
     /// line before the next segment.
     static func segments(_ drafts: [DraftSegment], transcript: [ContextLine]) -> [OutlineSegment] {
@@ -222,7 +277,8 @@ extension ResultAssembler {
                     speaker: point.speaker, text: point.text, time: transcript[point.lines[0]].time,
                     segmentIDs: point.lines.map { transcript[$0].segmentID }, isQuote: point.isQuote)
             }
-            return OutlineSegment(heading: heading, start: start, end: end, points: points, isExtracted: draft.isExtracted)
+            return OutlineSegment(
+                heading: heading, start: start, end: end, points: points, isExtracted: draft.isExtracted, isDeclined: draft.isDeclined)
         }
     }
 }
