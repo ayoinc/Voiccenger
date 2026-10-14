@@ -129,9 +129,28 @@ jobs:
           path: ~/Library/Application Support/Voiccenger/Models/whisper
           key: whisper-large-v3-turbo-v1
 
+      # GitHub's Apple silicon runners are virtual machines without a Neural Engine; on macos-14 Core ML
+      # refused WhisperKit's models there ("Unable to compute the asynchronous prediction using ML Program").
+      # A Core ML refusal is reported as a non-blocking note; a wrong transcript still fails.
       - name: Whisper transcription of the fixture meeting (Apple silicon)
+        id: whisper
         if: runner.arch == 'ARM64'
+        continue-on-error: true
         run: |
+          set -o pipefail
           dist/voiccenger-cli models download whisper
           time dist/voiccenger-cli transcribe .fixtures/meeting.wav --engine whisper --language en \
-            --truth .fixtures/meeting.truth.json --max-wer 0.25
+            --truth .fixtures/meeting.truth.json --max-wer 0.25 2>&1 | tee whisper.log
+
+      - name: Whisper result
+        if: always() && runner.arch == 'ARM64'
+        run: |
+          wer="$(grep -o 'WER [0-9.]*%' whisper.log 2>/dev/null || true)"
+          if [[ "${{ steps.whisper.outcome }}" == success ]]; then
+            echo "✅ ${{ matrix.runner }}: Whisper transcription $wer" >>"$GITHUB_STEP_SUMMARY"
+          elif grep -q 'ML Program' whisper.log 2>/dev/null; then
+            echo "⚠️ ${{ matrix.runner }}: Whisper not checked (non-blocking): Core ML can't run the model in this runner VM: $(grep -m1 'error:' whisper.log)" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ ${{ matrix.runner }}: Whisper transcription failed $wer" >>"$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

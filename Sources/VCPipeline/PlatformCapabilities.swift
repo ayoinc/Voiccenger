@@ -171,6 +171,9 @@ public struct PlatformCapabilities: Sendable, Hashable, Codable {
     public var tierName: String {
         if appleIntelligence.isAvailable { return "Full: on-device voice models, instant live text and Apple Intelligence" }
         if appleSpeechAvailable { return "Standard: on-device voice models and instant live text; reports from Claude or the transcript outline" }
+        if EngineSupport.onDeviceModels(machine: machine).isEmpty {
+            return "Basic: Apple Speech (classic) or Deepgram with live text every few seconds; reports from Claude or the transcript outline"
+        }
         return "Essential: on-device voice models with live text every few seconds; reports from Claude or the transcript outline"
     }
 }
