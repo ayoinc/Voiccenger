@@ -42,7 +42,10 @@ public actor RefiningTranscriber {
     private var prompt: [String]
 
     private let timeline = RecognitionTimeline()
-    private var audio = SessionAudio(capacitySeconds: 120)
+    /// Audio not yet handed to a refinement window. Live, the last two minutes; offline the input arrives far
+    /// faster than Apple recognizes it, so nothing is dropped before its window is refined (else long recordings
+    /// would keep Apple's text wherever recognition fell more than two minutes behind).
+    private var audio: SessionAudio
     private var audioEnd: TimeInterval = 0
     /// End of the audio already handed to a job; windows never reach back before it.
     private var consumedEnd: TimeInterval = 0
@@ -94,6 +97,7 @@ public actor RefiningTranscriber {
         self.customization = customization
         self.library = library
         self.waitForEngine = waitForEngine
+        audio = SessionAudio(capacitySeconds: waitForEngine ? Self.offlineAudioCapacity : 120)
         if modelPreview == nil, #available(macOS 26.0, *), AppleSpeech.isAvailable {
             self.engine = engine
             previewEngine = .apple
@@ -245,6 +249,9 @@ public actor RefiningTranscriber {
 
     /// Upper bound on how far Apple's results trail the audio fed to it.
     static let recognitionLagSeconds: TimeInterval = 2
+
+    /// Offline buffer limit: a day of audio, i.e. none in practice (audio is released once refined).
+    static let offlineAudioCapacity: Double = 24 * 3600
 
     private func endOfInput() {
         closeWindow()

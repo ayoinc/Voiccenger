@@ -44,6 +44,12 @@ public final class MeetingCoordinator {
     public private(set) var conversationDetectedAt: Date?
     /// Saved meetings, newest first.
     public private(set) var meetings: [Meeting] = []
+    /// Meeting folders that recorded but were never saved (the app quit or crashed first), newest first.
+    public private(set) var unsavedRecordings: [UnsavedRecording] = []
+    /// Recordings being transcribed (recovered, or a saved meeting transcribed again), by meeting id.
+    public private(set) var processing: [UUID: ProcessingProgress] = [:]
+    /// Quitting while a meeting records or saves (`TerminationFlow`).
+    public private(set) var termination = TerminationFlow()
     public private(set) var profiles: [SpeakerProfile] = []
     /// The most recent user-facing failure (start/stop/storage).
     public var lastError: String?
@@ -79,6 +85,11 @@ public final class MeetingCoordinator {
     @ObservationIgnored private var notifier: MeetingNotifier?
     @ObservationIgnored private var launched = false
     @ObservationIgnored private var prewarmTask: Task<Void, Never>?
+    /// The stop under way, shared by everything that stops the session (the user, the meeting app ending, quitting).
+    @ObservationIgnored private var stopTask: Task<Meeting?, Never>?
+    @ObservationIgnored private var quitAction: TerminationFlow.Action?
+    /// The stop or save `finishBeforeQuitting` waits for has ended.
+    @ObservationIgnored private var quitSaveEnded = false
 
     public init(settings: AppSettings = AppSettings(), paths: AppPaths = .default) {
         self.settings = settings
@@ -96,6 +107,7 @@ public final class MeetingCoordinator {
         }
         await notifier?.requestAuthorization()
         await reloadMeetings()
+        reloadUnsavedRecordings()
         await reloadProfiles()
         applySettings()
         observeSettings()
@@ -150,20 +162,28 @@ public final class MeetingCoordinator {
         }
     }
 
-    /// Stops the active recording, saves the meeting and returns it.
+    /// Stops the active recording, saves the meeting and returns it. `writeReport: false` saves without the report
+    /// (it can be written later from Meetings). A stop already under way is awaited instead.
     @discardableResult
-    public func stopRecording() async -> Meeting? {
+    public func stopRecording(writeReport: Bool = true) async -> Meeting? {
+        if let stopTask { return await stopTask.value }
         guard let session, session.state == .recording else { return nil }
-        defer { applySettings() }
-        do {
-            let meeting = try await session.stop()
-            meetings.removeAll { $0.id == meeting.id }
-            meetings.insert(meeting, at: 0)
-            return meeting
-        } catch {
-            lastError = "The meeting couldn't be saved: \(error.localizedDescription)"
-            return nil
+        let task = Task { () -> Meeting? in
+            defer { self.applySettings() }
+            do {
+                let meeting = try await session.stop(writeReport: writeReport)
+                self.meetings.removeAll { $0.id == meeting.id }
+                self.meetings.insert(meeting, at: 0)
+                return meeting
+            } catch {
+                self.lastError = "The meeting couldn't be saved: \(error.localizedDescription)"
+                return nil
+            }
         }
+        stopTask = task
+        let meeting = await task.value
+        stopTask = nil
+        return meeting
     }
 
     public func toggleRecording() async {
@@ -205,6 +225,141 @@ public final class MeetingCoordinator {
             meetings.removeAll { $0.id == id }
         } catch {
             lastError = "The meeting couldn't be deleted: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Unsaved recordings
+
+    /// Looks for meeting folders that recorded but were never saved, leaving out the meeting recording now.
+    public func reloadUnsavedRecordings() {
+        let active = session?.isActive == true ? session?.id : nil
+        unsavedRecordings = meetingStore.unsavedRecordings(excluding: active)
+    }
+
+    /// Recovers an unsaved recording into a saved meeting in its folder. With a journal (and not `fromAudio`) the
+    /// transcript is restored at once and the report is written after; otherwise the recordings are transcribed
+    /// with the current settings and enrolled voices (`processing` shows the progress).
+    public func recover(_ id: UUID, fromAudio: Bool = false) async {
+        guard processing[id] == nil, let recording = unsavedRecordings.first(where: { $0.id == id }) else { return }
+        guard recording.hasJournal, !fromAudio else {
+            await transcribe(directory: recording.directory, id: id, startedAt: recording.startedAt, kind: nil, title: nil)
+            return
+        }
+        do {
+            let meeting = try await MeetingRecovery.restoreFromJournal(recording, store: meetingStore)
+            add(meeting)
+            await generateReport(for: meeting.id)
+        } catch {
+            lastError = "The recording couldn't be recovered: \(error.localizedDescription)"
+        }
+    }
+
+    /// Transcribes a saved meeting again from its recordings, replacing its transcript and report.
+    public func retranscribe(_ meetingID: UUID) async {
+        guard processing[meetingID] == nil, let meeting = meetings.first(where: { $0.id == meetingID }),
+            !meeting.audioFiles.isEmpty
+        else { return }
+        await transcribe(
+            directory: meetingStore.directory(for: meetingID), id: meetingID, startedAt: meeting.startedAt,
+            kind: meeting.kind, title: meeting.title)
+    }
+
+    /// Deletes an unsaved recording's folder (audio and journal).
+    public func deleteUnsavedRecording(_ id: UUID) async {
+        guard processing[id] == nil else { return }
+        do {
+            try await meetingStore.delete(id: id)
+            unsavedRecordings.removeAll { $0.id == id }
+        } catch {
+            lastError = "The recording couldn't be deleted: \(error.localizedDescription)"
+        }
+    }
+
+    private func transcribe(directory: URL, id: UUID, startedAt: Date, kind: MeetingKind?, title: String?) async {
+        processing[id] = .transcribing(0)
+        defer { processing[id] = nil }
+        await reloadProfiles()
+        var config = settings.sessionConfig(kind: kind ?? .inPerson, detected: nil, meetingsDirectory: paths.meetings)
+        // Recordings are mono: no seat directions.
+        config.arrayGeometry = nil
+        config.title = title
+        do {
+            let meeting = try await MeetingSession.processRecording(
+                directory: directory, config: config, profiles: profiles, startedAt: startedAt, kind: kind
+            ) { [weak self] progress in
+                self?.processing[id] = progress
+            }
+            add(meeting)
+        } catch {
+            lastError = "The recording couldn't be transcribed: \(error.localizedDescription)"
+        }
+    }
+
+    /// A meeting saved outside `stopRecording` joins the list (in date order) and leaves the unsaved ones.
+    private func add(_ meeting: Meeting) {
+        unsavedRecordings.removeAll { $0.id == meeting.id }
+        meetings.removeAll { $0.id == meeting.id }
+        meetings.append(meeting)
+        meetings.sort { $0.startedAt > $1.startedAt }
+    }
+
+    // MARK: - Quitting
+
+    /// The app was asked to quit: `.terminateLater` when a meeting is recording or saving, after which
+    /// `finishBeforeQuitting()` must run.
+    public func prepareToQuit() -> TerminationFlow.Reply {
+        let (reply, action) = termination.requestQuit(session: session?.state, now: Date())
+        if let action { quitAction = action }
+        return reply
+    }
+
+    /// Stops and saves the meeting (without its report, which can be written later), or waits for the save under
+    /// way; after `termination.cap` seconds, or `quitNow()`, saves what has been transcribed. Returns when the app
+    /// may quit.
+    public func finishBeforeQuitting() async {
+        guard let action = quitAction else { return }
+        quitAction = nil
+        quitSaveEnded = false
+        Task {
+            if action == .stopAndSave {
+                // A recording still starting can't be stopped yet.
+                var waited = 0
+                while session?.state == .starting, waited < 100 {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    waited += 1
+                }
+                await stopRecording(writeReport: false)
+            } else if let stopTask {
+                _ = await stopTask.value
+            }
+            quitSaveEnded = true
+        }
+        while termination.phase != .done {
+            if quitSaveEnded {
+                _ = termination.saveEnded()
+            } else if termination.phase == .savingSnapshot || termination.tick(now: Date()) == .saveSnapshot {
+                await saveSnapshotForQuit()
+                _ = termination.saveEnded()
+            } else {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+
+    /// Quit without waiting any longer: what has been transcribed is saved.
+    public func quitNow() {
+        _ = termination.quitNow()
+    }
+
+    private func saveSnapshotForQuit() async {
+        guard let session else { return }
+        do {
+            let meeting = try await session.saveSnapshot()
+            meetings.removeAll { $0.id == meeting.id }
+            meetings.insert(meeting, at: 0)
+        } catch {
+            // The journal stays: the meeting is offered for recovery at the next launch.
+            lastError = "The meeting couldn't be saved: \(error.localizedDescription)"
         }
     }
 

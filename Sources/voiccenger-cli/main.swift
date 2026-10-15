@@ -168,6 +168,18 @@ let usage = """
                                        Write the report for a transcript (a JSON array of lines
                                        {"speaker", "start", "end"?, "text"}, as in .fixtures/meeting.truth.json)
                                        or a saved meeting; lists refused, retried and split requests.
+      recover [<meeting-dir> | --all] [options]
+                                       Recover meetings that recorded but were never saved (the app quit or
+                                       crashed first): restore the transcript from the folder's journal when
+                                       there is one, else replay microphone.wav and system.wav together through
+                                       the meeting pipeline. Saves meeting.json in the meeting's folder (named by
+                                       the meeting's id) and prints totals, never the transcript.
+          --all                        Every unsaved recording in --meetings (default: the app's library)
+          --from-audio                 Transcribe the recordings even when a journal could restore the transcript
+          --engine, --intelligence, --locale
+                                       As for `process` (default: the app's settings)
+          --profiles dir               Enrolled voices (default: the app's library)
+          --no-analysis                Skip live per-line analysis (the report is still written)
       doa --preset name --angle deg [--snr dB] [--reverb gain] [--source file.wav]
                                        Simulate a source around a microphone array and estimate its
                                        direction with GCC-PHAT. Presets: \(ArrayPresetIDs.all.map(\.id).joined(separator: ", "))
@@ -737,6 +749,125 @@ func report(_ a: inout Arguments) async throws {
     }
 }
 
+/// Recovers unsaved recordings (`recover --help`). Prints totals only: transcripts are private.
+@MainActor
+func recover(_ a: inout Arguments) async throws {
+    let all = a.flag("all")
+    let fromAudio = a.flag("from-audio")
+    let target = a.positional.first
+    let meetingsDir = directoryURL(a.option("meetings"), default: AppPaths.default.meetings)
+    let profileStore = SpeakerProfileStore(directory: directoryURL(a.option("profiles"), default: AppPaths.default.profiles))
+    // The app's preferences, so a recovered meeting is transcribed as the app would have.
+    let settings = AppSettings(defaults: UserDefaults(suiteName: appDefaultsDomain) ?? .standard)
+    let speechEngine = try a.option("engine").map(engine) ?? settings.speechEngine
+    let intelligence = try a.option("intelligence").map { try intelligenceKind($0) } ?? settings.engine
+    let locale = a.option("locale") ?? settings.localeID
+    let analysis = !a.flag("no-analysis")
+    try a.checkUnused()
+    guard all != (target != nil) else { throw UsageError("pass a meeting folder or --all") }
+
+    // A folder written to in the last half minute may be a meeting recording right now.
+    let quiet: TimeInterval = 30
+    var recordings: [UnsavedRecording]
+    if let target {
+        let dir = URL(fileURLWithPath: (target as NSString).expandingTildeInPath, isDirectory: true).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: dir.path) else { throw UsageError("no such folder: \(target)") }
+        guard !FileManager.default.fileExists(atPath: dir.appending(path: MeetingStore.fileName).path) else {
+            throw UsageError("\(dir.path) already holds a saved meeting (\(MeetingStore.fileName))")
+        }
+        guard let recording = UnsavedRecording.inspect(dir) else {
+            throw UsageError("\(dir.path) has no recordings or journal to recover (its name must be the meeting's id)")
+        }
+        guard Date().timeIntervalSince(recording.lastModified) >= quiet else {
+            throw UsageError("\(dir.path) was written to moments ago; it may still be recording")
+        }
+        recordings = [recording]
+    } else {
+        recordings = MeetingStore(directory: meetingsDir).unsavedRecordings(quietFor: quiet)
+        guard !recordings.isEmpty else {
+            print("No unsaved recordings in \(meetingsDir.path).")
+            return
+        }
+    }
+
+    let needsAudio = recordings.contains { fromAudio || !$0.hasJournal }
+    if needsAudio { try await ensureDownloaded(speechEngine) }
+    let profiles = await profileStore.all()
+    for recording in recordings {
+        let store = MeetingStore(directory: recording.directory.deletingLastPathComponent())
+        eprint(
+            "Recovering \(recording.id.uuidString): recorded \(recording.startedAt.formatted(date: .abbreviated, time: .shortened)), "
+                + "\(ReportRenderer.durationText(recording.duration)) (\(recording.audioFiles.joined(separator: ", ")))"
+                + (recording.hasJournal ? ", journal" : ""))
+        let started = ContinuousClock.now
+        let trace = ReportTrace()
+        var meeting: Meeting
+        if recording.hasJournal && !fromAudio {
+            eprint("Restoring the transcript from the journal…")
+            meeting = try await MeetingRecovery.restoreFromJournal(recording, store: store)
+            let choice = ReportWriter.engine(preferring: intelligence)
+            eprint("Writing the report with \(choice.engine.engineName)…")
+            do {
+                meeting.report = try await ReportTrace.$current.withValue(trace) {
+                    try await ReportWriter.report(for: meeting, engine: choice.engine, title: nil)
+                }
+                if let title = meeting.report?.title, !title.isEmpty { meeting.title = title }
+                try await store.save(meeting)
+            } catch {
+                eprint("The report couldn't be written: \(error.localizedDescription)")
+            }
+        } else {
+            eprint(
+                "Transcribing with \(SpeechModelLibrary.info(speechEngine).displayName) and \(profiles.count) enrolled voice(s)…")
+            var config = settings.sessionConfig(kind: .inPerson, detected: nil, meetingsDirectory: store.directory)
+            config.arrayGeometry = nil
+            config.microphoneDeviceUID = nil
+            config.speechEngine = speechEngine
+            config.engineKind = intelligence
+            config.localeID = locale
+            config.liveAnalysis = analysis
+            var shown = ""
+            meeting = try await ReportTrace.$current.withValue(trace) {
+                try await MeetingSession.processRecording(
+                    directory: recording.directory, config: config, profiles: profiles, startedAt: recording.startedAt
+                ) { progress in
+                    let label = progress.label
+                    guard label != shown else { return }
+                    shown = label
+                    FileHandle.standardError.write(Data("\r\u{1B}[K\(label)".utf8))
+                }
+            }
+            FileHandle.standardError.write(Data("\r\u{1B}[K".utf8))
+        }
+        printRecoverySummary(meeting, trace: trace, elapsed: seconds(since: started), directory: store.directory(for: meeting.id))
+    }
+}
+
+/// Totals of a recovered meeting: no names, no text.
+func printRecoverySummary(_ meeting: Meeting, trace: ReportTrace, elapsed: String, directory: URL) {
+    let byChannel = AudioChannel.allCases.map { channel in
+        "\(channel == .microphone ? "microphone" : "computer audio") \(meeting.segments.filter { $0.channel == channel }.count)"
+    }
+    let spoken = Set(meeting.segments.map(\.speakerKey))
+    let speakers = meeting.participants.filter { spoken.contains($0.id) }
+    let enrolled = speakers.filter(\.isEnrolled).count
+    print("Recovered in \(elapsed): \(ReportRenderer.durationText(meeting.duration)) meeting (\(meeting.kind == .online ? "online" : "in person"))")
+    print("Lines: \(meeting.segments.count) (\(byChannel.joined(separator: ", "))); by voice model: \(engineSummary(meeting.segments.map(\.engine)))")
+    print("Participants: \(speakers.count) (\(enrolled) enrolled, \(speakers.count - enrolled) unknown)")
+    let summary = trace.summary
+    if let report = meeting.report {
+        print("Report: written by \(report.generatedBy); requests \(summary.requests), refused \(summary.refusals), "
+            + "permissive retries \(summary.retries) (\(summary.answeredOnRetry) answered), splits \(summary.bisections), "
+            + "lines without AI \(summary.linesWithoutAI.values.reduce(0, +)), engine fallbacks \(summary.engineFallbacks)")
+    } else {
+        print("Report: none (write it in the app's Meetings, or with `voiccenger-cli report`)")
+    }
+    print("Saved: \(directory.appending(path: MeetingStore.fileName).path)")
+}
+
+/// The app's preferences domain (its bundle identifier).
+let appDefaultsDomain = "com.voiccenger.app"
+
 /// One ground-truth turn from `MakeFixtures.swift`.
 struct TruthTurn: Decodable {
     let start: Double
@@ -996,6 +1127,7 @@ let commandFlags: [String: Set<String>] = [
     "enroll": ["standard"],
     "calibrate": ["standard", "regions"],
     "process": ["no-analysis", "no-auto-language"],
+    "recover": ["all", "from-audio", "no-analysis"],
     "record": ["no-computer-audio", "detect", "no-analysis"],
     "models": ["refresh"],
     "capabilities": ["json"],
@@ -1024,6 +1156,7 @@ do {
     case "calibrate": try await calibrate(&args)
     case "process": try await process(&args)
     case "report": try await report(&args)
+    case "recover": try await recover(&args)
     case "record": try await record(&args)
     case "doa": try doa(&args)
     case "system-audio": try await systemAudio(&args)

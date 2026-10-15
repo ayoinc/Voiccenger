@@ -20,7 +20,8 @@ public struct AppPaths: Sendable, Hashable {
     public var profiles: URL { root.appending(path: "Profiles", directoryHint: .isDirectory) }
 }
 
-/// One directory per meeting: `<directory>/<uuid>/meeting.json` plus its audio recordings.
+/// One directory per meeting: `<directory>/<uuid>/meeting.json` plus its audio recordings (and, until it's saved,
+/// the `MeetingJournal` of a meeting being recorded).
 public actor MeetingStore {
     public nonisolated let directory: URL
     public static let fileName = "meeting.json"
@@ -29,11 +30,13 @@ public actor MeetingStore {
         self.directory = directory
     }
 
+    /// Writes `meeting.json`; the meeting's journal, now superseded, is deleted.
     public func save(_ m: Meeting) throws {
         let dir = directory(for: m.id)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let data = try Self.encoder.encode(m)
         try data.write(to: dir.appending(path: Self.fileName), options: .atomic)
+        try? FileManager.default.removeItem(at: dir.appending(path: MeetingJournal.fileName))
     }
 
     /// Every readable meeting, newest first. Directories without a decodable `meeting.json`

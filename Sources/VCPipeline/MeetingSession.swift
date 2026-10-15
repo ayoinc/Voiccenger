@@ -201,6 +201,23 @@ public final class MeetingSession {
     @ObservationIgnored private var lastLevelUpdate: TimeInterval = 0
     /// Name of the processed file, the title fallback for `processFile`.
     @ObservationIgnored private var sourceName: String?
+    /// When the recording being processed started (`processRecording`); live meetings start now.
+    @ObservationIgnored private var recordingStartedAt: Date?
+    /// The recordings `processRecording` replays (kept with the saved meeting).
+    @ObservationIgnored private var replayedFiles: [String] = []
+    /// The meeting becomes online when the computer's audio carried speech (a recording whose kind isn't known).
+    @ObservationIgnored private var inferKind = false
+    /// Every channel's transcriber and identifier has finished (`stop()`): what's left is alignment, analysis and
+    /// the report.
+    @ObservationIgnored private var inputTranscribed = false
+    /// Keeps offline channels on one clock (`ReplayPacer`).
+    @ObservationIgnored private var pacer: ReplayPacer?
+    /// Live meetings write every line to `journal.jsonl` as it's finalized, so a crash leaves the transcript.
+    @ObservationIgnored private var journal: MeetingJournal?
+    /// Participants as last journaled: who they are, and when (session seconds) the roster was written.
+    @ObservationIgnored private var journaledRoster: (identity: [String], time: TimeInterval)?
+    /// Progress of offline processing, for `processRecording`.
+    @ObservationIgnored private var onProgress: (@MainActor (ProcessingProgress) -> Void)?
 
     /// How far behind the newest audio the identifier's completed windows can be.
     private var diarizationLag: TimeInterval { config.speakerConfig.windowSeconds + 0.5 }
@@ -248,6 +265,7 @@ public final class MeetingSession {
         guard state == .recording, config.mode == .live, detectedMeeting == nil else { return }
         kind = .online
         detectedMeeting = meeting
+        journalHeader()
         health.setMeetingApp(meeting.app.displayName, at: now())
         let target = SystemAudioTarget(meetingApp: meeting.app)
         if let systemSource {
@@ -296,9 +314,85 @@ public final class MeetingSession {
         return try await session.stop()
     }
 
-    /// Finishes capture and processing, generates the report and saves the meeting.
+    public enum RecoveryError: LocalizedError {
+        case notAMeetingFolder(String)
+        case noRecordings(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notAMeetingFolder(let name): "“\(name)” isn't a meeting folder (its name must be the meeting's id)."
+            case .noRecordings(let name): "“\(name)” has no recorded audio to transcribe."
+            }
+        }
+    }
+
+    /// Transcribes a meeting again from its recordings: `microphone.wav` and `system.wav` in `directory` (a meeting
+    /// folder, named by the meeting's id) replay together on one session clock as the `.microphone` and `.system`
+    /// channels through the live pipeline (voice model, speaker identification with `profiles`, alignment, bleed
+    /// suppression, report), and the meeting is saved as `meeting.json` in that same folder.
+    ///
+    /// A recording whose header an interrupted app never finalized is repaired first. The meeting starts at
+    /// `startedAt`, by default when the folder and its recordings were created. Its kind is `kind`, else online when
+    /// the computer's audio carried speech. Without a title in `config` the report proposes one.
+    public static func processRecording(
+        directory: URL, config: Config, profiles: [SpeakerProfile], startedAt: Date? = nil, kind: MeetingKind? = nil,
+        library: SpeechModelLibrary = .shared, progress: (@MainActor (ProcessingProgress) -> Void)? = nil
+    ) async throws -> Meeting {
+        let name = directory.lastPathComponent
+        guard let id = UUID(uuidString: name) else { throw RecoveryError.notAMeetingFolder(name) }
+        var files: [(channel: AudioChannel, url: URL)] = []
+        var duration = 0.0
+        for channel in AudioChannel.allCases {
+            let url = directory.appending(path: UnsavedRecording.audioFileName(channel))
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            try WAVHeader.repair(url)
+            let info = try WAVHeader.read(url)
+            guard info.frames > 0 else { continue }
+            files.append((channel, url))
+            duration = max(duration, info.duration)
+        }
+        guard !files.isEmpty else { throw RecoveryError.noRecordings(name) }
+
+        var config = config
+        config.mode = .offline
+        // The recordings are the input: recording again would overwrite them.
+        config.recordAudio = false
+        config.meetingsDirectory = directory.deletingLastPathComponent()
+        if let kind { config.kind = kind }
+        let session = MeetingSession(config: config, profiles: profiles, id: id, library: library)
+        session.recordingStartedAt = startedAt ?? Self.creationDate(of: [directory] + files.map(\.url))
+        session.replayedFiles = files.map(\.url.lastPathComponent)
+        session.inferKind = kind == nil
+        session.onProgress = progress
+        progress?(.transcribing(0))
+        let inputs = files
+        let total = duration
+        try await session.run(channels: inputs.map(\.channel)) { clock in
+            inputs.map { AudioFileSource(url: $0.url, channel: $0.channel, clock: clock, realtime: false) }
+        }
+        // Input is decoded far ahead of recognition: progress is how far the transcript has got.
+        let ticker = Task { @MainActor [weak session] in
+            var through = 0.0
+            while !Task.isCancelled, let session, !session.inputTranscribed, total > 0 {
+                through = max(through, session.segments.map(\.range.end).max() ?? 0)
+                progress?(.transcribing(min(1, through / total)))
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+        defer { ticker.cancel() }
+        await session.waitForCaptureToEnd()
+        return try await session.stop()
+    }
+
+    /// When the earliest of `urls` was created.
+    private static func creationDate(of urls: [URL]) -> Date? {
+        urls.compactMap { try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate }.min()
+    }
+
+    /// Finishes capture and processing, generates the report (unless `writeReport` is false: the report can be
+    /// written later from the saved meeting) and saves the meeting.
     @discardableResult
-    public func stop() async throws -> Meeting {
+    public func stop(writeReport: Bool = true) async throws -> Meeting {
         if let meeting { return meeting }
         guard state == .recording else { throw SessionError.notRecording }
         state = .finishing
@@ -311,8 +405,10 @@ public final class MeetingSession {
         }
         for task in consumerTasks { await Self.finish(task, timeout: live ? .seconds(30) : nil) }
         for task in eventTasks { await Self.finish(task, timeout: live ? .seconds(15) : nil) }
+        inputTranscribed = true
+        onProgress?(.finishingLines)
         tickTask?.cancel()
-        var audioFiles: [String] = []
+        var audioFiles: [String] = replayedFiles
         for task in recorderTasks { if let name = await task.value { audioFiles.append(name) } }
 
         for update in pending.drain() { attribute(update) }
@@ -326,24 +422,58 @@ public final class MeetingSession {
         await analysisWorker?.value
         // Offline input runs faster than realtime: the meeting lasted as long as its audio, not its processing.
         endedAt = live ? Date() : (startedAt ?? Date()).addingTimeInterval(audioEnd)
+        if inferKind, kind == .inPerson, segments.contains(where: { $0.channel == .system }) { kind = .online }
 
-        var meeting = Meeting(
-            id: id, title: config.title ?? defaultTitle(), kind: kind,
-            appName: detectedMeeting?.app.displayName, startedAt: startedAt ?? Date(), endedAt: endedAt,
-            participants: participants, segments: segments, report: nil, audioFiles: audioFiles,
-            localeIDs: localesUsed, captureWarnings: health.raised)
-        meeting.report = await generateReport(for: meeting)
-        if config.title == nil, let title = meeting.report?.title.nonEmpty { meeting.title = title }
+        var meeting = makeMeeting(audioFiles: audioFiles)
+        if writeReport {
+            onProgress?(.writingReport)
+            meeting.report = await generateReport(for: meeting)
+            if config.title == nil, let title = meeting.report?.title.nonEmpty { meeting.title = title }
+        }
 
+        onProgress?(.saving)
+        journal?.close()
         try await MeetingStore(directory: config.meetingsDirectory).save(meeting)
         self.meeting = meeting
         state = .finished
         return meeting
     }
 
+    /// Saves the meeting as it stands, without waiting for the rest of processing (the app is quitting and can't
+    /// wait any longer): lines still waiting for their speaker are attributed with what's known, and there is no
+    /// report. A `stop()` still under way may save a fuller version over it.
+    @discardableResult
+    public func saveSnapshot() async throws -> Meeting {
+        if let meeting { return meeting }
+        guard state == .recording || state == .finishing else { throw SessionError.notRecording }
+        for update in pending.drain() { attribute(update) }
+        pendingFinals = []
+        let store = MeetingStore(directory: config.meetingsDirectory)
+        let audioFiles =
+            replayedFiles
+            + (config.recordAudio
+                ? AudioChannel.allCases.map { UnsavedRecording.audioFileName($0) }.filter {
+                    FileManager.default.fileExists(atPath: store.directory(for: id).appending(path: $0).path)
+                } : [])
+        var meeting = makeMeeting(audioFiles: audioFiles)
+        meeting.endedAt = meeting.endedAt ?? (config.mode == .live ? Date() : nil)
+        try await store.save(meeting)
+        self.meeting = meeting
+        return meeting
+    }
+
+    private func makeMeeting(audioFiles: [String]) -> Meeting {
+        Meeting(
+            id: id, title: config.title ?? defaultTitle(), kind: kind,
+            appName: detectedMeeting?.app.displayName, startedAt: startedAt ?? Date(), endedAt: endedAt,
+            participants: participants, segments: segments.sorted { $0.range.start < $1.range.start }, report: nil,
+            audioFiles: audioFiles, localeIDs: localesUsed, captureWarnings: health.raised)
+    }
+
     /// Renames a participant (typically an unknown "Speaker 2"). Later lines and the report use the new name.
     public func rename(participantKey: String, to name: String) {
         roster.rename(participantKey, to: name)
+        journalRoster(force: true)
     }
 
     /// Seconds of a participant's voice collected so far (enrollment needs at least 5 s).
@@ -402,9 +532,15 @@ public final class MeetingSession {
                 }
             }
             sources = started.map(\.0)
-            startedAt = Date()
-            if config.mode == .live { health.setMeetingApp(detectedMeeting?.app.displayName, at: 0) }
+            startedAt = recordingStartedAt ?? Date()
+            if config.mode == .live {
+                health.setMeetingApp(detectedMeeting?.app.displayName, at: 0)
+                openJournal()
+            } else {
+                pacer = ReplayPacer()
+            }
             for (source, stream) in started { launch(source: source, stream: stream) }
+            pacer?.open()
             for (channel, transcriber) in transcribers { launchEvents(channel: channel, transcriber: transcriber) }
             launchAnalysis()
             if config.mode == .live { launchTicker() }
@@ -521,18 +657,26 @@ public final class MeetingSession {
         var sinks: [AsyncStream<AudioChunk>.Continuation] = []
         var rawSinks: [AsyncStream<AudioChunk>.Continuation] = []
         let offline = config.mode == .offline
+        let pacer = self.pacer
+        /// A consumer's copy of the input; offline, it reports to the pacer how far the consumer has got.
+        func makeSink(
+            _ policy: AsyncStream<AudioChunk>.Continuation.BufferingPolicy = .unbounded
+        ) -> (AsyncStream<AudioChunk>, AsyncStream<AudioChunk>.Continuation) {
+            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: policy)
+            return (pacer?.paced(s) ?? s, c)
+        }
 
         if let system = source as? SystemAudioSource {
             systemSource = system
             observe(system)
         }
         if let transcriber = transcribers[channel] {
-            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
+            let (s, c) = makeSink()
             sinks.append(c)
             consumerTasks.append(Task.detached { await Self.feedTranscriber(s, transcriber) })
         }
         if let identifier = identifiers[channel] {
-            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
+            let (s, c) = makeSink()
             sinks.append(c)
             let collector = self.collector
             consumerTasks.append(
@@ -541,12 +685,12 @@ public final class MeetingSession {
                 })
         }
         if let archive {
-            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
+            let (s, c) = makeSink()
             sinks.append(c)
             consumerTasks.append(Task.detached { await Self.feedArchive(s, archive, channel: channel) })
         }
         if channel == .system {
-            let (s, c) = AsyncStream.makeStream(of: AudioChunk.self, bufferingPolicy: .unbounded)
+            let (s, c) = makeSink()
             sinks.append(c)
             let micIdentifier = identifiers[.microphone]
             let collector = self.collector
@@ -554,8 +698,7 @@ public final class MeetingSession {
         }
         if channel == .microphone, let geometry = config.arrayGeometry {
             // Direction is advisory live: keep only the newest chunks if estimation falls behind.
-            let (s, c) = AsyncStream.makeStream(
-                of: AudioChunk.self, bufferingPolicy: offline ? .unbounded : .bufferingNewest(10))
+            let (s, c) = makeSink(offline ? .unbounded : .bufferingNewest(10))
             sinks.append(c)
             let estimator = DirectionEstimator(geometry: geometry)
             consumerTasks.append(Task.detached { [weak self] in await Self.feedDirection(s, estimator, session: self) })
@@ -593,6 +736,8 @@ public final class MeetingSession {
                 var gain = AutomaticGainControl()
                 var window = LevelWindow()
                 for await chunk in stream {
+                    // Offline: wait for every consumer (of every channel) to be close behind.
+                    await pacer?.waitToForward(chunk.startTime)
                     for sink in raw { sink.yield(chunk) }
                     let processed = normalize ? gain.process(chunk) : chunk
                     for sink in outputs { sink.yield(processed) }
@@ -848,6 +993,44 @@ public final class MeetingSession {
         if !warnings.contains(message) { warnings.append(message) }
     }
 
+    // MARK: - Journal
+
+    /// Starts the live meeting's journal in its folder (`MeetingJournal`).
+    private func openJournal() {
+        do {
+            journal = try MeetingJournal(directory: MeetingStore(directory: config.meetingsDirectory).directory(for: id))
+            journalHeader()
+        } catch {
+            warn("The transcript can't be saved as it's written (\(error.localizedDescription)); it's saved when the meeting ends.")
+        }
+    }
+
+    private func journalHeader() {
+        guard let journal, let startedAt else { return }
+        journal.append(
+            .header(
+                JournalRecord.Header(
+                    meetingID: id, title: config.title, kind: kind, appName: detectedMeeting?.app.displayName,
+                    startedAt: startedAt, localeIDs: localesUsed)))
+    }
+
+    /// Writes the participants when someone joins, is renamed or enrolled, and at most once a minute otherwise
+    /// (speaking times).
+    private func journalRoster(force: Bool = false) {
+        guard let journal else { return }
+        let identity = participants.map { "\($0.id)\u{1F}\($0.displayName)\u{1F}\($0.profileID?.uuidString ?? "")" }
+        let time = now()
+        if !force, let last = journaledRoster, last.identity == identity, time - last.time < 60 { return }
+        journaledRoster = (identity, time)
+        journal.append(.participants(participants))
+    }
+
+    private func journalSegment(_ segment: TranscriptSegment) {
+        guard let journal else { return }
+        journal.append(.segment(segment))
+        journalRoster()
+    }
+
     private func now() -> TimeInterval { clock?.now() ?? 0 }
 
     private func noteLocale(_ id: String) {
@@ -884,6 +1067,7 @@ public final class MeetingSession {
             }
             roster.setLocale(update.localeID, for: piece.speakerKey)
             segments.append(segment)
+            journalSegment(segment)
             if segment.channel == .system { removeBleed(repeating: segment) }
             if let archive,
                 let route = voices.route(
@@ -916,6 +1100,7 @@ public final class MeetingSession {
                 .map(\.id))
         guard !bleed.isEmpty else { return }
         segments.removeAll { bleed.contains($0.id) }
+        journal?.append(.removed(Array(bleed)))
         attentionItems.removeAll { bleed.contains($0.segmentID) }
         bleedLinesRemoved += bleed.count
     }
@@ -962,9 +1147,11 @@ public final class MeetingSession {
         let segment = segments[i]
         if isBleed(segment) {
             segments.remove(at: i)
+            journal?.append(.removed([segment.id]))
             bleedLinesRemoved += 1
             return
         }
+        journalSegment(segment)
         if segment.channel == .system { removeBleed(repeating: segment) }
         enqueueAnalysis(of: segment)
     }
@@ -1021,6 +1208,7 @@ public final class MeetingSession {
         roster.setProfiles(profiles)
         roster.rekey(oldKey, to: newKey, profile: profile)
         for i in segments.indices where segments[i].speakerKey == oldKey { segments[i].speakerKey = newKey }
+        journal?.append(.rekey(from: oldKey, to: newKey))
         for i in attentionItems.indices where attentionItems[i].speakerKey == oldKey {
             let a = attentionItems[i]
             attentionItems[i] = AttentionItem(
@@ -1039,6 +1227,7 @@ public final class MeetingSession {
         let collector = self.collector
         Task { await collector.rekey(oldKey, to: newKey) }
         rebuildSeats()
+        journalRoster(force: true)
     }
 
     // MARK: - Live analysis

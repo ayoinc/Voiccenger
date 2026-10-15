@@ -10,6 +10,7 @@ struct MeetingsView: View {
     @Environment(NavigationModel.self) private var navigation
     @ViewState private var search = ""
     @ViewState private var pendingDelete: Meeting?
+    @ViewState private var pendingUnsavedDelete: UnsavedRecording?
 
     private var filtered: [Meeting] {
         guard let query = search.trimmedNonEmpty else { return coordinator.meetings }
@@ -22,26 +23,38 @@ struct MeetingsView: View {
 
     var body: some View {
         @Bindable var navigation = navigation
+        let unsaved = search.trimmedNonEmpty == nil ? coordinator.unsavedRecordings : []
         NavigationStack(path: $navigation.meetingPath) {
             Group {
-                if coordinator.meetings.isEmpty {
+                if coordinator.meetings.isEmpty && unsaved.isEmpty {
                     ContentUnavailableView(
                         "No Meetings Yet", systemImage: "list.bullet.rectangle",
                         description: Text("Recorded meetings and their reports appear here."))
-                } else if filtered.isEmpty {
+                } else if filtered.isEmpty && unsaved.isEmpty {
                     ContentUnavailableView.search(text: search)
                 } else {
                     List {
-                        ForEach(filtered) { meeting in
-                            NavigationLink(value: meeting.id) {
-                                MeetingRow(meeting: meeting)
-                            }
-                            .contextMenu {
-                                Button("Delete…", role: .destructive) { pendingDelete = meeting }
+                        if !unsaved.isEmpty {
+                            Section("Unsaved Recordings") {
+                                ForEach(unsaved) { recording in
+                                    UnsavedRecordingRow(recording: recording) { pendingUnsavedDelete = recording }
+                                }
                             }
                         }
-                        .onDelete { offsets in
-                            if let i = offsets.first { pendingDelete = filtered[i] }
+                        Section {
+                            ForEach(filtered) { meeting in
+                                NavigationLink(value: meeting.id) {
+                                    MeetingRow(meeting: meeting)
+                                }
+                                .contextMenu {
+                                    Button("Delete…", role: .destructive) { pendingDelete = meeting }
+                                }
+                            }
+                            .onDelete { offsets in
+                                if let i = offsets.first { pendingDelete = filtered[i] }
+                            }
+                        } header: {
+                            if !unsaved.isEmpty { Text("Meetings") }
                         }
                     }
                     .listStyle(.inset)
@@ -57,6 +70,8 @@ struct MeetingsView: View {
                 }
             }
         }
+        // Opening Meetings looks again for recordings left unsaved (say, by a crash since launch).
+        .task { coordinator.reloadUnsavedRecordings() }
         .confirmationDialog(
             "Delete “\(pendingDelete?.title ?? "")”?",
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
@@ -69,6 +84,76 @@ struct MeetingsView: View {
             }
         } message: { _ in
             Text("The transcript, report and audio recordings are removed. This can't be undone.")
+        }
+        .confirmationDialog(
+            "Delete this unsaved recording?",
+            isPresented: Binding(get: { pendingUnsavedDelete != nil }, set: { if !$0 { pendingUnsavedDelete = nil } }),
+            titleVisibility: .visible,
+            presenting: pendingUnsavedDelete
+        ) { recording in
+            Button("Delete Recording", role: .destructive) {
+                Task { await coordinator.deleteUnsavedRecording(recording.id) }
+            }
+        } message: { recording in
+            Text("The \(Format.duration(recording.duration)) of audio\(recording.hasJournal ? " and the transcript kept while recording" : "") are removed. This can't be undone.")
+        }
+    }
+}
+
+/// A meeting folder that recorded but was never saved: recover its transcript, or delete it.
+private struct UnsavedRecordingRow: View {
+    @Environment(MeetingCoordinator.self) private var coordinator
+    let recording: UnsavedRecording
+    let delete: () -> Void
+
+    private var progress: ProcessingProgress? { coordinator.processing[recording.id] }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+                .frame(width: 24)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Unsaved recording — \(recording.startedAt.formatted(date: .abbreviated, time: .shortened)), \(Format.duration(recording.duration))")
+                    .font(.headline)
+                    .lineLimit(1)
+                if let progress {
+                    ProgressView(value: progress.fraction)
+                        .frame(maxWidth: 260)
+                    Text(progress.label)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                } else {
+                    Text(
+                        recording.hasJournal
+                            ? "Voiccenger quit before saving it. The transcript was kept as it was written."
+                            : "Voiccenger quit before saving it. Recovering transcribes the audio with your voice model and enrolled voices."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer()
+            if progress == nil {
+                Button("Recover Transcript") { Task { await coordinator.recover(recording.id) } }
+                    .buttonStyle(.borderedProminent)
+                    .help(recording.hasJournal ? "Restore the transcript and write the report" : "Transcribe the recording in the background")
+                Button("Delete…", role: .destructive, action: delete)
+            }
+        }
+        .padding(.vertical, 4)
+        .contextMenu {
+            if progress == nil, recording.hasJournal, !recording.audioFiles.isEmpty {
+                Button("Transcribe from the Audio Instead") { Task { await coordinator.recover(recording.id, fromAudio: true) } }
+            }
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([recording.directory]) }
+            if progress == nil {
+                Divider()
+                Button("Delete…", role: .destructive, action: delete)
+            }
         }
     }
 }
@@ -134,6 +219,7 @@ private struct MeetingDetailView: View {
     @ViewState private var renamingTitle = false
     @ViewState private var newTitle = ""
     @ViewState private var confirmingDelete = false
+    @ViewState private var confirmingRetranscribe = false
     /// Session time to scroll the transcript to, set by a timestamp in the report.
     @ViewState private var transcriptTarget: TimeInterval?
 
@@ -168,6 +254,15 @@ private struct MeetingDetailView: View {
                 } message: {
                     Text("The transcript, report and audio recordings are removed. This can't be undone.")
                 }
+                .confirmationDialog(
+                    "Transcribe “\(meeting.title)” again?", isPresented: $confirmingRetranscribe, titleVisibility: .visible
+                ) {
+                    Button("Transcribe Again") { Task { await coordinator.retranscribe(meetingID) } }
+                } message: {
+                    Text(
+                        "The recording is transcribed again with your current voice model and enrolled voices, and the report is rewritten. Names you gave speakers are replaced."
+                    )
+                }
         }
     }
 
@@ -194,7 +289,11 @@ private struct MeetingDetailView: View {
             .labelsHidden()
         }
         ToolbarItemGroup(placement: .primaryAction) {
-            if coordinator.generatingReports.contains(meetingID) {
+            if let progress = coordinator.processing[meetingID] {
+                ProgressView(value: progress.fraction)
+                    .frame(width: 80)
+                    .help(progress.label)
+            } else if coordinator.generatingReports.contains(meetingID) {
                 ProgressView()
                     .controlSize(.small)
                     .help("Writing the report…")
@@ -225,6 +324,8 @@ private struct MeetingDetailView: View {
                     newTitle = meeting.title
                     renamingTitle = true
                 }
+                Button("Transcribe Again from the Recording…") { confirmingRetranscribe = true }
+                    .disabled(meeting.audioFiles.isEmpty || coordinator.processing[meetingID] != nil)
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([coordinator.meetingStore.directory(for: meetingID)])
                 }
